@@ -1,0 +1,11 @@
+/target/
+.env
+.env.*
+!.env.example
+*.log
+*.apk
+*.apks
+*.xapk
+/artifacts/
+/cache/
+__pycache__/

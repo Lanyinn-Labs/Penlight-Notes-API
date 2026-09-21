@@ -1,0 +1,31 @@
+{
+  "region": "global",
+  "filename": "BanGDreamOurNotes_1.0.1_2026_09_17_22_42_02.apk",
+  "size_bytes": 446890829,
+  "sha256": "c0b6a1541e4562533aaeb2c65062cb6202913b2aec5aae80d371c4fc04409fa9",
+  "entry_count": 4051,
+  "architectures": [
+    "arm64-v8a"
+  ],
+  "has_android_manifest": true,
+  "has_il2cpp": true,
+  "has_il2cpp_metadata": true,
+  "relevant_entries": [
+    {
+      "path": "assets/bin/Data/Managed/Metadata/global-metadata.dat",
+      "size_bytes": 31547372
+    },
+    {
+      "path": "lib/arm64-v8a/libil2cpp.so",
+      "size_bytes": 214703440
+    },
+    {
+      "path": "lib/arm64-v8a/libunity.so",
+      "size_bytes": 28473720
+    }
+  ],
+  "notes": [
+    "Region is specified by the --region argument.",
+    "Inspection scope: archive entries and file checksum. Manifest and protocol parsing are not included."
+  ]
+}

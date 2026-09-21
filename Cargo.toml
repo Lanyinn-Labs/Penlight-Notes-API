@@ -1,0 +1,26 @@
+[package]
+name = "penlight-notes-api"
+version = "0.1.0"
+edition = "2021"
+description = "Unofficial API server for BanG Dream! Our Notes"
+license = "MIT"
+repository = "https://github.com/Lanyinn-Labs/Penlight-Notes-API"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenvy = "0.15"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
