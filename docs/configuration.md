@@ -46,7 +46,21 @@
 
 账号接口只读查询现有账号；凭据文件不通过接口返回。账号数据缓存 15 秒，修改凭据配置后重启服务。不要将 credentials_file 设为公共文件或将凭据写入提交。
 
-配置了 `master_directory` 后，资源接口只读取经过校验的该存储；缺失或损坏返回错误。没有配置此字段时才使用旧 APK 快照。导入步骤见 [README](../README.md#导入-master)。自动更新不是默认开启，本次验证使用从手机复制并导入的 Master。
+配置了 `master_directory` 后，资源接口只读取经过校验的该存储；缺失或损坏返回错误。没有配置此字段时才使用旧 APK 快照。导入步骤见 [Master 导入](#master-导入)。自动更新不是默认开启，本次验证使用从手机复制并导入的 Master。
+
+## Master 导入
+
+从自有 Android 客户端复制 `files/Master`，使用已验证的日服 1.0.2 元数据导入：
+
+```bash
+cargo build --locked
+uv run --no-project --with py3rijndael python scripts/import_jp_master.py \
+  artifacts/jp/phone-master artifacts/jp/master-store
+```
+
+默认元数据路径为 `artifacts/jp/global-metadata.dat`，可通过 `--metadata` 指定。将协议配置的 `master_directory` 设为导入后的存储目录。脚本读取客户端常量并调用本程序的 Master 导入器，不打印密钥；接口校验已发布快照的版本和摘要。
+
+这是本地导入步骤，自动更新需另行配置 Master 更新或同步任务。国际服旧 APK 快照可用 `scripts/decrypt_master.py /path/to/client.apk` 导出已验证的 1.0.1 APK，再通过 `OURNOTES_GLOBAL_MASTER_DIR` 指向输出目录。工具参数见 [维护工具](../scripts/README.md)。
 
 ## Docker
 
