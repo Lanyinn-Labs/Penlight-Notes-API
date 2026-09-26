@@ -14,6 +14,26 @@ pub enum AppError {
     RegionDisabled,
     #[error("Our Notes upstream protocol has not been implemented")]
     ProtocolPending,
+    #[error("event ID and ranks must be positive; provide 1 to 20 comma-separated ranks")]
+    InvalidRankingQuery,
+    #[error("Master record ID must be a positive integer")]
+    InvalidMasterId,
+    #[error("query parameters must contain valid positive IDs or a tab from 0 to 2")]
+    InvalidQuery,
+    #[error("Sirius upstream request timed out")]
+    UpstreamTimeout,
+    #[error("game service returned gRPC status {0}")]
+    UpstreamGameError(u16),
+    #[error("game account session is unavailable")]
+    UpstreamAuthenticationUnavailable,
+    #[error("game service is rate limiting requests")]
+    UpstreamRateLimited,
+    #[error("game service is unavailable")]
+    UpstreamUnavailable,
+    #[error("game service returned an invalid ranking response")]
+    UpstreamInvalidResponse,
+    #[error("decrypted Master snapshot is not configured or is unavailable")]
+    MasterDataUnavailable,
     #[error("a valid API key is required")]
     Unauthorized,
     #[error("route not found")]
@@ -28,6 +48,21 @@ impl IntoResponse for AppError {
             Self::UnsupportedRegion => (StatusCode::BAD_REQUEST, "unsupported_region"),
             Self::RegionDisabled => (StatusCode::SERVICE_UNAVAILABLE, "region_disabled"),
             Self::ProtocolPending => (StatusCode::NOT_IMPLEMENTED, "protocol_pending"),
+            Self::InvalidRankingQuery => (StatusCode::BAD_REQUEST, "invalid_ranking_query"),
+            Self::InvalidMasterId => (StatusCode::BAD_REQUEST, "invalid_master_id"),
+            Self::InvalidQuery => (StatusCode::BAD_REQUEST, "invalid_query"),
+            Self::UpstreamTimeout => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout"),
+            Self::UpstreamGameError(_) => (StatusCode::BAD_GATEWAY, "upstream_game_error"),
+            Self::UpstreamAuthenticationUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_authentication_unavailable",
+            ),
+            Self::UpstreamRateLimited => (StatusCode::SERVICE_UNAVAILABLE, "upstream_rate_limited"),
+            Self::UpstreamUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable"),
+            Self::UpstreamInvalidResponse => (StatusCode::BAD_GATEWAY, "upstream_invalid_response"),
+            Self::MasterDataUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "master_data_unavailable")
+            }
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),

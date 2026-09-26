@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x64
+            archive: tar.gz
+          - os: macos-latest
+            target: macos-arm64
+            archive: tar.gz
+          - os: windows-latest
+            target: windows-x64
+            archive: zip
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install toolchain
+        run: rustup toolchain install 1.97 --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Check sources and tag version
+        run: python scripts/check_release.py
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Run regression tests
+        run: cargo test --release --locked
+      - name: Package runtime
+        run: python scripts/package_release.py --target ${{ matrix.target }}
+      - name: Smoke-test extracted archive
+        shell: bash
+        run: python scripts/smoke_release.py dist/penlight-notes-api-*-${{ matrix.target }}.${{ matrix.archive }} --expect-target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: penlight-notes-api-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Collect checksums
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -1,24 +1,34 @@
 use axum::{
-    extract::{Path, State},
+    extract::{rejection::QueryRejection, Path, Query, State},
     Json,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::SharedState;
-use crate::{client::OurNotesClient, error::AppError, region::Region};
+use crate::{
+    client::sirius::{envelope, Query as SiriusQuery, SiriusClient},
+    error::AppError,
+    offline_master,
+    ranking::RankingRequest,
+    region::Region,
+};
 
-pub async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "service": "penlight-notes-api", "upstream_ready": false}))
+pub async fn health(State(state): State<SharedState>) -> Json<Value> {
+    Json(
+        json!({"status": "ok", "service": "penlight-notes-api", "upstream_ready": state.sirius.as_ref().is_some_and(|client| client.ready())}),
+    )
 }
 
 pub async fn version() -> Json<Value> {
     Json(
-        json!({"name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION"), "stage": "scaffold"}),
+        json!({"name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION"), "stage": "online", "protocol_implementation":"sirius-api-proxy", "protocol_revision":"c2df04b7979cadc89fd25fa120cb8c406aa4ef86"}),
     )
 }
 
 pub async fn servers(State(config): State<SharedState>) -> Json<Value> {
     let servers: Vec<Value> = config
+        .config
         .regions
         .iter()
         .map(|region| {
@@ -26,9 +36,9 @@ pub async fn servers(State(config): State<SharedState>) -> Json<Value> {
                 "region": region.region,
                 "enabled": region.enabled,
                 "client_version": region.client_version,
-                "upstream_configured": region.base_url.is_some(),
-                "upstream_ready": false,
-                "status": if region.enabled { "protocol_pending" } else { "disabled" },
+                "upstream_configured": region.sirius.is_some() || region.base_url.is_some(),
+                "upstream_ready": region.region == Region::Jp && region.enabled && config.sirius.as_ref().is_some_and(|client| client.ready()),
+                "status": if !region.enabled { "disabled" } else if region.sirius.is_some() { "protocol_configured" } else { "protocol_pending" },
             })
         })
         .collect();
@@ -40,7 +50,346 @@ pub async fn application(
     Path(region): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let region = Region::parse(&region)?;
-    OurNotesClient::application(config.region(region))
+    online(&config, region)?
+        .query(SiriusQuery::System)
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+fn online(state: &SharedState, region: Region) -> Result<&SiriusClient, AppError> {
+    if !state.config.region(region).enabled {
+        return Err(AppError::RegionDisabled);
+    }
+    if region != Region::Jp {
+        return Err(AppError::ProtocolPending);
+    }
+    state.sirius.as_deref().ok_or(AppError::ProtocolPending)
+}
+
+fn private_online(state: &SharedState, region: Region) -> Result<&SiriusClient, AppError> {
+    // Private account queries require configured frontend authentication even if
+    // the operator deliberately leaves public resource routes unauthenticated.
+    if state.config.api_key.is_none() {
+        return Err(AppError::Unauthorized);
+    }
+    online(state, region)
+}
+
+fn positive(raw: &str) -> Result<i64, AppError> {
+    raw.parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or(AppError::InvalidQuery)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnnouncementQuery {
+    #[serde(default)]
+    tab: i32,
+}
+
+pub async fn announcements(
+    State(state): State<SharedState>,
+    Path(region): Path<String>,
+    query: Result<Query<AnnouncementQuery>, QueryRejection>,
+) -> Result<Json<Value>, AppError> {
+    let Query(query) = query.map_err(|_| AppError::InvalidQuery)?;
+    online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::Announcements(query.tab))
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub async fn announcement(
+    State(state): State<SharedState>,
+    Path((region, id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::Announcement(positive(&id)?))
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub async fn player_profile(
+    State(state): State<SharedState>,
+    Path((region, id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::Profile(positive(&id)?))
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub async fn event_rankings(
+    State(state): State<SharedState>,
+    Path((region, event)): Path<(String, String)>,
+    query: Result<Query<CutoffQuery>, QueryRejection>,
+) -> Result<Json<Value>, AppError> {
+    let Query(query) = query.map_err(|_| AppError::InvalidRankingQuery)?;
+    let request = RankingRequest::parse(&event, &query.ranks)?;
+    online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::EventRanking(request))
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub async fn event_deck(
+    State(state): State<SharedState>,
+    Path((region, event, player)): Path<(String, String, String)>,
+) -> Result<Json<Value>, AppError> {
+    online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::EventDeck(positive(&event)?, player))
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub async fn music_rankings(
+    State(state): State<SharedState>,
+    Path((region, id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::MusicRanking(positive(&id)?))
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub async fn challenge_rankings(
+    State(state): State<SharedState>,
+    Path((region, id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::ChallengeRanking(positive(&id)?))
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub async fn account(
+    State(state): State<SharedState>,
+    Path(region): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let data = private_online(&state, Region::parse(&region)?)?
+        .query(SiriusQuery::Account)
+        .await?;
+    if !data["playerId"].as_str().is_some_and(|id| !id.is_empty()) {
+        return Err(AppError::UpstreamInvalidResponse);
+    }
+    Ok(Json(envelope(json!({"authenticated":true}))))
+}
+
+pub async fn user_data(
+    State(state): State<SharedState>,
+    Path(region): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    private_online(&state, Region::parse(&region)?)?
+        .account_data()
+        .await
+        .map(envelope)
+        .map(Json)
+}
+
+pub const USER_RESOURCES: &[(&str, &str)] = &[
+    ("profile", "myProfile"),
+    ("decks", "decks"),
+    ("cards", "memberCards"),
+    ("support-cards", "supportCards"),
+    ("items", "items"),
+    ("stamps", "stamps"),
+    ("characters", "characterRank"),
+    ("music-scores", "liveScore"),
+    ("music", "liveMusic"),
+    ("missions", "playerMissionData"),
+    ("login-bonuses", "loginBonusUpdate"),
+    ("gacha", "gachaCount"),
+    ("events", "events"),
+    ("tutorial", "tutorialProgress"),
+];
+
+pub async fn user_resource(
+    state: SharedState,
+    region: String,
+    field: &'static str,
+) -> Result<Json<Value>, AppError> {
+    let data = private_online(&state, Region::parse(&region)?)?
+        .account_data()
+        .await?;
+    let value = data["playerData"].get(field).cloned().unwrap_or_else(|| {
+        if matches!(
+            field,
+            "myProfile" | "playerMissionData" | "tutorialProgress"
+        ) {
+            Value::Null
+        } else {
+            json!([])
+        }
+    });
+    Ok(Json(envelope(value)))
+}
+
+pub async fn master_schema_list(
+    State(config): State<SharedState>,
+    Path(region): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let region = Region::parse(&region)?;
+    if !config.config.region(region).enabled {
+        return Err(AppError::RegionDisabled);
+    }
+    Ok(Json(offline_master::list(region)))
+}
+
+pub async fn master_schema(
+    State(config): State<SharedState>,
+    Path((region, table)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    let region = Region::parse(&region)?;
+    if !config.config.region(region).enabled {
+        return Err(AppError::RegionDisabled);
+    }
+    offline_master::get(region, &table).map(Json)
+}
+
+pub async fn master_records(
+    State(config): State<SharedState>,
+    Path((region, table)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    let region = Region::parse(&region)?;
+    let settings = config.config.region(region);
+    if !settings.enabled {
+        return Err(AppError::RegionDisabled);
+    }
+    if region == Region::Jp {
+        if let Some(client) = config
+            .sirius
+            .as_ref()
+            .filter(|client| client.master_configured())
+        {
+            return client.master_records(&table).await.map(Json);
+        }
+    }
+    let directory = settings
+        .master_dir
+        .as_deref()
+        .ok_or(AppError::MasterDataUnavailable)?;
+    offline_master::records(region, directory, &table)
         .await
         .map(Json)
+}
+
+pub async fn jp_catalog_list(
+    state: SharedState,
+    region: String,
+    resource: &'static str,
+) -> Result<Json<Value>, AppError> {
+    let region = Region::parse(&region)?;
+    let settings = state.config.region(region);
+    if !settings.enabled {
+        return Err(AppError::RegionDisabled);
+    }
+    if region != Region::Jp {
+        return Err(AppError::ProtocolPending);
+    }
+    if let Some(client) = state
+        .sirius
+        .as_ref()
+        .filter(|client| client.master_configured())
+    {
+        return client.catalog(resource).await.map(Json);
+    }
+    let directory = settings
+        .master_dir
+        .as_deref()
+        .ok_or(AppError::MasterDataUnavailable)?;
+    offline_master::jp_catalog(directory, resource)
+        .await
+        .map(Json)
+}
+
+pub async fn jp_catalog_entry(
+    state: SharedState,
+    region: String,
+    resource: &'static str,
+    id: String,
+) -> Result<Json<Value>, AppError> {
+    let region = Region::parse(&region)?;
+    let settings = state.config.region(region);
+    if !settings.enabled {
+        return Err(AppError::RegionDisabled);
+    }
+    if region != Region::Jp {
+        return Err(AppError::ProtocolPending);
+    }
+    if let Some(client) = state
+        .sirius
+        .as_ref()
+        .filter(|client| client.master_configured())
+    {
+        let id = positive(&id).map_err(|_| AppError::InvalidMasterId)?;
+        let mut data = client.catalog(resource).await?;
+        let entries = data
+            .as_object_mut()
+            .and_then(|map| map.remove("entries"))
+            .ok_or(AppError::MasterDataUnavailable)?;
+        let entry = entries
+            .as_array()
+            .ok_or(AppError::MasterDataUnavailable)?
+            .iter()
+            .find(|entry| {
+                entry["_id"].as_i64() == Some(id)
+                    || entry["_id"].as_str().and_then(|v| v.parse::<i64>().ok()) == Some(id)
+            })
+            .cloned()
+            .ok_or(AppError::NotFound)?;
+        data["entry"] = entry;
+        return Ok(Json(data));
+    }
+    let directory = settings
+        .master_dir
+        .as_deref()
+        .ok_or(AppError::MasterDataUnavailable)?;
+    offline_master::jp_catalog_entry(directory, resource, &id)
+        .await
+        .map(Json)
+}
+
+pub async fn master_data(
+    State(state): State<SharedState>,
+    Path(region): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let manifest = online(&state, Region::parse(&region)?)?
+        .master_manifest()
+        .await?;
+    Ok(Json(
+        json!({"region":"jp", "source":"master_snapshot", "manifest":manifest}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutoffQuery {
+    ranks: String,
+}
+
+pub async fn event_cutoffs(
+    State(state): State<SharedState>,
+    Path((region, event_id)): Path<(String, String)>,
+    query: Result<Query<CutoffQuery>, QueryRejection>,
+) -> Result<Json<Value>, AppError> {
+    let region = Region::parse(&region)?;
+    if !state.config.region(region).enabled {
+        return Err(AppError::RegionDisabled);
+    }
+    let Query(query) = query.map_err(|_| AppError::InvalidRankingQuery)?;
+    let request = RankingRequest::parse(&event_id, &query.ranks)?;
+    let response = state.rankings.get(region, request).await?;
+    Ok(Json(
+        serde_json::to_value(response).expect("cutoff response is serializable"),
+    ))
 }

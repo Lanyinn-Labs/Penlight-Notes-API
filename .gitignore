@@ -9,3 +9,17 @@
 /artifacts/
 /cache/
 __pycache__/
+/config/*.local.json
+/config/*.local.yaml
+
+# Local analysis archives and private deployment files
+/.local-backups/
+/secrets/
+/config/*.local.yml
+/docker-compose*.local.yml
+*.har
+*.pcap
+*.pcapng
+
+# Generated release archives
+/dist/

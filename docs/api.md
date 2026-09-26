@@ -2,86 +2,132 @@
 
 ## 通用约定
 
-游戏接口以 `/api` 为路径前缀，使用小写区服标识：
+游戏接口以 `/api/{region}` 开头，区服为 `jp` 或 `global`。以下在线接口目前支持日服；未配置日服协议、或查询未接入的国际服时返回 `501 protocol_pending`。关闭区服返回 `503 region_disabled`。
 
-| 标识 | 区服 |
+设置 `API_KEY` 后，所有 `/api/*` 请求必须提供 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`。`/user/*` 始终要求配置并通过 API Key 认证。响应为 JSON；原始 Protobuf JSON 中的 64 位整数可能使用字符串。
+
+## 服务状态
+
+| GET 路径 | 说明 |
 | --- | --- |
-| `global` | 国际服 |
-| `jp` | 日服 |
+| `/health` | 进程状态及 upstream_ready |
+| `/version` | 服务版本、stage: online、协议来源及固定提交 |
+| `/servers` | 各区服启用状态、版本、协议是否配置及可用状态 |
 
-响应使用 JSON 格式。配置 `API_KEY` 后，`/api/*` 请求必须携带 `X-API-Key: <API_KEY>` 或 `Authorization: Bearer <API_KEY>`。认证在接口处理前执行。
+这些接口无需认证，不执行网络探测。`upstream_ready` 仅表示最近 60 秒内应用状态查询成功且官方服务可用；刚启动时为 false。区服 status 为 disabled、protocol_pending 或 protocol_configured；配置成功不等于官方服务可用。
 
-## 服务接口
+## 在线查询
 
-以下接口无需认证。
+| GET 路径（均以 `/api/jp` 为前缀） | 说明 |
+| --- | --- |
+| `/application` | 官方版本、维护与服务可用状态 |
+| `/announcements?tab=0` | 公告列表；tab 允许 0、1、2，默认 0 |
+| `/announcements/{id}` | 公告详情 |
+| `/players/by-profile-id/{id}` | 用公开 profile ID 查询玩家资料 |
+| `/events/{event_id}/rankings?ranks=100,1000` | 指定名次的原始活动排名 |
+| `/events/{event_id}/players/{player_id}/deck` | 活动中的玩家队伍 |
+| `/music/{id}/rankings` | 歌曲排名，移除调用账号的 myRank/myScore |
+| `/challenge-music/{id}/rankings` | 挑战歌曲排名，移除调用账号的 myRank/myScore |
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/health` | 查询服务运行状态 |
-| GET | `/version` | 查询服务名称、版本与开发阶段 |
-| GET | `/servers` | 查询区服配置与接入状态 |
+ID 必须为正整数。活动 rankings 和 cutoffs 的 ranks 必须包含 1 至 20 个逗号分隔的正整数，排序并去重；不接受未知查询参数。
 
-### GET /health
-
-返回 HTTP 200。`status` 表示服务运行状态，`upstream_ready` 表示游戏服务接入状态，两者独立。
-
-```json
-{
-  "status": "ok",
-  "service": "penlight-notes-api",
-  "upstream_ready": false
-}
-```
-
-### GET /version
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `name` | string | 服务名称 |
-| `version` | string | 服务版本 |
-| `stage` | string | 开发阶段；当前为 `scaffold` |
-
-### GET /servers
-
-返回 `servers` 数组，每项包含以下字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `region` | string | 区服标识 |
-| `enabled` | boolean | 区服是否启用 |
-| `client_version` | string 或 null | 配置的游戏客户端版本 |
-| `upstream_configured` | boolean | 是否配置游戏服务地址 |
-| `upstream_ready` | boolean | 游戏服务是否接入完成 |
-| `status` | string | `disabled` 或 `protocol_pending` |
-
-当前版本的 `upstream_ready` 固定为 `false`。`upstream_configured` 仅反映地址是否已填写，不表示地址有效或可用。服务不会返回配置中的完整地址或认证信息。
-
-## 游戏接口
-
-### GET /api/{region}/application
-
-应用信息接口，当前尚未实现游戏协议。区服启用时返回 HTTP 501 `protocol_pending`；区服关闭时返回 HTTP 503 `region_disabled`。
-
-默认配置下，国际服启用，日服关闭。启用日服后，该接口同样返回 HTTP 501。
-
-卡牌、歌曲、活动、排行及用户接口暂未开放。
-
-## 错误响应
+在线响应封装如下，data 内部保留上游 Protobuf JSON 结构：
 
 ```json
 {
-  "error": {
-    "code": "protocol_pending",
-    "message": "Our Notes upstream protocol has not been implemented"
-  }
+  "region": "jp",
+  "source": "official_game_service",
+  "protocol_implementation": "sirius_api_proxy",
+  "data": {}
 }
 ```
 
-| HTTP 状态码 | 错误码 | 说明 |
+### 活动榜线
+
+`GET /api/jp/events/{event_id}/cutoffs?ranks=100,1000`
+
+响应包含 region、event_id、source: official_game_service、status、observed_at_unix_ms、age_ms 和 cutoffs。每个榜线包含 rank 和 point。上游未返回某名次时，point 为 null；已返回的零分保留为 0。
+
+status 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数据。超过旧数据保留期后返回实际错误；缓存时间由 RANKING_*_SECS 配置。相同请求并发合并，并限制失败后的重试。
+
+2026-09-27 导入的 Master 没有活动，活动查询返回空排名。这验证了请求链路及空结果处理，实际活动分数仍待活动开放后验证。
+
+## 现有账号查询
+
+所有路径均以 `/api/jp/user` 为前缀，查询部署者配置的现有账号。
+
+| GET 路径 | 说明 |
+| --- | --- |
+| `/account` | Whoami 验证，仅返回 data.authenticated，不返回认证凭据 |
+| `/data` | 完整 GetPlayerData 响应，缓存 15 秒 |
+| `/profile` | myProfile |
+| `/decks` | decks |
+| `/cards` | memberCards |
+| `/support-cards` | supportCards |
+| `/items` | items |
+| `/stamps` | stamps |
+| `/characters` | characterRank |
+| `/music-scores` | liveScore |
+| `/music` | liveMusic |
+| `/missions` | playerMissionData |
+| `/login-bonuses` | loginBonusUpdate |
+| `/gacha` | gachaCount |
+| `/events` | events |
+| `/tutorial` | tutorialProgress |
+
+拆分接口将对应字段放入通用响应的 data；缺失的重复字段返回 []，缺失的 profile、missions、tutorial 对象返回 null。仅提供读取操作。
+
+## Master 查询
+
+| GET 路径 | 说明 |
+| --- | --- |
+| `/api/jp/master-data` | 经校验的已发布快照清单、Master 版本、表摘要 |
+| `/api/{region}/master/{table}` | 读取表原始记录，例如 MasterCharacter |
+| `/api/{region}/master-schema` | APK 提取的静态表结构索引 |
+| `/api/{region}/master-schema/{table}` | APK 提取的字段信息 |
+
+配置日服协议的 master_directory 后，表和资源读取原始 Sirius 快照存储，source 为 master_snapshot；响应包含 master_version、snapshot、resource_version 和 entries。列表及日文文本固定到同一快照，校验清单和表摘要。存储缺失或损坏返回 503 master_data_unavailable。
+
+未配置该存储时，旧表查询和资源接口读取 `_MASTER_DIR` 指向的已解密 APK JSON，source 为 apk_master_snapshot，附 client_version、apk_sha256。国际服表查询使用此离线方式。
+
+master-schema 始终是构建时提取的 APK 结构，不等于线上最新结构。国际服为 240 张表，日服为 235 张表；records_available: false 表示记录未内置进可执行文件。
+
+### 日服资源
+
+`GET /api/jp/{resource}` 返回 entries；`GET /api/jp/{resource}/{id}` 返回 entry。保留原始字段，添加 id，并在 MasterText 存在对应文本时添加 name_ja、subtitle_ja。
+
+| resource | Master 表 |
+| --- | --- |
+| cards | MasterMemberCard |
+| music | MasterLiveMusic |
+| events | MasterEvent |
+| characters | MasterCharacter |
+| bands | MasterBand |
+| gacha | MasterGacha |
+| items | MasterItem |
+| stamps | MasterStamp |
+| shops | MasterShop |
+| login-bonuses | MasterLoginBonus |
+
+资源详情 ID 无效返回 400，未找到返回 404。国际服这些整理后的资源接口尚未接入。
+
+## 错误
+
+统一格式为 `{"error":{"code":"...","message":"..."}}`，不会返回原始凭据或私有上游诊断。
+
+| HTTP | code | 说明 |
 | --- | --- | --- |
-| 400 | `unsupported_region` | application 接口的区服标识无效 |
-| 401 | `unauthorized` | API Key 缺失或无效 |
-| 404 | `not_found` | 请求路径不存在 |
-| 405 | `method_not_allowed` | 请求方法不受支持 |
-| 501 | `protocol_pending` | 游戏协议尚未实现 |
-| 503 | `region_disabled` | 区服未启用 |
+| 400 | unsupported_region | 区服无效 |
+| 400 | invalid_query / invalid_ranking_query / invalid_master_id | 参数无效 |
+| 401 | unauthorized | 密钥缺失、错误或私有接口未配置密钥 |
+| 404 | not_found | 路径或资源不存在 |
+| 405 | method_not_allowed | 方法不支持 |
+| 501 | protocol_pending | 区服在线协议未配置或未接入 |
+| 503 | region_disabled | 区服关闭 |
+| 503 | master_data_unavailable | 快照缺失、损坏或来源不符 |
+| 503 | upstream_authentication_unavailable | 游戏账号会话不可用 |
+| 503 | upstream_rate_limited | 官方限流 |
+| 503 | upstream_unavailable | 官方服务不可用 |
+| 502 | upstream_invalid_response | 返回数据不符合预期 |
+| 502 | upstream_game_error | 官方 gRPC 业务错误，message 包含状态码 |
+| 504 | upstream_timeout | 官方请求超时 |

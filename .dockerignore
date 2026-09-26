@@ -4,3 +4,13 @@
 !rust-toolchain.toml
 !src/
 !src/**
+!data/
+!data/**
+!vendor/
+!vendor/**
+!config/
+!config/jp.example.json
+!LICENSE
+!THIRD-PARTY-NOTICES.md
+!docs/
+!docs/upstream-attribution.md

@@ -4,17 +4,45 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env().map_err(std::io::Error::other)?;
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if !arguments.is_empty() {
+        if arguments.len() != 3 || arguments[0] != "master-import" {
+            return Err(
+                "usage: penlight-notes-api [master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY]"
+                    .into(),
+            );
+        }
+        use sirius_api_proxy::master::{import_directory, key_from_hex, MasterDecoder};
+        let key = key_from_hex(&std::env::var("SIRIUS_MASTER_KEY_HEX")?)?;
+        let iv = key_from_hex(&std::env::var("SIRIUS_MASTER_IV_HEX")?)?;
+        let receipt = import_directory(
+            std::path::Path::new(&arguments[1]),
+            std::path::Path::new(&arguments[2]),
+            &MasterDecoder::new(&key, iv),
+        )?;
+        println!("{}", serde_json::to_string(&receipt)?);
+        return Ok(());
+    }
+    let config = Arc::new(Config::from_env().map_err(std::io::Error::other)?);
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    let client = api::load_client(&config).map_err(std::io::Error::other)?;
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    tracing::info!(address = %listener.local_addr()?, "Penlight Notes API listening (protocol pending)");
-    axum::serve(listener, api::build(Arc::new(config)))
+    let workers = client
+        .as_ref()
+        .map(|client| client.start_workers())
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    tracing::info!(address = %listener.local_addr()?, "Penlight Notes API listening");
+    axum::serve(listener, api::build_with_client(config, client))
         .with_graceful_shutdown(shutdown())
         .await?;
+    if let Some(workers) = workers {
+        workers.shutdown().await;
+    }
     Ok(())
 }
 

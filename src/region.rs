@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::error::AppError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Region {
     Global,

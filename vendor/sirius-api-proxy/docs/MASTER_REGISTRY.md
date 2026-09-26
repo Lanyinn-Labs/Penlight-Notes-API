@@ -1,0 +1,549 @@
+# Master snapshot publication
+
+A `master_directory` of a JP, HK, EN or KR profile exposes verifiable plaintext manifests
+through the public API bearer scope. No game/CDN credential, encryption key, schema model or
+query to the game is needed to read installed snapshots. These endpoints remain local when node
+routing is enabled. CN is reserved. Global CDN authorization and region identity are described
+in [region support](REGIONS.md#master-data).
+
+For a single-region deployment:
+
+| GET path under `/api/v1/master-data` | Result |
+| --- | --- |
+| `/manifest` | Current snapshot's scoped plaintext manifest |
+| `/by-hash/{content_sha256}/manifest` | Newest committed installation with that scoped content identity |
+| `/history?limit=20` | Recent installations in committed predecessor order |
+| `/snapshots/{snapshot}/manifest` | The named snapshot's manifest, independent of CURRENT |
+| `/snapshots/{snapshot}/tables/{table}/{sha256}` | Exact JSON bytes matching the pinned SHA-256 |
+
+Multi-region deployments insert `{region}` after `/api/v1`, for example
+`/api/v1/hk/master-data/manifest`. A snapshot is served only under the region recorded in its
+receipt (legacy receipts without a region are JP). A table identifier is the existing
+name without `.json`, for example `MasterExample`. Only names listed in the source manifest
+are served. Unsafe paths and linked snapshot/file entries are rejected. Retained snapshots
+remain addressable after a new snapshot becomes current; these endpoints do not prune history.
+
+The manifest contains schema version 1, region/environment/platform scope, snapshot identifier,
+Master version, sorted plaintext file names/sizes/SHA-256, a `content_sha256`, and the original
+encrypted-file `source_manifest`. The source metadata contains names, sizes and hashes only.
+A consumer must pin the manifest before reading files and independently verify every downloaded
+file's hash/size and the expected scope. It must never combine CURRENT-relative table reads
+into one snapshot while an owner might publish a new version.
+
+### Asset version provenance
+
+A manifest may also carry an optional `resource_version`: the asset (resource) version recorded
+when that snapshot was installed. The CDN updater takes it from the same game VERSION response
+that supplied the Master version (the response's `resourceVersion` field where the protocol has
+one, which is field 2 of the Global HK/EN/KR VersionResponse; for JP, whose VersionResponse has no such field, the `x-asset-version` header of that same
+response, selected for the configured client version and platform exactly like resource
+snapshots). The final pre-publication VERSION check must report the same Master version, asset
+version and CDN credential, otherwise the update fails as changed. The value is stored in the
+snapshot's `receipt.json`, shown as `resource_version` in the local Master status, and omitted
+when absent. Legacy snapshots and plain `master-import` runs have none; `master-import IN OUT
+--resource-version VERSION` records an operator-supplied value. Nothing synthesizes it.
+`--region hk|en|kr` records a Global import (the default is `jp`).
+
+It is installation provenance, not a live asset mirror: a later asset-only change does not
+reinstall an already-provenanced Master version. When an installed snapshot has no recorded
+value and the game reports one for the same Master version, the updater reinstalls that version
+once (a full CDN download) to record it. Owner-to-consumer sync installs the owner's value;
+a consumer whose tables are identical but whose provenance differs reinstalls from its local
+tables without downloading them. Consumers reject manifests with unknown fields, so upgrade
+consumers before owners that will publish `resource_version`.
+
+## Identity and HTTP caching
+
+`content_sha256` is SHA-256 over compact UTF-8 JSON with recursively lexicographically sorted
+object keys and the fields `schema_version`, `scope`, `source_manifest`, `files`. Both file arrays
+are sorted by name. It includes the version through `source_manifest`; it excludes the local
+snapshot UUID and the optional `resource_version`: identity names table content, and the same
+tables keep the same identity whether or not provenance was recorded (a Master version is
+installed with one asset version, so identity still distinguishes normal installations). The
+PostgreSQL mirror replaces a stored manifest whose identity matches but whose provenance differs from the newly
+recorded provenance. Reimporting identical data therefore retains content identity while receiving a
+new storage identifier. Whitespace and number spelling inside the actual table files are never
+rewritten: their hashes and byte sizes refer to the original decoded bytes. Tests include
+independently calculated Python hash/canonical-JSON vectors.
+
+Manifest ETags hash the entire serialized response, including snapshot identifier. Manifests use
+`Cache-Control: private, no-cache`; `If-None-Match` supports strong/weak matching, lists and `*`.
+A matching condition returns an empty 304. Digest-qualified table URLs return a hash ETag and
+`private, max-age=31536000, immutable`. Authorization still precedes all handlers. A file is
+read and verified before returning a conditional response, so a missing/corrupted file cannot
+be concealed by a stale ETag. `x-master-version` is present on successful/conditional responses.
+
+## Local integrity and older snapshots
+
+New local imports and CDN updates stage `tables.json` alongside the source manifest, receipt
+and decoded tables, before the existing atomic publication of CURRENT. Its file list must
+exactly match the source manifest; files are limited to 64 MiB each, 512 MiB aggregate, and the
+existing maximum 4096 tables. Ordinary current-table reads now also verify this index when
+present. Invalid indexes never fall back to an unverified read. MasterManifest.bin is rejected
+as a table name because its decoded name would overwrite the snapshot's source manifest.
+
+Version 1.1 snapshots without an index remain supported. A manifest read computes their hashes
+in memory, validates JSON and leaves disk unchanged; this scans their table data once per
+manifest request. Digest-qualified file reads then verify the requested hash without rescanning
+all tables. This establishes a baseline from the trusted local legacy files, not renewed proof
+of their original encrypted CDN payload. Reimporting or updating with the current producer
+creates the durable index. Normal existing API paths remain compatible.
+
+## Consumer synchronization
+
+A JP, HK, EN or KR consumer may configure `master_directory` and `master_sync` instead of
+`master_update`. Owner and consumer must have the same region, environment and platform. The
+consumer verifies the owner manifest's scope, and a consumer never installs onto a directory
+holding another region's snapshots:
+
+```yaml
+master_directory: ./master-data
+master_sync:
+  origin: https://master-owner.example.invalid
+  token_env: SIRIUS_MASTER_OWNER_TOKEN
+  regional_paths: false
+  allow_http: false
+  interval_seconds: 300
+  timeout_seconds: 600
+  request_timeout_ms: 60000
+```
+
+The origin must contain only scheme and authority. The bearer is the owner's public API read
+credential; it must not reuse administrative, peer, game, CDN or updater credentials in a
+service deployment. `regional_paths: true` selects the owner's multi-region URL layout.
+HTTPS verifies certificates normally. Plain HTTP requires explicit opt-in. Redirects, ambient
+proxies and automatic HTTP retries are disabled. Neither game login nor CDN decryption keys
+are needed by the synchronization operation.
+
+The service synchronizes immediately after startup and waits `interval_seconds` after each
+attempt (60..86400). Failed attempts retain the installed snapshot and retry at the next poll.
+`timeout_seconds` (default 600, 1..3600) covers lock admission, manifest/file acquisition and
+preparation; `request_timeout_ms` (default 60000, 100..300000) bounds each HTTP request. Connection
+establishment uses the smaller of that request limit and 10 seconds. Manifests are bounded to
+4 MiB; declared tables retain the producer's file/count/aggregate bounds. The final synchronous
+filesystem publication is not preemptible; filesystem stalls may exceed the network deadline.
+
+The consumer pins the owner's scoped manifest, validates its content identity, verifies cached
+local tables before reuse, and downloads missing or corrupt files through pinned digest URLs.
+All files must match their declared byte length and SHA-256 and parse as JSON before publication.
+A second manifest check rejects owner content changes during the transfer. New owner snapshot
+UUIDs with identical content are accepted. The consumer creates its own local snapshot UUID and
+receipt (`source: registry`), retaining the same content identity. It can serve the same read
+protocol to downstream consumers. Unchanged polls still verify every installed table, allowing
+local corruption to be detected and repaired. Previous snapshots are retained.
+
+The existing filesystem writer lock excludes imports/CDN updates/other consumers. Shutdown
+cancels outstanding synchronization; a blocking preparation may finish, but cannot publish
+CURRENT independently after cancellation. Partial staging is temporary. No completion record
+is claimed until atomic publication succeeds. The existing Master update status reports
+`mode: sync`, running/ready/failed and a sanitized result.
+
+For a one-shot run, use a single-region config:
+
+```sh
+SIRIUS_CONFIG_PATH=consumer.yaml sirius-api-proxy master-sync
+```
+
+This prints the result as JSON, exits nonzero on failure and does not start an HTTP listener.
+As with other Master commands, stop a service owning the same snapshot directory first.
+
+## Committed publication history
+
+Every new import, CDN update or consumer installation writes `publication.json` inside its staged
+snapshot, with its UUID, UTC publication-attempt time and the previous committed snapshot UUID.
+That record is synced before the snapshot directory is renamed and CURRENT changes. The current
+pointer therefore commits the new history link together with the new tables. Directories left
+behind before a failed pointer switch never become history merely because they exist on disk.
+Readers pin CURRENT once and walk the immutable predecessor chain, newest first; clock changes
+do not reorder it. All writers continue to require the existing exclusive directory lock.
+An invalid existing pointer/predecessor fails publication rather than silently starting a new chain.
+
+`GET /api/v1/master-data/history?limit=20` uses the same public bearer as other Master reads
+(and the regional prefix in multi-region deployments). Limits are 1..100, default 20; unknown
+query fields fail. Responses are private/no-store and contain scope, pinned `head`, entries,
+`has_more`, `next_before`, and `legacy_boundary`. Entries include snapshot UUID, source version, scoped content
+SHA-256, file count, plaintext byte total and nullable `published_at`. This is installation
+history: explicit reimports of identical content remain visible with equal content hashes;
+ordinary unchanged CDN/sync polls do not install and thus add no record. Read paths never call
+the game. Listed manifests/indexes and history links are validated; corrupt records, cycles,
+linked files and unsafe paths fail explicitly. History reports manifest identities rather than
+performing a full rehash of every indexed table payload.
+
+Legacy snapshots have no publication record. They are included with `published_at: null`, and
+traversal stops with `legacy_boundary: true`; older ordering is unknown. No directory scan,
+mtime inference or automatic legacy rewrite fabricates missing history. `has_more` denotes a
+known predecessor beyond the requested limit, not an inferred legacy predecessor. Each page
+returns at most 100 installations. Pass the returned `next_before` as the `before` query
+parameter to retrieve strictly older entries, for example `/history?limit=20&before=master-UUID`.
+`next_before` is null at the end; repeating a cursor is safe. A new CURRENT between page requests
+does not duplicate or skip the older entries, since each page finds the cursor in the committed
+predecessor chain. `head` is pinned independently for each request and may therefore change.
+A syntactically invalid cursor returns 400; a missing or orphan snapshot, or a cursor beyond a
+legacy boundary, returns 404. A cursor at the oldest entry returns an empty final page. Cursors
+are bounded to 128 characters; each request traverses at most 10,000 links, including the skipped
+prefix. Hitting that safety bound fails explicitly with 503, not a truncated success. Deep
+history indexing, external database persistence and retention/compaction remain separate work.
+Existing snapshot directories are not pruned.
+
+## Remaining restoration
+
+Producer reads and consumer synchronization operate over atomic local snapshots.
+PostgreSQL persistence, consumer notifications and Git publication are documented below. Git
+publication with the `indented_root` layout runs in production for JP/HK/EN/KR.
+
+## Consumer update notifications
+
+An internal caller may `POST /internal/v1/master-data/sync` (or the configured regional
+internal prefix) with the internal bearer and a JSON hint:
+
+```json
+{"scope":{"region":"jp","environment":"release","platform":"iOS"},"content_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+```
+
+The body is limited to 4 KiB, unknown fields are rejected, and scope must exactly match
+the receiving profile. A consumer without `master_sync` returns 503; invalid scope/hash
+returns 400. Public read credentials cannot trigger synchronization. HTTP 202 acknowledges
+an in-memory wakeup, not completed synchronization or verification of the supplied digest.
+
+Bursts coalesce to at most one pending wakeup, including notifications during an active
+update. The existing single sync worker always fetches the configured owner's current
+manifest, validates scope/content/files, and atomically publishes; no origin/path or file
+content is accepted from the hint. A stale digest therefore cannot roll back a consumer.
+Periodic polling remains the fallback, and service restart performs an immediate poll,
+so notification loss does not disable eventual synchronization.
+
+### Configured owner notifications
+
+The owner transport now has a bounded one-attempt sender with per-target in-memory
+acknowledgements. Only HTTP 202 with the strict JSON status `accepted` advances that
+state; errors leave the same content eligible for retry, and newer committed content
+can supersede an unaccepted older hint. Restart intentionally permits resending CURRENT.
+Requests use explicit origins, normal TLS verification, no ambient proxies, no redirects
+and no implicit retries. Response bodies are bounded to 1 KiB and the request deadline
+covers body consumption. Acceptance does not prove consumer synchronization.
+
+Configure `master_notify` on a JP, HK, EN or KR profile with `master_directory`. Hints carry
+the profile's scope and use `/internal/v1/{region}/master-data/sync` when `regional_paths` is set:
+
+```yaml
+master_notify:
+  interval_seconds: 30
+  request_timeout_ms: 5000
+  targets:
+    - name: replica
+      origin: https://replica.example
+      token_env: SIRIUS_MASTER_REPLICA_NOTIFY_TOKEN
+      regional_paths: true
+      allow_http: false
+```
+
+The token must authorize the consumer's internal endpoint. It must differ from every
+local profile's API/internal/peer/game/CDN/owner-read/updater/outgoing-node and proxy
+credentials; only environment variable references belong in configuration. Target names
+are unique, 1–64 ASCII letters/digits/underscores/hyphens. Configure 1–16 targets, a
+10–3600 second reconciliation interval (default 30) and a 100–30000 millisecond per-target
+request timeout (default 5000). HTTP requires explicit opt-in; origins cannot include
+paths, URL credentials, queries or fragments. Notifications are disabled when omitted.
+
+The worker reconciles committed CURRENT immediately at startup, after successful in-process
+CDN/consumer publication and periodically. Polling also discovers independent CLI imports.
+Targets are visited sequentially; the interval starts after the pass finishes, so a full
+pass can take up to the target count times the request timeout plus local manifest reads.
+Each failed target retries on a later pass, while accepted targets skip unchanged content.
+One failed target does not prevent later targets from being tried. Local manifest failure
+sends no hint; delivery failures never change CURRENT or roll back a publication.
+Shutdown cancels active network work. Manifest reads run off the async executor and may
+finish after cancellation, but perform no writes or notification transmission themselves.
+
+Acknowledgements are transient. The durable source is CURRENT: restart resends its current
+content, and intermediate versions can coalesce to the newest committed state. There is
+no promise to deliver every installation event, or to deliver exactly once. A notification
+only wakes the consumer; its configured owner and full verification determine installed
+data. Periodic consumer polling remains necessary even after an accepted notification.
+General publication webhooks and central registry persistence remain separate restoration work.
+Optional Git publication is described below.
+
+## Lookup by content identity
+
+`GET /api/v1/master-data/by-hash/{content_sha256}/manifest` resolves a content identity
+without requiring the caller to know a node's snapshot UUID. The hash must be exactly
+64 lowercase hexadecimal characters (otherwise 400). Authorization is the normal public
+Master-read bearer, and regional deployments use the corresponding regional prefix.
+
+The lookup pins CURRENT and walks its committed predecessor chain. It selects the newest
+matching installation, returns 404 when no reachable match exists, and stops at a legacy
+snapshot without a publication record. It does not scan unrelated directories, so a staged
+or orphaned snapshot is never exposed as a published hash. Corruption and the 10,000-link
+traversal limit return 503 rather than an incomplete successful result. This is a bounded
+local-history lookup; a persistent deep-history index and optional database backend remain
+separate work.
+
+Content identity includes region/environment/platform. Identical data in another scope
+does not match. Reimporting the same content may change the selected snapshot UUID and
+response ETag while preserving `content_sha256`; responses therefore use private/no-cache
+and support If-None-Match, rather than promising immutable response bytes for the hash URL.
+Pin the returned snapshot and table hashes when fetching files. As with other manifest
+reads, indexed metadata is validated here; exact table payloads are verified when read.
+
+## Git publication restoration status
+
+The bounded Git execution primitive supports Unix and Windows. It invokes
+commands directly, disables terminal prompting, drains stdout/stderr concurrently, limits
+each stream to a caller-selected 1 KiB–16 MiB, and applies a command timeout up to 600 seconds.
+Failures return static error categories without raw argv, stderr or stdout. Successful callers
+receive bounded stdout only and must avoid exposing any credential-bearing command results.
+
+Cancellation or failure kills the owned process tree, including ordinary Git transport and
+signing helpers. On Unix this is the child's own process group. On Windows the child is created
+suspended, assigned to a dedicated Job Object and only then resumed, so no helper can start
+outside the job; the job is terminated on timeout, error or cancellation, and is also marked
+kill-on-close so an abnormal service exit does not leave Git running. As on Unix, a successful
+command releases the tree without killing helpers that outlive it. Timeout/error cleanup
+explicitly waits up to two additional seconds for the direct child; cancellation uses Tokio's
+kill-on-drop/reaping behavior. Neither mechanism is a sandbox against a helper deliberately
+escaping it (for example a Windows helper created with job breakaway by a privileged parent).
+Windows uses `NUL` for the global Git config, does not set an askpass program and removes
+`SSH_ASKPASS`, so credential prompts fail rather than wait. Other platforms return an explicit
+unsupported error.
+
+Windows containment is covered by a dedicated `cmd.exe` helper test (timeout, cancellation and
+a positive control), output bounds and real Git commit/stalled-remote shutdown tests, run by the
+Windows CI job. Local development on macOS only cross-compiles and links those tests.
+
+Local commits, explicit remote pushes, configured author/signing policy and optional service
+background publication are available below. Without master_git configured, no background Git
+commands run.
+
+### Local Master Git commits
+
+With Git available on PATH, a single-region configuration can commit its installed
+Master snapshot into a dedicated managed bare repository:
+
+```sh
+SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-commit ./master-git-state
+```
+
+`master_directory` selects the source and the profile supplies region/environment/platform.
+The command does not create a game client, resolve game/CDN credentials, contact the game,
+start the HTTP service or push to a remote. It prints `commit`, `content_sha256`, `changed` and `remote_verified` (false for local-only commits).
+This receipt acknowledges only a local Git reference update.
+
+The destination must be a new/empty directory or an existing matching Sirius Git state
+directory. It contains an exclusive owner lock, a scoped ownership marker and `repository.git`.
+Do not point it at a source checkout or another application's repository. A different scope,
+symlinked destination/repository, unowned nonempty directory or locked owner fails explicitly.
+This is a single-writer managed store, not a shared worktree for manual edits.
+
+The command pins CURRENT, validates the manifest and every table's hash, size and JSON, and
+stages exact plaintext bytes in temporary storage. It creates Git blobs with filters disabled
+and constructs a fresh tree, so removed tables leave the new tree without altering old commits.
+`sirius-publication.json` records the scoped source manifest and content identity without the
+node-local snapshot UUID or asset provenance. Identical content therefore reuses the existing commit after a
+reimport, rather than creating timestamp-only commits. No receipt, keys or CDN credentials
+are included. The reserved publication filename cannot also be a table.
+
+The branch is `master-data` by default (`master_git.branch`), with new commits parented to the
+previous commit. This describes the default `native` layout; see
+[Indented root layout](#indented-root-layout) for the alternative. A compare-and-swap
+reference update commits the new tree; failed validation leaves the prior reference unchanged.
+A cancelled/failed command may leave unreachable Git objects, and loss of the response at the
+reference update is ambiguous: rerun the identical operation to inspect/reuse the committed tree.
+The source CURRENT pointer is never changed by Git publication. Git commands share a 120-second
+budget after local preparation; synchronous local reads can exceed that preparation time.
+
+By default, commits use `Sirius Master Publisher <sirius-master@localhost>` and are unsigned.
+The commit policy below can override author/committer identity and enable signatures. Ambient `GIT_*` variables are removed before process execution to prevent
+repository redirects, injected config and trace destinations; terminal prompting is disabled.
+Successful command output is bounded to 1 MiB per stream and generated stdin to 4 MiB. Explicit remote push and environment-referenced HTTP authorization are described below;
+Windows support still remains
+before the full optional Git publication feature is complete.
+
+### Explicit remote Git push
+
+```sh
+SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-push ./master-git-state https://git.example/master-data.git
+```
+
+The command uses the same verified snapshot, scoped state lock, layout and branch
+(default `master-data`) as the profile's `master_git` settings. It
+checks the remote branch before creating a new local commit. An absent remote branch can be
+created; a remote equal to or behind the local branch can be advanced. A remote ahead of or
+diverged from local history fails verification before adding a local commit. A new empty
+local store will not overwrite an existing remote branch; retain/recover the original managed
+state and reconcile deliberately. The command never force-pushes, merges or resets either
+branch to conceal divergence. The force marker used when fetching only refreshes a private
+local inspection ref; it is never part of a push refspec.
+
+A rejected/lost push leaves the local commit available. Repeating the command with unchanged
+source data reuses that commit and retries the push. After Git reports success, a separate
+remote-ref query must confirm exactly the submitted commit before `remote_verified: true`
+is returned. `changed` refers to creation of a local commit, not whether network work occurred.
+Remote races, errors and timeouts produce an error, never a false publication receipt. The
+source Master CURRENT pointer is independent and is never rolled back by Git failures. All
+Git work, including checks, commit creation, push and acknowledgement, shares the existing
+120-second budget after local preparation.
+
+For HTTP authorization, set `SIRIUS_MASTER_GIT_AUTHORIZATION` externally to a complete single
+header value such as `Authorization: Bearer …` or `Authorization: Basic …`. Do not put credentials
+in REMOTE_URL. Git receives only the environment variable name through `--config-env`; the
+secret value is not embedded in command arguments or stored in repository configuration. Use a
+dedicated Git publication credential scoped to the selected repository. Git must support `--config-env`
+for this authorization mechanism. No ambient credential helper, Git askpass, system/global Git
+configuration or HTTP proxy is used; an explicit proxy can be configured as described below. Certificate verification stays enabled; redirects are
+disabled. SSH/custom transport URLs, URL credentials/query/fragments and malformed headers
+are rejected. CLI network publication accepts HTTPS only.
+
+An explicitly supplied `file:///absolute/path/to/repository.git` URL is supported for local
+mirrors and tests, with authorization unset. The library's HTTP test opt-in is not enabled by
+the CLI. Final production Git acceptance, including a packaged Windows binary, remains a
+separate release requirement.
+
+### Background Git publication
+
+JP, HK, EN and KR profiles may enable `master_git` with a separate `state_directory` and
+optional `remote`. The state directory's ownership marker records the scope, so another region
+cannot publish into it. A multi-region deployment rejects shared snapshot or Git state
+directories and shared remotes. Git tokens must be distinct per region.
+[The multi-region publisher example](examples/master-publisher.yaml) runs `master_update` plus
+`indented_root` publication for all four regions.
+`master_directory` is required. Omit `remote` for local commits only; omit `master_git` to
+leave the feature disabled. See the commented single-profile example configuration.
+
+The worker reconciles CURRENT at startup, after successful in-process Master installations,
+and every `interval_seconds` (default 300; range 10–86400). Polling also discovers CLI imports
+and retries failed publication. Git and consumer notifications use independent wake signals.
+Intermediate installations may coalesce into the latest snapshot. Keep the managed state
+across restarts: Git refs are durable, while displayed last-success status is rebuilt at startup.
+
+`GET /internal/v1/master-data/git` (or `/internal/v1/{region}/master-data/git`) requires the
+internal bearer. It reports pending/running/ready/failed/stopped/disabled, the last successful
+receipt and a static error code; it does not expose paths, remote URLs or credentials. Failure
+never rolls back installed Master data. Shutdown cancels active network work and releases the
+state lock; the next startup reconciles an ambiguous previous push against remote refs.
+
+Service remote configuration uses `url`, optional `authorization_env`, and explicit `allow_file`
+or `allow_http` opt-ins (both default false). Prefer HTTPS. Authorization must be a dedicated
+Git credential: deployment preparation rejects reuse of other service credentials, including
+underlying Bearer tokens and decoded Basic passwords. No remote is contacted at preparation;
+the configured background worker performs publication after service startup.
+
+### Indented root layout
+
+`master_git.layout` selects the published tree; the CLI commands use the profile's value too.
+
+- `native` (default): exact decoded table bytes plus `sirius-publication.json`, unchanged
+  from 1.2.0.
+- `indented_root`: at the repository root, every table of the pinned verified snapshot under
+  its usual name (for example `MasterExample.json`), re-indented with two spaces and a trailing
+  newline, plus `version.json`. Nothing else is in the tree.
+
+```json
+{
+  "dataVersion": "<Master version>",
+  "assetVersion": "<recorded resource_version>"
+}
+```
+
+Re-indentation is a token-preserving pretty printer over the original bytes, not a parse and
+reserialize: object key order, duplicate keys, number spellings (`1.0`, `1e3`, `-0`), string
+escapes and non-ASCII text are copied exactly; only insignificant whitespace changes. Empty
+objects and arrays are written `{}` and `[]`. Content hashes and sizes in manifests still refer
+to the original bytes; Git holds the formatted form. Tables removed upstream disappear from the
+next tree, and identical content reuses the existing commit. Commit messages keep
+`Sirius Master <region> <version>`.
+
+If the pinned snapshot has no recorded asset version, `indented_root` publication fails with
+error code `asset_version_unavailable` before any Git command runs, leaving refs untouched. It
+is retried at the next installation wakeup or interval; no empty or placeholder value is
+written. The `native` layout does not need provenance.
+
+`master_git.branch` (default `master-data`) names the local and remote branch, for example
+`main`. It accepts slash-separated components of ASCII letters, digits, `.`, `_` and `-`; a
+component cannot be empty, start with `.` or `-`, end with `.` or `.lock`, or contain `..`,
+and `HEAD` is rejected. Changing the branch or layout of an existing state directory starts or
+continues that branch in the same managed repository; other branches are left untouched. The
+remote safety rules are unchanged: a remote branch that is ahead or diverged, including an
+initialized repository whose `main` already has a README commit, is refused. Publish to an
+empty repository or to a branch that Sirius owns.
+
+```yaml
+master_git:
+  state_directory: ./data/master-git-jp
+  layout: indented_root
+  branch: main
+  remote:
+    url: https://github.com/example/sirius-jp-master.git
+    authorization_env: SIRIUS_MASTER_GIT_AUTHORIZATION
+```
+
+### Commit identity and signatures
+
+Both the background worker and `master-git-commit` / `master-git-push` use the profile's
+`master_git.commit` policy when present. Omitted policy preserves the default unsigned identity.
+
+```yaml
+master_git:
+  state_directory: ./data/master-git
+  commit:
+    author:
+      name: Sirius Data Maintainer
+      email: maintainer@example.invalid
+    committer:
+      name: Sirius Publisher
+      email: publisher@example.invalid
+    signing:
+      format: ssh
+      key: /run/secrets/master-signing-key
+      # program: /usr/bin/ssh-keygen
+```
+
+Omit `committer` to reuse `author`. Omit `signing` for explicitly unsigned new commits.
+SSH signing requires an absolute key path; use an agent-backed public key path or an
+unattended private key as appropriate for your deployment. OpenPGP uses `format: openpgp`
+(`gpg` is also accepted) and a hexadecimal key fingerprint in `key`, referencing the service
+account's keyring. Keys and passphrases must not be embedded in YAML. An optional `program`
+selects one absolute executable path containing only ASCII letters/digits, `/`, `.`, `_`, `-`;
+shell expressions and appended arguments are rejected. Omit it to use Git's signing executable
+default. Configure any required agent/keyring for unattended operation before starting service.
+
+Signers run inside the existing publication deadline and owned process group. Signing failures
+return a static error and do not advance the branch or alter installed Master data. The next
+retry can publish after the signer is repaired. No raw signer diagnostics are returned over HTTP.
+
+Identity/signing changes apply to newly created commits. Identical content still reuses the
+existing commit, including an older unsigned commit: enabling signing does not retroactively
+rewrite or re-sign history. Verify signatures using a separately trusted public key/keyring
+(for SSH, supply `gpg.ssh.allowedSignersFile` to `git verify-commit`). A successful push receipt
+confirms the remote ref, not a remote hosting provider's signature-trust badge.
+
+### Independent Git proxy
+
+Service profiles can set `master_git.remote.proxy_url_env` to a dedicated environment-variable
+name containing the full proxy URL. For the explicit `master-git-push` CLI, set
+`SIRIUS_MASTER_GIT_PROXY_URL`. Omitting it forces direct Git transport; it does not inherit
+another service's proxy or ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY settings.
+
+Supported proxy schemes are `http`, `https`, and `socks5h` (proxy-side DNS). Git's installed
+libcurl must support the selected transport. Optional username/password belong in the environment
+value, not the YAML, origin URL or command-line arguments. The subprocess receives the variable
+name via Git config-env; no proxy secret is stored in repository config or returned in errors.
+Environment names starting with GIT_ or reserved ambient proxy names are rejected. File remotes
+cannot use a proxy. URLs with non-root paths, query/fragment, incomplete credentials or control
+characters fail validation.
+
+HTTPS origins use CONNECT through HTTP proxies. Proxy authentication is separate from origin
+Authorization; origin headers are not attached to CONNECT. Origin and HTTPS-proxy certificates
+remain verified. Proxy refusal/authentication/transport failures fail publication without direct
+fallback, preserving the pending local commit and installed Master. Ambient bypass lists are
+removed from the owned Git subprocess, so they cannot silently override this explicit routing.
+
+
+## Complete snapshot tar downloads
+
+`GET /api/v1/master-data/bundle` and `/api/v1/master-data/by-hash/{content_sha256}/bundle`
+serve one verified local snapshot under the public bearer (regional deployments insert the
+region after `/api/v1`). They share the standalone registry's [bundle format and bounds](REGISTRY_SERVICE.md#verified-snapshot-bundles):
+exact original JSON tables, pinned manifest, full verification before response, temporary-file
+streaming, content ETag, and process-wide admission held through download completion.
+The API routes read local file snapshots; PostgreSQL bundles are available through the standalone
+PostgreSQL registry backend. No implicit fallback between backends occurs.

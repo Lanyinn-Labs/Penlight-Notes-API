@@ -2,4 +2,6 @@ pub mod api;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod offline_master;
+pub mod ranking;
 pub mod region;

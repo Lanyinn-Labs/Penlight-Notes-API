@@ -1,0 +1,55 @@
+# Private deployment configuration: no game account, CDN key or runtime proto bundle required.
+listen: 127.0.0.1:9998
+token_env: SIRIUS_REGISTRY_TOKEN
+scope:
+  region: jp
+  environment: release
+  platform: iOS
+regional_paths: false
+backend:
+  kind: files
+  directory: ./master
+# Or replace backend with:
+# backend:
+#   kind: postgres
+#   connection:
+#     host: database.example.invalid
+#     database: sirius_master
+#     username: sirius_reader
+#     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
+#     timeout_seconds: 30
+# Use a dedicated SELECT-only role on already initialized sirius_master_* tables.
+# tls:
+#   certificate_file: ./registry-cert.pem
+#   private_key_file: ./registry-key.pem
+# access_log:
+#   format: json
+#   output:
+#     type: stderr
+
+# Optional verified Master owner (credentials must all differ):
+# owner:
+#   internal_token_env: SIRIUS_REGISTRY_INTERNAL_TOKEN
+#   source:
+#     origin: https://owner.example.invalid
+#     token_env: SIRIUS_MASTER_OWNER_TOKEN
+#     regional_paths: false
+#     interval_seconds: 300
+#     timeout_seconds: 600
+#     request_timeout_ms: 60000
+#   staging_directory: ./registry-master # PostgreSQL only; omit for files
+
+# For local-only publication, omit owner.source and set:
+# owner:
+#   internal_token_env: SIRIUS_REGISTRY_INTERNAL_TOKEN
+#   local_interval_seconds: 300
+#   staging_directory: ./registry-master # PostgreSQL only
+
+# Optional outbound update hints to consumers that pull from this registry:
+# notify:
+#   interval_seconds: 30
+#   request_timeout_ms: 5000
+#   targets:
+#     - name: replica-a
+#       origin: https://replica-a.example.invalid
+#       token_env: SIRIUS_REPLICA_A_INTERNAL_TOKEN

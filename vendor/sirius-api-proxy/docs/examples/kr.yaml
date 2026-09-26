@@ -1,0 +1,28 @@
+# JSON is valid YAML. default_cdn_root is the first CDN line of the Korea server-list entry.
+# Optional Master pipeline (docs/REGIONS.md#master-data): remove the leading "# " from the
+# commented lines to download Master data without CDN authorization and publish it to Git.
+# Optional resource snapshots for the asset updater (docs/REGIONS.md#resource-snapshots): the
+# resource_snapshot line serves schema-3 snapshots from the anonymous catalog .hash.
+# Optional Global SDK guest account (docs/ACCOUNTS.md#global-accounts): uncomment the accounts
+# and global_login lines, create the private identity file and export SIRIUS_GLOBAL_SDK_APP_KEY.
+{
+  "region": "kr",
+  "platform": "Android",
+  "listen": "127.0.0.1:9999",
+  "environment": "release",
+  "endpoint": "https://l14-prod-kr-all-gs-sirius.bilibiligame.net",
+  "client_version": "1.0.1",
+  "session_lock": true,
+  "protocol_directory": "protocol/global/1.0.1",
+  "api_token_env": "SIRIUS_KR_API_TOKEN",
+  "internal_token_env": "SIRIUS_KR_INTERNAL_TOKEN",
+  "default_cdn_root": "https://l14-prod-sg-patch-sirius.bilibiligame.net/prod/kr_461b4e9a7c2385f0e2d966a1b73c8f52",
+  # "master_directory": "data/kr/master",
+  # "master_update": {"cdn_authorization": "none", "key_hex_env": "SIRIUS_MASTER_KEY_HEX", "iv_hex_env": "SIRIUS_MASTER_IV_HEX", "interval_seconds": 300},
+  # "master_git": {"state_directory": "data/kr/master-git", "layout": "indented_root", "branch": "main",
+  #   "remote": {"url": "https://github.com/Srirus-Project/sirius-kr-master.git", "authorization_env": "SIRIUS_MASTER_GIT_KR_AUTHORIZATION"}},
+  # "resource_snapshot": {"cdn_authorization": "none", "catalog_hash_ttl_seconds": 60},
+  # "accounts": [{"name": "kr-guest", "global_identity_file": "/run/secrets/sirius-global-guest-1.json"}],
+  # "global_login": {"sdk_app_key_env": "SIRIUS_GLOBAL_SDK_APP_KEY", "login_min_interval_seconds": 300, "max_logins_per_day": 24},
+  "cdn_credential_env": {}
+}

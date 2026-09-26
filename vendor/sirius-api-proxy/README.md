@@ -1,0 +1,178 @@
+# Sirius API Proxy
+
+A Rust API proxy for **BanG Dream! Our Notes**. Derived from
+[Haruki-Sekai-API](https://github.com/Team-Haruki/Haruki-Sekai-API), with game-specific
+protocols and a standalone implementation. Haruki's MIT attribution is retained
+in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial project.
+
+## Features
+
+- Version, announcements, public player profiles, song/event/challenge rankings and event decks.
+- Separate public API and internal administration tokens; private account responses stay internal.
+- Binary Protobuf over HTTP/2 unary gRPC with verified TLS, trailers, deadlines and response limits.
+- Optional per-region [HTTP/HTTPS outbound proxies](docs/UPSTREAM_PROXY.md) with scoped authentication.
+- Optional [per-client API tokens](docs/CLIENT_AUTH.md) with PostgreSQL users and region grants.
+- Native Protobuf/JSON codecs generated at build time; compatible proto hot reload switches to
+  dynamic codecs without restarting. Rebuilding restores the native path for the new definitions.
+- Master manifest verification, Rijndael-256 decryption, gzip/JSON validation, atomic snapshots,
+  local table queries and optional periodic updates. No database is required.
+- Optional [transactional PostgreSQL Master mirror](docs/MASTER_DATABASE.md) with exact JSON bytes,
+  searchable JSONB, publication history and scoped snapshot retention.
+- Version-pinned resource snapshots for Sirius Asset Updater, with CDN allowlists and secret references.
+
+The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version **1.2.1** is
+independent of the game's client version, protocol label and resource version.
+Only explicitly supported RPCs for the selected region are exposed; arbitrary RPC forwarding is unavailable.
+
+An account-free [Master registry reader](docs/REGISTRY_SERVICE.md) can serve file or PostgreSQL snapshots
+with `registry-serve`, using the same manifest contract as Master consumers.
+
+## Regions
+
+Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejected before
+network activity. Use one instance per region. JP retains its existing functionality; Global
+supports verified server discovery/version queries, player operations with SDK guest accounts, the Master data pipeline (download,
+registry, sync, Git and database publication) and schema-3 resource snapshots for the asset
+updater (`resource_snapshot`). A production end-to-end Global asset acceptance run is still
+pending. Global player operations use SDK guest accounts that log in lazily with `PlayerLogin`
+([Global accounts](docs/ACCOUNTS.md#global-accounts)); login and player data are live-verified,
+the other Global reads are implemented but not yet exercised live. See [region support and upgrade
+instructions](docs/REGIONS.md) before deploying paired v1.2.1 services.
+
+## Quick start
+
+Extract the release archive and run from its root, or build from source with Rust 1.96 or later:
+
+```sh
+cargo build --release --locked
+cp sirius-api-config.example.yaml sirius-api-config.yaml
+export SIRIUS_API_TOKEN='replace-with-a-long-random-token'
+export SIRIUS_INTERNAL_TOKEN='replace-with-a-different-long-random-token'
+./target/release/sirius-api-proxy
+# Release archive: ./sirius-api-proxy (sirius-api-proxy.exe on Windows)
+```
+
+For one process serving multiple regions, see [multi-region configuration](docs/MULTI_REGION.md).
+
+`SIRIUS_CONFIG_PATH` overrides the configuration path. Default listen address: `127.0.0.1:9999`.
+Keep the bundled `protocol/` directory beside the executable and run from that directory,
+or configure an absolute `protocol_directory`. No external protoc, Redis or database is needed.
+
+Player queries require an account. JP uses an existing account: use `accounts`, or configure both
+`player_id_env` and `player_credential_env`, then provide the referenced secrets. The service does
+not register, transfer or delete JP accounts. HK/EN/KR use SDK guest identity files; the one-shot
+`global-account bootstrap` (explicit `--create-sdk-guest`) and `global-account verify` commands
+are described in [Global accounts](docs/ACCOUNTS.md#global-accounts), including the terms-of-service
+risk. Public profile IDs are different from credential player IDs.
+
+For multiple existing accounts, see [account pool and live credential rotation](docs/ACCOUNTS.md).
+
+`session_lock` defaults to `true`, including when omitted from existing configuration.
+Set `session_lock: false` to allow concurrent upstream RPCs for the same configured account;
+restart the proxy to apply the change. Upstream concurrency support is not confirmed, and
+server instability can also cause request failures. Keep the default unless testing or
+operating with that uncertainty. The default 20-second request deadline includes time waiting for
+serialization, bootstrap or protocol activation. Initial authenticated Version discovery
+remains single-flight, and protocol reload waits for all active logical calls in either mode.
+With concurrency enabled, upstream observations reflect response completion order.
+
+CDN secrets are optional for API-only use. Resource snapshots become ready only when the
+observed CDN and credential match configuration. Secret values are never included in responses.
+Rotate secrets in the deployment environment and restart after a server-side credential change.
+
+## HTTP API
+
+All routes except `/health` require `Authorization: Bearer ...`. Public `/api/v1` routes also accept
+a per-client `X-Sirius-Token` when [client authorization](docs/CLIENT_AUTH.md) is configured.
+
+| Route | Token | Result |
+| --- | --- | --- |
+| `GET /health` | None | Process health and service version, not upstream availability |
+| `GET /api/v1/system` | API | Region, supported RPCs, version and availability observation |
+| `GET /api/v1/regions` | API | Region capabilities, including reserved CN |
+| `GET /api/v1/servers` | API | Global server list; JP returns 501 |
+| `GET /api/v1/announcements?tab=0` | API | Announcement list; tab is 0, 1 or 2 |
+| `GET /api/v1/announcements/{id}` | API | Announcement details |
+| `GET /api/v1/players/by-profile-id/{profile_id}` | API | Public player profile |
+| `GET /api/v1/events/{event_id}/rankings?ranks=1,10,100` | API | Up to 100 distinct positive ranks |
+| `GET /api/v1/events/{event_id}/players/{player_id}/deck` | API | Event deck |
+| `GET /api/v1/songs/{song_id}/rankings` | API | Song ranking without the service account's myRank |
+| `GET /api/v1/challenge-songs/{challenge_song_id}/rankings` | API | Challenge ranking without myRank/myScore |
+| `GET /api/v1/master-data` | API | Local Master version and table index |
+| `GET /api/v1/master-data/tables/{name}` | API | Original table JSON with x-master-version |
+| `GET /internal/v1/protocol` | Internal | Protocol fingerprint, codec and generation |
+| `POST /internal/v1/protocol/reload` | Internal | Validate and activate the configured proto bundle |
+| `GET /internal/v1/master-data/updater` | Internal | Last update status; does not trigger an update |
+| `GET /internal/v1/account` | Internal | Verify the configured account identity |
+| `GET /internal/v1/account/player-data` | Internal | Read the service account's private data |
+| `GET /internal/v1/resources/snapshot` | Internal | Last observed resource snapshot |
+
+HTTP `v1` is independent of game versions. Environment and upstream are deployment settings,
+not request parameters. Protobuf JSON int64/uint64 values are strings; original Master JSON
+may contain numeric integers that require a lossless parser.
+
+`/system` returns HTTP 200 with `status: unavailable` for valid upstream business errors;
+network/protocol failures return 502 and timeouts return 504. Other upstream errors map to
+502/503. Invalid caller tokens return 401; an unconfigured game account returns 503.
+Raw credential fields and grpc-message values are not returned to callers.
+
+## Master data and protocol updates
+
+```sh
+# Offline import; supply SIRIUS_MASTER_KEY_HEX and SIRIUS_MASTER_IV_HEX.
+./sirius-api-proxy master-import /path/to/encrypted-master ./master-data
+# Optionally record the matching asset version (needed by the indented Git layout).
+./sirius-api-proxy master-import /path/to/encrypted-master ./master-data --resource-version VERSION
+# One remote update using the configured master_update settings.
+./sirius-api-proxy master-update
+# Hot reload a complete, compatible proto bundle.
+curl --fail-with-body -X POST -H "Authorization: Bearer $SIRIUS_INTERNAL_TOKEN" \
+  http://127.0.0.1:9999/internal/v1/protocol/reload
+```
+
+Master key and IV each contain 32 bytes encoded as 64 hexadecimal characters.
+Configure `master_directory` to serve snapshots. Remote updates verify manifest hashes,
+decrypt and parse every table, recheck the version and atomically switch CURRENT.
+Failed updates preserve the old snapshot; a writer lock prevents concurrent publication.
+Optional background updates run at the configured interval without overlapping.
+See [Master CDN proxy, retry and deadline configuration](docs/MASTER_NETWORK.md).
+
+Protocol reload rejects incompatible changes with HTTP 422 and keeps the previous schema.
+In-flight logical requests use one schema throughout. Files are not watched automatically.
+See [protocol updates](docs/PROTO_RELOAD.md) and [deployment checks](docs/DEPLOYMENT_CHECKS.md).
+
+## Deployment and scope
+
+The Docker image contains the executable and protocol bundle. Mount configuration, supply
+secrets and set `listen: 0.0.0.0:9999` inside the container. Persist `/app/master-data` if enabled.
+Restrict internal routes at the reverse proxy as well as through their separate token.
+
+The current JP baseline has been exercised for identity, account data, public profiles,
+announcements, song rankings, 235 Master tables and native/dynamic protocol switching.
+Event/challenge business responses and an established friendship were not covered by live testing.
+Account pooling, per-region clients and [configurable request controls](docs/REQUEST_POLICY.md)
+and [scoped response caching](docs/RESPONSE_CACHE.md) are available. Multi-node
+coordination and remaining cache refresh policies are tracked in the 1.2.0 restoration ledger.
+Upstream availability is outside this service's control.
+
+## Development and release
+
+```sh
+cargo fmt --all -- --check
+cargo check --locked --all-targets
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+```
+
+Tests use local fixtures and do not require the game servers. Release archives include the
+runtime protocol bundle, examples, documentation and licenses. See [release preparation](docs/RELEASING.md).
+Repository visibility and workflow activation are separate from preparing a release.
+
+For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).
+
+Configure optional [access logs and trusted proxies](docs/ACCESS_LOG.md) at the service root.
+
+See [application logging](docs/APPLICATION_LOG.md) for process logs, separate from HTTP access logs.
+
+Every configuration field of the original Haruki-Sekai-API is mapped, adapted or excluded with
+evidence in the [configuration audit](docs/CONFIG_AUDIT.md).
