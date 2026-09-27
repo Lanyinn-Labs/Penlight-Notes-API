@@ -1,0 +1,88 @@
+name: Android version monitor
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-version-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Detect official Android version
+        id: version
+        run: python scripts/check_android_version.py --write-candidate docs/android-update-candidate.md --github-output "$GITHUB_OUTPUT"
+        shell: bash
+      - name: Prepare review branch
+        if: steps.version.outputs.update_available == 'true'
+        id: candidate
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config commit.gpgsign false
+          if [ ! -f docs/android-update-candidate.md ] && ! git ls-files --error-unmatch docs/android-update-candidate.md >/dev/null 2>&1; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          candidate_dir=$(mktemp -d)
+          if [ -f docs/android-update-candidate.md ]; then
+            cp docs/android-update-candidate.md "$candidate_dir/candidate.md"
+          fi
+          if git ls-files --error-unmatch docs/android-update-candidate.md >/dev/null 2>&1; then
+            git restore -- docs/android-update-candidate.md
+          else
+            rm -f docs/android-update-candidate.md
+          fi
+          if git fetch origin automation/android-client-update; then
+            git switch -c automation/android-client-update FETCH_HEAD
+          else
+            git switch -c automation/android-client-update
+          fi
+          mkdir -p docs
+          if [ -f "$candidate_dir/candidate.md" ]; then
+            cp "$candidate_dir/candidate.md" docs/android-update-candidate.md
+          else
+            rm -f docs/android-update-candidate.md
+          fi
+          git add -A -- docs/android-update-candidate.md
+          if git diff --cached --quiet; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m 'docs: prepare Japanese Android client compatibility review'
+          git push origin HEAD:automation/android-client-update
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Open or refresh draft adaptation PR
+        if: steps.candidate.outputs.changed == 'true'
+        shell: bash
+        run: |
+          if [ "$(gh pr list --head automation/android-client-update --base main --state open --json number --jq 'length')" = 0 ]; then
+            gh pr create --draft --base main --head automation/android-client-update \
+              --title 'docs: review Japanese Android client update' \
+              --body-file docs/android-update-candidate.md
+          else
+            gh pr edit automation/android-client-update --body-file docs/android-update-candidate.md
+          fi
+      - name: Run checks on candidate branch
+        if: steps.candidate.outputs.changed == 'true'
+        run: gh workflow run ci.yml --ref automation/android-client-update

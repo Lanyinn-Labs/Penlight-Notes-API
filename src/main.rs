@@ -5,10 +5,27 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments == ["master-update"] {
+        let config = Config::from_env().map_err(std::io::Error::other)?;
+        let client = api::load_client(&config)
+            .map_err(std::io::Error::other)?
+            .ok_or("JP protocol configuration is required")?;
+        let settings = config
+            .region(penlight_notes_api::region::Region::Jp)
+            .sirius
+            .as_ref()
+            .ok_or("JP protocol configuration is required")?;
+        let updater =
+            sirius_api_proxy::master_update::MasterUpdater::new(settings, client.core.clone())
+                .map_err(|_| "Master update configuration or secrets are unavailable")?;
+        let result = updater.update_once().await?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
     if !arguments.is_empty() {
         if arguments.len() != 3 || arguments[0] != "master-import" {
             return Err(
-                "usage: penlight-notes-api [master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY]"
+                "usage: penlight-notes-api [master-update | master-import ENCRYPTED_DIRECTORY OUTPUT_DIRECTORY]"
                     .into(),
             );
         }

@@ -16,7 +16,7 @@ on:
       - 'src/**'
       - 'data/**'
       - 'vendor/**'
-      - 'config/jp.example.json'
+      - 'config/*.example.json'
       - 'scripts/**'
       - 'LICENSE'
       - 'THIRD-PARTY-NOTICES.md'

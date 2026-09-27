@@ -87,6 +87,7 @@ fn assemble(
         )
         .route("/{region}/master-schema", get(handlers::master_schema_list))
         .route("/{region}/master-data", get(handlers::master_data))
+        .route("/{region}/master-updater", get(handlers::master_updater))
         .route("/{region}/master/{table}", get(handlers::master_records))
         .route(
             "/{region}/master-schema/{table}",

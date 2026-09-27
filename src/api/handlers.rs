@@ -393,3 +393,12 @@ pub async fn event_cutoffs(
         serde_json::to_value(response).expect("cutoff response is serializable"),
     ))
 }
+
+/// Read-only status of the configured Master updater/synchronizer.
+pub async fn master_updater(
+    State(state): State<SharedState>,
+    Path(region): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let client = online(&state, Region::parse(&region)?)?;
+    Ok(Json(envelope(client.core.master_update_status().await)))
+}

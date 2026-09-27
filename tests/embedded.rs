@@ -192,3 +192,28 @@ fn upstream_errors_preserve_business_status_without_private_diagnostics() {
         "game service returned an invalid ranking response"
     );
 }
+
+#[tokio::test]
+async fn master_updater_status_is_read_only_and_missing_secrets_fail_startup() {
+    let mut frontend = Config::default();
+    frontend.regions[1].sirius = Some(settings());
+    let router = api::build(Arc::new(frontend));
+    let (status, body) = get(router, "/api/jp/master-updater").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"]["status"], "disabled");
+
+    let mut value: Value =
+        serde_json::from_str(include_str!("../config/jp.master-update.example.json")).unwrap();
+    value["accounts"] = json!([]);
+    value["protocol_directory"] = json!(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"));
+    value["master_update"]["username_env"] = json!("PENLIGHT_TEST_MISSING_CDN_USERNAME_672b7111");
+    let config: sirius_api_proxy::config::Config = serde_json::from_value(value).unwrap();
+    config.validate().unwrap();
+    let client = SiriusClient::new(config).unwrap();
+    assert_eq!(
+        client.core.master_update_status().await["status"],
+        "pending"
+    );
+    assert!(client.start_workers().is_err());
+}

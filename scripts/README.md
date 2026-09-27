@@ -2,6 +2,7 @@
 
 | 脚本 | 用途 |
 | --- | --- |
+| `check_android_version.py` | 检测 Google Play 官方安卓版本，生成适配候选 |
 | `check_release.py` | 校验来源及 GitHub 版本标签 |
 | `package_release.py` | 按公开文件清单打包运行环境 |
 | `smoke_release.py` | 解压并校验下载包，验证离线启动及认证 |

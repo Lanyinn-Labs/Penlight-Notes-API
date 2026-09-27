@@ -46,6 +46,7 @@ docker compose up -d --build
 - [API 参考](docs/api.md)
 - [配置参考](docs/configuration.md)
 - [账号配置](docs/account-setup.md)
+- [自动更新](docs/updates.md)
 - [构建与发布](docs/releases.md)
 - [维护工具](scripts/README.md)
 

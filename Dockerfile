@@ -13,7 +13,7 @@ RUN adduser -D -H -u 10001 penlight
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/target/release/penlight-notes-api /usr/local/bin/
 COPY vendor/sirius-api-proxy/protocol /app/vendor/sirius-api-proxy/protocol
-COPY config/jp.example.json /app/config/jp.example.json
+COPY config/jp.example.json config/jp.master-update.example.json /app/config/
 COPY LICENSE THIRD-PARTY-NOTICES.md docs/upstream-attribution.md /usr/share/doc/penlight-notes-api/
 COPY vendor/sirius-api-proxy/LICENSE /usr/share/doc/penlight-notes-api/SIRIUS-LICENSE
 COPY vendor/sirius-api-proxy/LICENSE-protobuf /usr/share/doc/penlight-notes-api/PROTOBUF-LICENSE

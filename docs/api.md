@@ -81,6 +81,7 @@ status 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数
 
 | GET 路径 | 说明 |
 | --- | --- |
+| `/api/jp/master-updater` | 后台 Master 更新/同步状态，只读 |
 | `/api/jp/master-data` | 经校验的已发布快照清单、Master 版本、表摘要 |
 | `/api/{region}/master/{table}` | 读取表原始记录，例如 MasterCharacter |
 | `/api/{region}/master-schema` | APK 提取的静态表结构索引 |

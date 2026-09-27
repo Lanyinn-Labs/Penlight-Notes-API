@@ -12,10 +12,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = ['README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', '.env.example',
-                'config/jp.example.json', 'vendor/sirius-api-proxy/LICENSE',
+                'config/jp.example.json', 'config/jp.master-update.example.json', 'vendor/sirius-api-proxy/LICENSE',
                 'vendor/sirius-api-proxy/LICENSE-protobuf', 'vendor/sirius-api-proxy/UPSTREAM.json']
 PUBLIC_TREES = ['docs', 'vendor/sirius-api-proxy/protocol', 'vendor/sirius-api-proxy/docs']
-TOOLS = ['import_jp_master.py', 'inspect_jp_local_save.py', 'decrypt_master.py',
+TOOLS = ['check_android_version.py', 'import_jp_master.py', 'inspect_jp_local_save.py', 'decrypt_master.py',
          'decrypt_master_split_apk.py', 'README.md']
 
 

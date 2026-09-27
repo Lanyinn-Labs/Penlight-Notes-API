@@ -10,6 +10,7 @@
 !vendor/**
 !config/
 !config/jp.example.json
+!config/jp.master-update.example.json
 !LICENSE
 !THIRD-PARTY-NOTICES.md
 !docs/
