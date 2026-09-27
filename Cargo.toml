@@ -1,6 +1,6 @@
 [package]
 name = "penlight-notes-api"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Unofficial API server for BanG Dream! Our Notes"
 license = "MIT"
