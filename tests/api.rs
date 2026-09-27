@@ -7,7 +7,7 @@ use penlight_notes_api::{
     api,
     config::Config,
     error::AppError,
-    ranking::{CachePolicy, RankingPoint, RankingRequest, RankingSource, SourceError},
+    ranking::{CachePolicy, RankingPoint, RankingRequest, RankingSource},
     region::Region,
 };
 use serde_json::Value;
@@ -44,11 +44,11 @@ async fn call_router(router: Router, path: &str, header: Option<(&str, &str)>) -
 
 struct FakeRankingSource {
     calls: AtomicUsize,
-    replies: Mutex<VecDeque<Result<Vec<RankingPoint>, SourceError>>>,
+    replies: Mutex<VecDeque<Result<Vec<RankingPoint>, AppError>>>,
 }
 
 impl FakeRankingSource {
-    fn new(replies: Vec<Result<Vec<RankingPoint>, SourceError>>) -> Self {
+    fn new(replies: Vec<Result<Vec<RankingPoint>, AppError>>) -> Self {
         Self {
             calls: AtomicUsize::new(0),
             replies: Mutex::new(replies.into()),
@@ -61,14 +61,14 @@ impl RankingSource for FakeRankingSource {
         &'a self,
         _region: Region,
         _request: &'a RankingRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, SourceError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, AppError>> + Send + 'a>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let reply = self
             .replies
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Err(SourceError::Unavailable));
+            .unwrap_or(Err(AppError::UpstreamUnavailable));
         Box::pin(async move {
             tokio::task::yield_now().await;
             reply
@@ -140,11 +140,18 @@ async fn authentication_protects_api_but_not_health() {
 #[tokio::test]
 async fn configured_upstream_is_not_reported_as_ready() {
     let mut config = Config::default();
-    config.regions[0].base_url = Some("https://example.invalid/secret".into());
+    config.regions[1].sirius = Some(serde_json::from_value(serde_json::json!({
+        "region":"jp", "platform":"Android", "environment":"release",
+        "endpoint":"https://example.invalid", "client_version":"1.0.2",
+        "protocol_directory":std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"),
+        "api_token_env":"unused", "internal_token_env":"unused", "accounts":[],
+        "default_cdn_root":"https://static.bang-dream-on.jp",
+        "cdn_credential_env":{"https://static.bang-dream-on.jp":"PENLIGHT_CDN_PASSWORD"}
+    })).unwrap());
     let (status, body) = call(config, "/servers", None).await;
     assert_eq!(status, 200);
-    assert_eq!(body["servers"][0]["upstream_configured"], true);
-    assert_eq!(body["servers"][0]["upstream_ready"], false);
+    assert_eq!(body["servers"][1]["upstream_configured"], true);
+    assert_eq!(body["servers"][1]["upstream_ready"], false);
     assert!(!body.to_string().contains("example.invalid"));
 }
 
@@ -409,7 +416,7 @@ async fn cutoff_cache_marks_old_values_stale_then_stops_serving_them() {
             rank: 100,
             point: 5000,
         }]),
-        Err(SourceError::Unavailable),
+        Err(AppError::UpstreamUnavailable),
     ]));
     let service = penlight_notes_api::ranking::RankingService::new(
         source.clone(),
@@ -438,7 +445,7 @@ async fn cutoff_cache_marks_old_values_stale_then_stops_serving_them() {
                 rank: 100,
                 point: 5000,
             }]),
-            Err(SourceError::Unavailable),
+            Err(AppError::UpstreamUnavailable),
         ])),
         CachePolicy {
             fresh: Duration::ZERO,
@@ -469,4 +476,111 @@ async fn invalid_upstream_ranking_data_is_rejected() {
     let (status, body) = call_router(router, "/api/global/events/42/cutoffs?ranks=100", None).await;
     assert_eq!(status, 502);
     assert_eq!(body["error"]["code"], "upstream_invalid_response");
+}
+
+struct WaitingRankingSource {
+    entered: tokio::sync::Notify,
+}
+impl RankingSource for WaitingRankingSource {
+    fn fetch<'a>(
+        &'a self,
+        _: Region,
+        _: &'a RankingRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, AppError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_follows_authentication_and_exempts_health() {
+    let mut config = Config {
+        api_key: Some("key".into()),
+        ..Config::default()
+    };
+    config.request_limits.per_second = 1;
+    config.request_limits.burst = 1;
+    let router = api::build(Arc::new(config));
+    assert_eq!(
+        call_router(router.clone(), "/api/jp/application", None)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        call_router(
+            router.clone(),
+            "/api/jp/application",
+            Some(("X-API-Key", "key"))
+        )
+        .await
+        .0,
+        501
+    );
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/jp/application")
+                .header("X-API-Key", "key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "api_rate_limited");
+    assert_eq!(call_router(router, "/health", None).await.0, 200);
+}
+
+#[tokio::test]
+async fn concurrency_rejects_without_queueing_and_cancellation_releases_capacity() {
+    let source = Arc::new(WaitingRankingSource {
+        entered: tokio::sync::Notify::new(),
+    });
+    let mut config = Config::default();
+    config.request_limits.max_concurrent = 1;
+    let router = api::build_with_ranking_source(Arc::new(config), source.clone());
+    let pending = tokio::spawn(call_router(
+        router.clone(),
+        "/api/jp/events/1/cutoffs?ranks=1",
+        None,
+    ));
+    tokio::time::timeout(Duration::from_secs(1), source.entered.notified())
+        .await
+        .unwrap();
+    let (status, body) = call_router(router.clone(), "/api/jp/master-schema", None).await;
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["code"], "api_busy");
+    assert_eq!(call_router(router.clone(), "/health", None).await.0, 200);
+    pending.abort();
+    let _ = pending.await;
+    assert_eq!(
+        call_router(router, "/api/jp/master-schema", None).await.0,
+        200
+    );
+}
+
+#[tokio::test]
+async fn total_timeout_returns_json_and_releases_capacity() {
+    let source = Arc::new(WaitingRankingSource {
+        entered: tokio::sync::Notify::new(),
+    });
+    let mut config = Config::default();
+    config.request_limits.max_concurrent = 1;
+    config.request_limits.timeout = Duration::from_millis(30);
+    let router = api::build_with_ranking_source(Arc::new(config), source);
+    let (status, body) =
+        call_router(router.clone(), "/api/jp/events/1/cutoffs?ranks=1", None).await;
+    assert_eq!(status, 504);
+    assert_eq!(body["error"]["code"], "api_timeout");
+    assert_eq!(
+        call_router(router, "/api/jp/master-schema", None).await.0,
+        200
+    );
 }

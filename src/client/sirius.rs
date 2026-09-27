@@ -5,7 +5,7 @@
 use crate::{
     config::SiriusConfig,
     error::AppError,
-    ranking::{RankingPoint, RankingRequest, RankingSource, SourceError},
+    ranking::{RankingPoint, RankingRequest, RankingSource},
     region::Region,
 };
 use serde_json::{json, Value};
@@ -18,80 +18,9 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-pub enum Query {
-    System,
-    Announcements(i32),
-    Announcement(i64),
-    Profile(i64),
-    EventRanking(RankingRequest),
-    EventDeck(i64, String),
-    MusicRanking(i64),
-    ChallengeRanking(i64),
-    Account,
-    PlayerData,
-}
-
-impl Query {
-    fn operation(&self) -> Result<Operation, AppError> {
-        let positive = |id: i64| {
-            if id > 0 {
-                Ok(id)
-            } else {
-                Err(AppError::InvalidQuery)
-            }
-        };
-        Ok(match self {
-            Self::System => Operation::Version {},
-            Self::Announcements(tab) if (0..=2).contains(tab) => {
-                Operation::Announcements { tab: *tab }
-            }
-            Self::Announcements(_) => return Err(AppError::InvalidQuery),
-            Self::Announcement(id) => Operation::Announcement { id: positive(*id)? },
-            Self::Profile(id) => Operation::Profile {
-                profile_id: positive(*id)?,
-            },
-            Self::EventRanking(request) => {
-                let ranks = request
-                    .ranks
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let checked = RankingRequest::parse(&request.event_id.to_string(), &ranks)?;
-                Operation::EventRanking {
-                    event_id: checked.event_id,
-                    ranks: checked.ranks,
-                }
-            }
-            Self::EventDeck(id, player) => {
-                if player.is_empty()
-                    || player.len() > 128
-                    || !player
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                {
-                    return Err(AppError::InvalidQuery);
-                }
-                Operation::EventDeck {
-                    event_id: positive(*id)?,
-                    player_id: player.clone(),
-                }
-            }
-            Self::MusicRanking(id) => Operation::MusicRanking {
-                music_id: positive(*id)?,
-            },
-            Self::ChallengeRanking(id) => Operation::ChallengeRanking {
-                challenge_music_id: positive(*id)?,
-            },
-            Self::Account | Self::PlayerData => return Err(AppError::InvalidQuery),
-        })
-    }
-}
-
 pub struct SiriusClient {
     pub core: Arc<GameClient>,
     settings: SiriusConfig,
-    observation: std::sync::Mutex<Option<(Instant, bool)>>,
     player_data: Mutex<Option<(Instant, Value)>>,
 }
 
@@ -105,54 +34,53 @@ impl SiriusClient {
         Ok(Self {
             core,
             settings,
-            observation: std::sync::Mutex::new(None),
             player_data: Mutex::new(None),
         })
     }
 
-    pub fn ready(&self) -> bool {
-        self.observation
-            .lock()
-            .expect("observation mutex poisoned")
-            .as_ref()
-            .is_some_and(|(at, ready)| *ready && at.elapsed() < Duration::from_secs(60))
+    pub async fn ready(&self) -> bool {
+        self.upstream_status(Duration::from_secs(300)).await["status"] == "available"
     }
 
-    pub async fn query(&self, query: Query) -> Result<Value, AppError> {
-        if matches!(query, Query::System) {
-            let execution = self.core.public_query(Operation::Version {}).await;
-            let available = match execution.result {
-                Ok(_) => true,
-                Err(sirius_api_proxy::error::AppError::Grpc(_)) => false,
-                Err(error) => return Err(map_error(error)),
-            };
-            *self.observation.lock().expect("observation mutex poisoned") =
-                Some((Instant::now(), available));
-            return Ok(
-                json!({"region":"jp", "status":if available {"available"} else {"unavailable"}, "platform":self.core.platform(), "observation":execution.observation, "supported_rpcs":self.core.supported_routes()}),
-            );
-        }
-        let mut value = match query {
-            Query::Account => {
-                self.core
-                    .call("/app.player.PlayerService/Whoami", json!({}))
-                    .await
-            }
-            Query::PlayerData => {
-                self.core
-                    .call("/app.player.PlayerService/GetPlayerData", json!({}))
-                    .await
-            }
-            _ => self.core.public_call(query.operation()?).await,
-        }
-        .map_err(map_error)?;
-        if matches!(query, Query::MusicRanking(_) | Query::ChallengeRanking(_)) {
+    pub async fn upstream_status(&self, ttl: Duration) -> Value {
+        let observation = self.core.observation().await;
+        upstream_snapshot(&observation, chrono::Utc::now(), ttl)
+    }
+
+    pub async fn application(&self) -> Result<Value, AppError> {
+        let execution = self.core.public_query(Operation::Version {}).await;
+        let available = match execution.result {
+            Ok(_) => true,
+            Err(sirius_api_proxy::error::AppError::Grpc(_)) => false,
+            Err(error) => return Err(map_error(error)),
+        };
+        Ok(
+            json!({"region":"jp", "status":if available {"available"} else {"unavailable"},
+            "platform":self.core.platform(), "observation":execution.observation,
+            "supported_rpcs":self.core.supported_routes()}),
+        )
+    }
+
+    pub async fn query(&self, operation: Operation) -> Result<Value, AppError> {
+        let ranking = matches!(
+            operation,
+            Operation::MusicRanking { .. } | Operation::ChallengeRanking { .. }
+        );
+        let mut value = self.core.public_call(operation).await.map_err(map_error)?;
+        if ranking {
             if let Some(object) = value.as_object_mut() {
                 object.remove("myRank");
                 object.remove("myScore");
             }
         }
         Ok(value)
+    }
+
+    pub async fn whoami(&self) -> Result<Value, AppError> {
+        self.core
+            .call("/app.player.PlayerService/Whoami", json!({}))
+            .await
+            .map_err(map_error)
     }
 
     pub async fn account_data(&self) -> Result<Value, AppError> {
@@ -162,7 +90,11 @@ impl SiriusClient {
                 return Ok(data.clone());
             }
         }
-        let data = self.query(Query::PlayerData).await?;
+        let data = self
+            .core
+            .call("/app.player.PlayerService/GetPlayerData", json!({}))
+            .await
+            .map_err(map_error)?;
         if !data["playerData"].is_object() {
             return Err(AppError::UpstreamInvalidResponse);
         }
@@ -258,52 +190,70 @@ impl SiriusClient {
         crate::offline_master::normalize_jp_catalog(document, Some(&texts), resource)
     }
 
-    pub fn start_workers(&self) -> Result<BackgroundTasks, String> {
+    pub async fn profile_summary(&self, raw: &Value) -> Value {
+        // Pin one validated snapshot across all lookups. Public data remains usable
+        // when optional enrichment tables are unavailable.
+        let manifest = self.master_manifest().await.ok();
+        let (ranks, cards, texts) = match &manifest {
+            Some(manifest) => tokio::join!(
+                self.master_records_at(manifest, "MasterPlayerRank"),
+                self.master_records_at(manifest, "MasterMemberCard"),
+                self.master_records_at(manifest, "MasterText"),
+            ),
+            None => return super::profile::summarize(raw, None, None, None, None),
+        };
+        super::profile::summarize(
+            raw,
+            ranks.ok().as_ref(),
+            cards.ok().as_ref(),
+            texts.ok().as_ref(),
+            manifest.as_ref().map(|manifest| manifest.version.as_str()),
+        )
+    }
+
+    pub fn start_worker(&self) -> Result<Option<BackgroundTask>, String> {
         let (shutdown, receiver) = tokio::sync::watch::channel(false);
-        let mut handles = Vec::new();
-        if self.settings.master_update.is_some() {
+        // Configuration allows exactly one Master update mode.
+        let handle = if self.settings.master_update.is_some() {
             let worker = sirius_api_proxy::master_update::MasterUpdater::new(
                 &self.settings,
                 self.core.clone(),
             )
             .map_err(|_| "Master updater initialization failed")?;
-            handles.push(tokio::spawn(worker.run(receiver.clone())));
-        }
-        if self.settings.master_sync.is_some() {
+            tokio::spawn(worker.run(receiver))
+        } else if self.settings.master_sync.is_some() {
             let worker =
                 sirius_api_proxy::master_sync::Syncer::new(&self.settings, self.core.clone())
                     .map_err(|_| "Master synchronization initialization failed")?;
-            handles.push(tokio::spawn(worker.run(receiver)));
-        }
-        Ok(BackgroundTasks { shutdown, handles })
+            tokio::spawn(worker.run(receiver))
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(BackgroundTask { shutdown, handle }))
     }
 }
 
-pub struct BackgroundTasks {
+pub struct BackgroundTask {
     shutdown: tokio::sync::watch::Sender<bool>,
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
-impl BackgroundTasks {
+impl BackgroundTask {
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
-        for mut handle in self.handles.drain(..) {
-            if tokio::time::timeout(Duration::from_secs(5), &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-            }
+        if tokio::time::timeout(Duration::from_secs(5), &mut self.handle)
+            .await
+            .is_err()
+        {
+            self.handle.abort();
         }
     }
 }
 
-impl Drop for BackgroundTasks {
+impl Drop for BackgroundTask {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
-        for handle in &self.handles {
-            handle.abort();
-        }
+        self.handle.abort();
     }
 }
 
@@ -334,28 +284,21 @@ impl RankingSource for SiriusRankingSource {
         &'a self,
         region: Region,
         request: &'a RankingRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, SourceError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, AppError>> + Send + 'a>> {
         Box::pin(async move {
             if region != Region::Jp {
-                return Err(SourceError::ProtocolPending);
+                return Err(AppError::ProtocolPending);
             }
-            let client = self.0.as_ref().ok_or(SourceError::ProtocolPending)?;
+            let client = self.0.as_ref().ok_or(AppError::ProtocolPending)?;
             let data = client
-                .query(Query::EventRanking(request.clone()))
-                .await
-                .map_err(|error| match error {
-                    AppError::ProtocolPending => SourceError::ProtocolPending,
-                    AppError::UpstreamAuthenticationUnavailable => SourceError::Unauthorized,
-                    AppError::UpstreamRateLimited => SourceError::RateLimited,
-                    AppError::UpstreamTimeout => SourceError::Timeout,
-                    AppError::NotFound => SourceError::NotFound,
-                    AppError::UpstreamGameError(status) => SourceError::GameError(status),
-                    AppError::UpstreamInvalidResponse => SourceError::InvalidResponse,
-                    _ => SourceError::Unavailable,
-                })?;
+                .query(Operation::EventRanking {
+                    event_id: request.event_id,
+                    ranks: request.ranks.clone(),
+                })
+                .await?;
             let entries = match data.get("ranking") {
                 None => return Ok(Vec::new()), // Protobuf JSON can omit an empty repeated field.
-                Some(value) => value.as_array().ok_or(SourceError::InvalidResponse)?,
+                Some(value) => value.as_array().ok_or(AppError::UpstreamInvalidResponse)?,
             };
             entries
                 .iter()
@@ -364,13 +307,13 @@ impl RankingSource for SiriusRankingSource {
                         rank: entry["rank"]
                             .as_i64()
                             .and_then(|n| i32::try_from(n).ok())
-                            .ok_or(SourceError::InvalidResponse)?,
+                            .ok_or(AppError::UpstreamInvalidResponse)?,
                         point: match entry.get("point") {
                             None => 0,
                             Some(value) => value
                                 .as_i64()
                                 .and_then(|n| i32::try_from(n).ok())
-                                .ok_or(SourceError::InvalidResponse)?,
+                                .ok_or(AppError::UpstreamInvalidResponse)?,
                         },
                     })
                 })
@@ -381,4 +324,59 @@ impl RankingSource for SiriusRankingSource {
 
 pub fn envelope(data: Value) -> Value {
     json!({"region":"jp", "source":"official_game_service", "protocol_implementation":"sirius_api_proxy", "data":data})
+}
+
+fn upstream_snapshot(
+    observation: &sirius_api_proxy::client::Observation,
+    now: chrono::DateTime<chrono::Utc>,
+    ttl: Duration,
+) -> Value {
+    let age_ms = observation
+        .observed_at
+        .map(|at| (now - at).num_milliseconds().max(0) as u64);
+    let status = match age_ms {
+        None => "unknown",
+        Some(age) if u128::from(age) >= ttl.as_millis() => "stale",
+        _ if observation.grpc_status == Some(0) && !observation.maintenance => "available",
+        _ => "unavailable",
+    };
+    json!({"configured":true, "status":status, "last_observed_at":observation.observed_at,
+        "age_ms":age_ms, "grpc_status":observation.grpc_status, "maintenance":observation.maintenance})
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    #[test]
+    fn health_distinguishes_unknown_success_failure_maintenance_and_staleness() {
+        let now = chrono::Utc::now();
+        let ttl = Duration::from_secs(300);
+        let mut observation = sirius_api_proxy::client::Observation::default();
+        assert_eq!(
+            upstream_snapshot(&observation, now, ttl)["status"],
+            "unknown"
+        );
+        observation.observed_at = Some(now);
+        observation.grpc_status = Some(0);
+        assert_eq!(
+            upstream_snapshot(&observation, now, ttl)["status"],
+            "available"
+        );
+        observation.maintenance = true;
+        assert_eq!(
+            upstream_snapshot(&observation, now, ttl)["status"],
+            "unavailable"
+        );
+        observation.maintenance = false;
+        observation.grpc_status = Some(16);
+        assert_eq!(
+            upstream_snapshot(&observation, now, ttl)["status"],
+            "unavailable"
+        );
+        observation.grpc_status = Some(0);
+        assert_eq!(
+            upstream_snapshot(&observation, now + chrono::Duration::seconds(301), ttl)["status"],
+            "stale"
+        );
+    }
 }

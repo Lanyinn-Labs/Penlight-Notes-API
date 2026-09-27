@@ -17,26 +17,28 @@
 
 ```bash
 cp .env.example .env
-cp config/jp.example.json config/jp.local.json
 ```
 
-按 [账号配置](docs/account-setup.md) 填写现有账号凭据，并配置 Master 存储路径。在 `.env` 中设置：
+按 [账号配置](docs/account-setup.md) 保存现有账号凭据，在唯一配置文件 `.env` 中填写：
 
 ```dotenv
-OURNOTES_JP_PROTOCOL_CONFIG=config/jp.local.json
-API_KEY=your-api-key
+PENLIGHT_API_KEY=your-api-key
+PENLIGHT_JP_ACCOUNTS=secrets/jp-account.json
 ```
 
 ```bash
+cargo run --locked -- check-config
 cargo run --locked
 ```
 
-默认监听 `http://127.0.0.1:8081`，API 请求使用 `X-API-Key` 或 Bearer 认证。
+默认监听 `http://127.0.0.1:8081`，API 请求使用 `X-API-Key` 或 Bearer 认证。请求保护和缓存使用内置默认值，无需逐项填写。
+
+需要自动更新 Master 时，在同一个 `.env` 设置 `PENLIGHT_JP_MASTER_MODE=download` 即可；CDN 认证和解密参数来自运行时客户端 JSON，见 [自动更新](docs/updates.md)。
 
 ### Docker
 
 ```bash
-docker compose up -d --build
+docker compose up -d --pull always
 ```
 
 配置与数据挂载见 [Docker 配置](docs/configuration.md#docker)。

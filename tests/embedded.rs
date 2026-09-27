@@ -18,12 +18,17 @@ use std::{
 use tower::ServiceExt;
 
 fn settings() -> sirius_api_proxy::config::Config {
-    let mut value: Value = serde_json::from_str(include_str!("../config/jp.example.json")).unwrap();
-    value["accounts"] = json!([]);
-    value["master_directory"] = Value::Null;
-    value["protocol_directory"] = json!(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"));
-    serde_json::from_value(value).unwrap()
+    // Build the same environment-backed JP settings without mutating process environment.
+    let mut protocol: sirius_api_proxy::config::Config = serde_json::from_value(json!({
+        "region":"jp", "platform":"Android", "environment":"release",
+        "endpoint":"https://api.bang-dream-on.jp", "client_version":"1.0.2",
+        "protocol_directory":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"),
+        "api_token_env":"unused", "internal_token_env":"unused", "accounts":[],
+        "default_cdn_root":"https://static.bang-dream-on.jp",
+        "cdn_credential_env":{"https://static.bang-dream-on.jp":"PENLIGHT_CDN_PASSWORD"}
+    })).unwrap();
+    protocol.master_directory = None;
+    protocol
 }
 
 async fn get(router: axum::Router, path: &str) -> (u16, Value) {
@@ -37,12 +42,33 @@ async fn get(router: axum::Router, path: &str) -> (u16, Value) {
 }
 
 #[tokio::test]
+async fn disabled_jp_skips_client_initialization_and_background_tasks() {
+    let mut config = Config::default();
+    let mut protocol = settings();
+    protocol.protocol_directory = PathBuf::from("missing-disabled-region-protocol");
+    config.regions[1].enabled = false;
+    config.regions[1].sirius = Some(protocol);
+    assert!(api::load_client(&config).unwrap().is_none());
+    let router = api::build(Arc::new(config));
+    let (status, health) = get(router.clone(), "/health").await;
+    assert_eq!(status, 200);
+    assert_eq!(health["master_update"]["status"], "disabled");
+    assert_eq!(get(router, "/api/jp/application").await.0, 503);
+}
+
+#[tokio::test]
 async fn embedded_protocol_initializes_without_a_proxy_listener() {
     let client = SiriusClient::new(settings()).unwrap();
     let status = serde_json::to_value(client.core.protocol_status().unwrap()).unwrap();
     assert_eq!(status["family"], "jp");
     assert_eq!(status["codec"], "native");
-    assert!(!client.ready());
+    assert!(!client.ready().await);
+    assert_eq!(
+        client
+            .upstream_status(std::time::Duration::from_secs(300))
+            .await["status"],
+        "unknown"
+    );
     let mut wrong = settings();
     wrong.region = sirius_api_proxy::region::Region::En;
     assert!(SiriusClient::new(wrong).is_err());
@@ -202,18 +228,21 @@ async fn master_updater_status_is_read_only_and_missing_secrets_fail_startup() {
     assert_eq!(status, 200);
     assert_eq!(body["data"]["status"], "disabled");
 
-    let mut value: Value =
-        serde_json::from_str(include_str!("../config/jp.master-update.example.json")).unwrap();
-    value["accounts"] = json!([]);
-    value["protocol_directory"] = json!(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"));
-    value["master_update"]["username_env"] = json!("PENLIGHT_TEST_MISSING_CDN_USERNAME_672b7111");
-    let config: sirius_api_proxy::config::Config = serde_json::from_value(value).unwrap();
+    let mut config = settings();
+    config.master_directory = Some(PathBuf::from("unused-test-store"));
+    config.master_update = Some(sirius_api_proxy::config::MasterUpdateConfig {
+        network: Default::default(),
+        cdn_authorization: sirius_api_proxy::config::CdnAuthorization::Basic,
+        username_env: Some("PENLIGHT_TEST_MISSING_CDN_USERNAME_672b7111".into()),
+        key_hex_env: "PENLIGHT_TEST_MISSING_KEY".into(),
+        iv_hex_env: "PENLIGHT_TEST_MISSING_IV".into(),
+        interval_seconds: 300,
+    });
     config.validate().unwrap();
     let client = SiriusClient::new(config).unwrap();
     assert_eq!(
         client.core.master_update_status().await["status"],
         "pending"
     );
-    assert!(client.start_workers().is_err());
+    assert!(client.start_worker().is_err());
 }

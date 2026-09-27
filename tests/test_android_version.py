@@ -40,24 +40,58 @@ class AndroidVersionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             monitor.report('1.0.3', '1.0.4; shell')
 
-    def test_candidate_records_review_without_config_changes(self):
-        value = monitor.report('1.0.2', '1.0.3')
-        candidate = monitor.candidate_text(value)
-        self.assertIn('1.0.3', candidate)
-        self.assertIn('尚未修改运行配置', candidate)
+    def test_candidate_records_review_without_changing_default_version(self):
+        import subprocess
         with tempfile.TemporaryDirectory() as temporary:
-            import subprocess
             root = Path(temporary)
-            config = root / 'config.json'
-            config.write_text(json.dumps({'region': 'jp', 'platform': 'Android', 'client_version': '1.0.2'}))
-            page = root / 'page.html';page.write_text(listing())
+            version = root / 'version'
+            version.write_text(json.dumps({'client_version':'1.0.2', 'master':{'key_hex':'preserved-key', 'iv_hex':'preserved-iv'}, 'cdn_username':'preserved-user', 'cdn_password':'preserved-password'}))
+            page = root / 'page.html'
+            page.write_text(listing())
             output = root / 'candidate.md'
             process = subprocess.run([sys.executable, str(ROOT / 'scripts/check_android_version.py'),
-                                      '--config', str(config), '--html-file', str(page),
-                                      '--write-candidate', str(output)], capture_output=True, text=True)
+                '--client-config', str(version), '--html-file', str(page), '--write-candidate', str(output)],
+                capture_output=True, text=True)
             self.assertEqual(process.returncode, 0, process.stderr)
-            self.assertEqual(json.loads(config.read_text(encoding='utf-8'))['client_version'], '1.0.2')
-            self.assertEqual(output.read_text(encoding='utf-8'), candidate)
+            self.assertEqual(monitor.read_version(version), '1.0.2')
+            self.assertIn('尚未修改运行配置', output.read_text())
+
+    def test_prepare_version_validates_baseline_and_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'version'
+            path.write_text(json.dumps({'client_version':'1.0.2', 'master':{'key_hex':'preserved-key', 'iv_hex':'preserved-iv'}, 'cdn_username':'preserved-user', 'cdn_password':'preserved-password'}))
+            for current, latest in [('1.0.1', '1.0.3'), ('1.0.2', 'private-sentinel')]:
+                with self.assertRaises(ValueError):
+                    monitor.prepare_version(path, current, latest)
+                self.assertEqual(monitor.read_version(path), '1.0.2')
+            monitor.prepare_version(path, '1.0.2', '1.0.3')
+            self.assertEqual(monitor.read_version(path), '1.0.3')
+            self.assertEqual(json.loads(path.read_text())['cdn_password'], 'preserved-password')
+            self.assertEqual(json.loads(path.read_text())['master'], {'key_hex':'preserved-key', 'iv_hex':'preserved-iv'})
+
+    def test_cli_prepares_build_version_and_never_downgrades_it(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            version = root / 'version'
+            version.write_text(json.dumps({'client_version':'1.0.2', 'master':{'key_hex':'preserved-key', 'iv_hex':'preserved-iv'}, 'cdn_username':'preserved-user', 'cdn_password':'preserved-password'}))
+            page = root / 'page.html'
+            output = root / 'candidate.md'
+            github = root / 'github-output'
+            for latest, status in [('1.0.3','update_available'), ('1.0.1','store_older'), ('1.0.3','current')]:
+                page.write_text(listing(version=latest))
+                process = subprocess.run([sys.executable, str(ROOT / 'scripts/check_android_version.py'),
+                    '--client-config', str(version), '--html-file', str(page), '--write-candidate', str(output),
+                    '--prepare-update', '--github-output', str(github)], capture_output=True, text=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertEqual(json.loads(process.stdout)['status'], status)
+                self.assertEqual(monitor.read_version(version), '1.0.3')
+                self.assertEqual(json.loads(version.read_text())['cdn_password'], 'preserved-password')
+                self.assertEqual(json.loads(version.read_text())['master'], {'key_hex':'preserved-key', 'iv_hex':'preserved-iv'})
+                self.assertIn(f'status={status}', github.read_text())
+                if status == 'update_available':
+                    self.assertIn('本草稿已更新客户端配置中的版本', output.read_text())
+            self.assertFalse(output.exists())
 
 
 if __name__ == '__main__':

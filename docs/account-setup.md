@@ -10,9 +10,9 @@
 {"player_id":"YOUR_PLAYER_ID","credential":"YOUR_CREDENTIAL"}
 ```
 
-将文件放入 Git 忽略的私有目录（如 `secrets/`），设置 `0600` 权限，并在日服配置的 `accounts[].credentials_file` 指定其路径。模板见 [jp.example.json](../config/jp.example.json)。容器部署时需确保运行用户能读取挂载文件。
+将文件放入 Git 忽略的私有目录（如 `secrets/`），设置 `0600` 权限，并在 `.env` 的 `PENLIGHT_JP_ACCOUNTS` 指定其路径；多个路径用逗号分隔，默认用文件名去掉扩展名作为账号名，也可用 `existing=secrets/jp-account.json` 指定唯一名称（1–64 个字母、数字、下划线或连字符）。容器部署时需确保运行用户能读取挂载文件。
 
-设置 `OURNOTES_JP_PROTOCOL_CONFIG` 和 `API_KEY` 后启动服务，查询 `/api/jp/user/account` 可验证账号是否可用；请求必须携带 API Key。账号认证凭据与本服务的 API Key 是不同的两项配置。
+设置 `PENLIGHT_JP_ACCOUNTS` 和 `PENLIGHT_API_KEY` 后启动服务，查询 `/api/jp/user/account` 可验证账号是否可用；请求必须携带 API Key。账号认证凭据与本服务的 API Key 是不同的两项配置。
 
 ## 从自己的 Android 本地存档恢复
 

@@ -23,8 +23,11 @@ pub fn build(config: Arc<Config>) -> Router {
 }
 
 pub fn load_client(config: &Config) -> Result<Option<Arc<SiriusClient>>, String> {
-    config
-        .region(crate::region::Region::Jp)
+    let region = config.region(crate::region::Region::Jp);
+    if !region.enabled {
+        return Ok(None);
+    }
+    region
         .sirius
         .clone()
         .map(SiriusClient::new)
@@ -51,6 +54,7 @@ fn assemble(
     client: Option<Arc<SiriusClient>>,
 ) -> Router {
     let state = Arc::new(ApiState {
+        gate: super::limits::RequestGate::new(config.request_limits),
         rankings: RankingService::new(source, config.ranking_cache),
         sirius: client,
         config,
@@ -157,5 +161,8 @@ async fn authorize(
             return Err(AppError::Unauthorized);
         }
     }
-    Ok(next.run(request).await)
+    let _permit = config.gate.enter()?;
+    tokio::time::timeout(config.gate.timeout(), next.run(request))
+        .await
+        .map_err(|_| AppError::ApiTimeout)
 }

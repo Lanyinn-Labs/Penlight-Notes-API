@@ -69,7 +69,25 @@ def report(current, latest):
             'configured_version': current, 'store_version': latest, 'status': status, 'source': STORE_URL}
 
 
-def candidate_text(value):
+def read_version(path):
+    value = json.loads(path.read_text(encoding='utf-8'))['client_version']
+    if not isinstance(value, str) or not VERSION.fullmatch(value):
+        raise ValueError('Expected a stable three-part version in the client bundle')
+    return value
+
+
+def prepare_version(path, current, latest):
+    """Update only the candidate version; keep reviewed client constants for manual comparison."""
+    if read_version(path) != current or not VERSION.fullmatch(latest):
+        raise ValueError('Version candidate must match the configured baseline')
+    value = json.loads(path.read_text(encoding='utf-8'))
+    value['client_version'] = latest
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8', newline='\n')
+
+
+def candidate_text(value, config_changes=False):
+    change = ('本草稿已更新客户端配置中的版本，保留原有 CDN 认证和 key/IV；尚未验证新客户端。'
+              if config_changes else '此候选仅记录版本变化，尚未修改运行配置或协议。')
     return f'''# 日服安卓适配候选
 
 - 当前配置版本：`{value['configured_version']}`
@@ -77,42 +95,47 @@ def candidate_text(value):
 - 包名：`{PACKAGE}`
 - 来源：[Google Play]({STORE_URL})
 
-此候选仅记录版本变化，尚未修改运行配置或协议。商店显示版本不保证所有设备已完成灰度更新。
+{change}商店显示版本不保证所有设备已完成灰度更新。
 
 ## 验证清单
 
 - [ ] 取得并核对 Android 新构建的版本和包名
 - [ ] 验证现有账号的 Version、Whoami 和 GetPlayerData
 - [ ] 比较客户端版本要求、认证和 Protobuf 变化
-- [ ] 比较 Master 密钥、IV 和本地存档格式；变化时重新适配工具
+- [ ] 核对并更新 `data/jp-client.json` 的版本、协议路径、CDN 认证和 Master key/IV；不要放入个人凭据
+- [ ] 比较本地存档格式；变化时重新适配工具
 - [ ] 必要时更新 Sirius 来源提交、许可证记录和文件摘要
 - [ ] 调整配置后验证 Master、公告、玩家资料和排行
-- [ ] 通过 CI 及在线验证后，更新版本记录并发布
+- [ ] 通过 CI 及在线验证后合并；仅参数变化无需重新编译
+- [ ] 部署端执行 `docker compose restart api` 拉取并应用新配置；协议/算法变化时先更新镜像
 '''
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=ROOT / 'config/jp.example.json')
+    parser.add_argument('--client-config', type=Path, default=ROOT / 'data/jp-client.json')
     parser.add_argument('--html-file', type=Path, help='Inspect a saved official listing for local verification')
     parser.add_argument('--write-candidate', type=Path)
     parser.add_argument('--github-output', type=Path)
+    parser.add_argument('--prepare-update', action='store_true',
+                        help='Update build version metadata in the review workspace when a newer version is found')
     args = parser.parse_args()
-    config = json.loads(args.config.read_text(encoding='utf-8'))
-    if config.get('region') != 'jp' or config.get('platform', '').lower() != 'android':
-        raise ValueError('Version monitor requires a JP Android configuration')
+    current = read_version(args.client_config)
     latest = parse_version(args.html_file.read_text(encoding='utf-8')) if args.html_file else fetch_version()
-    value = report(config['client_version'], latest)
+    value = report(current, latest)
+    if args.prepare_update and value['status'] == 'update_available':
+        prepare_version(args.client_config, current, latest)
     if args.write_candidate:
         if value['status'] == 'update_available':
             args.write_candidate.parent.mkdir(parents=True, exist_ok=True)
-            args.write_candidate.write_text(candidate_text(value), encoding='utf-8', newline='\n')
+            args.write_candidate.write_text(candidate_text(value, args.prepare_update), encoding='utf-8', newline='\n')
         elif value['status'] == 'current' and args.write_candidate.exists():
             args.write_candidate.unlink()
     if args.github_output:
         with args.github_output.open('a', encoding='utf-8', newline='\n') as output:
             output.write(f"update_available={'true' if value['status'] == 'update_available' else 'false'}\n")
             output.write(f"store_version={latest}\n")
+            output.write(f"status={value['status']}\n")
     value['checked_at'] = datetime.now(timezone.utc).isoformat()
     print(json.dumps(value, ensure_ascii=False, indent=2))
 

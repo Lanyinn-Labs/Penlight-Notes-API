@@ -1502,9 +1502,10 @@ dependencies = [
 
 [[package]]
 name = "penlight-notes-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
+ "chrono",
  "dotenvy",
  "serde",
  "serde_json",
@@ -1515,7 +1516,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "yaml_serde",
 ]
 
 [[package]]

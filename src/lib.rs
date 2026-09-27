@@ -1,5 +1,6 @@
 pub mod api;
 pub mod client;
+pub mod client_release;
 pub mod config;
 pub mod error;
 pub mod offline_master;

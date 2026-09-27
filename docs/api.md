@@ -4,17 +4,23 @@
 
 游戏接口以 `/api/{region}` 开头，区服为 `jp` 或 `global`。以下在线接口目前支持日服；未配置日服协议、或查询未接入的国际服时返回 `501 protocol_pending`。关闭区服返回 `503 region_disabled`。
 
-设置 `API_KEY` 后，所有 `/api/*` 请求必须提供 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`。`/user/*` 始终要求配置并通过 API Key 认证。响应为 JSON；原始 Protobuf JSON 中的 64 位整数可能使用字符串。
+设置 `PENLIGHT_API_KEY` 后，所有 `/api/*` 请求必须提供 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`。`/user/*` 始终要求配置并通过 API Key 认证。响应为 JSON；原始 Protobuf JSON 中的 64 位整数可能使用字符串。
 
 ## 服务状态
 
 | GET 路径 | 说明 |
 | --- | --- |
-| `/health` | 进程状态及 upstream_ready |
+| `/health` | 进程状态、上游最近通信及 Master 更新状态 |
 | `/version` | 服务版本、stage: online、协议来源及固定提交 |
 | `/servers` | 各区服启用状态、版本、协议是否配置及可用状态 |
 
-这些接口无需认证，不执行网络探测。`upstream_ready` 仅表示最近 60 秒内应用状态查询成功且官方服务可用；刚启动时为 false。区服 status 为 disabled、protocol_pending 或 protocol_configured；配置成功不等于官方服务可用。
+这些接口无需认证，不执行网络探测，也不占用接口限流额度。`/health` 的 `status: ok` 表示 HTTP 服务运行，`upstream` 包含最近实际通信的 `last_observed_at`、`age_ms`、`grpc_status` 和 `maintenance`。状态为 disabled（未启用）、unknown（尚无记录）、available、unavailable 或 stale（超过 `PENLIGHT_STATUS_TTL_SECONDS`，默认 300 秒）。记录来自底层客户端，包括普通查询和后台 Master 版本检查；缓存命中、本地 Master 读取不刷新时间。`upstream_ready` 保留为兼容字段，仅在 available 时为 true。它不代表所有账号、接口均可用。
+
+`master_update` 单独展示后台任务的 status、started_at、completed_at，不返回私有数据。区服 status 为 disabled、protocol_pending 或 protocol_configured；配置成功不等于官方服务可用。
+
+## 请求保护
+
+认证通过后，`/api/*` 使用全实例共享的令牌桶和并发限制。默认持续 30 请求/秒、突发 60 个、最多同时处理 16 个请求；超过速率或并发分别返回 `429 api_rate_limited`、`429 api_busy`，带 `Retry-After: 1`，不会排队。请求总超时默认 30 秒，返回 `504 api_timeout`。调用方应退避重试，限流配置见 [配置参考](configuration.md)。多容器实例各自计数。
 
 ## 在线查询
 
@@ -48,7 +54,7 @@ ID 必须为正整数。活动 rankings 和 cutoffs 的 ranks 必须包含 1 至
 
 响应包含 region、event_id、source: official_game_service、status、observed_at_unix_ms、age_ms 和 cutoffs。每个榜线包含 rank 和 point。上游未返回某名次时，point 为 null；已返回的零分保留为 0。
 
-status 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数据。超过旧数据保留期后返回实际错误；缓存时间由 RANKING_*_SECS 配置。相同请求并发合并，并限制失败后的重试。
+status 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数据。超过旧数据保留期后返回实际错误；缓存时间由 `PENLIGHT_RANKING_*_SECONDS` 配置。相同请求并发合并，并限制失败后的重试。
 
 2026-09-27 导入的 Master 没有活动，活动查询返回空排名。这验证了请求链路及空结果处理，实际活动分数仍待活动开放后验证。
 
@@ -89,7 +95,7 @@ status 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数
 
 配置日服协议的 master_directory 后，表和资源读取原始 Sirius 快照存储，source 为 master_snapshot；响应包含 master_version、snapshot、resource_version 和 entries。列表及日文文本固定到同一快照，校验清单和表摘要。存储缺失或损坏返回 503 master_data_unavailable。
 
-未配置该存储时，旧表查询和资源接口读取 `_MASTER_DIR` 指向的已解密 APK JSON，source 为 apk_master_snapshot，附 client_version、apk_sha256。国际服表查询使用此离线方式。
+未配置该存储时，旧表查询和资源接口读取 `PENLIGHT_JP_SNAPSHOT_DIR` / `PENLIGHT_GLOBAL_SNAPSHOT_DIR` 指向的已解密 APK JSON，source 为 apk_master_snapshot，附 client_version、apk_sha256。国际服表查询使用此离线方式。
 
 master-schema 始终是构建时提取的 APK 结构，不等于线上最新结构。国际服为 240 张表，日服为 235 张表；records_available: false 表示记录未内置进可执行文件。
 
@@ -132,3 +138,15 @@ master-schema 始终是构建时提取的 APK 结构，不等于线上最新结�
 | 502 | upstream_invalid_response | 返回数据不符合预期 |
 | 502 | upstream_game_error | 官方 gRPC 业务错误，message 包含状态码 |
 | 504 | upstream_timeout | 官方请求超时 |
+
+## 玩家资料补充字段
+
+`/api/jp/players/by-profile-id/{id}` 保留 `data.playerProfile`，并新增顶层 `summary`：
+
+- `player_id`、`profile_id`、`name`、`rank_exp`：公开身份和等级经验。
+- `player_level`：根据 MasterPlayerRank 的累计经验阈值换算。
+- `last_updated_at`：官方秒级时间戳转换为 UTC ISO 8601 时间。
+- `favorite_member_card.master_id`、`name`、`subtitle`：喜爱卡片 ID、日文成员名称和卡片副标题。
+- `master_version`、`master_status`：补充字段所依据的快照版本及 ready、partial 或 unavailable。
+
+同一请求固定一个经校验的 Master 快照。缺失的映射返回 null；Master 不可用时仍返回成功取得的公开资料。此处的 master_status 指补充表能否读取，不代表后台更新任务状态。

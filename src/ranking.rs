@@ -1,4 +1,4 @@
-//! Activity cutoff queries and cache. The wire protocol is not yet validated.
+//! Activity cutoff queries with bounded caching and coalesced refreshes.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -56,51 +56,12 @@ pub struct RankingPoint {
     pub point: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SourceError {
-    ProtocolPending,
-    Unauthorized,
-    RateLimited,
-    Unavailable,
-    InvalidResponse,
-    NotFound,
-    Timeout,
-    GameError(u16),
-}
-
-impl SourceError {
-    fn app_error(&self) -> AppError {
-        match self {
-            Self::ProtocolPending => AppError::ProtocolPending,
-            Self::Unauthorized => AppError::UpstreamAuthenticationUnavailable,
-            Self::RateLimited => AppError::UpstreamRateLimited,
-            Self::Unavailable => AppError::UpstreamUnavailable,
-            Self::InvalidResponse => AppError::UpstreamInvalidResponse,
-            Self::NotFound => AppError::NotFound,
-            Self::Timeout => AppError::UpstreamTimeout,
-            Self::GameError(status) => AppError::UpstreamGameError(*status),
-        }
-    }
-}
-
 pub trait RankingSource: Send + Sync {
     fn fetch<'a>(
         &'a self,
         region: Region,
         request: &'a RankingRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, SourceError>> + Send + 'a>>;
-}
-
-pub struct PendingRankingSource;
-
-impl RankingSource for PendingRankingSource {
-    fn fetch<'a>(
-        &'a self,
-        _region: Region,
-        _request: &'a RankingRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, SourceError>> + Send + 'a>> {
-        Box::pin(async { Err(SourceError::ProtocolPending) })
-    }
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, AppError>> + Send + 'a>>;
 }
 
 #[derive(Clone, Copy)]
@@ -127,19 +88,13 @@ struct Snapshot {
 struct SlotState {
     snapshot: Option<Snapshot>,
     retry_after: Option<Instant>,
-    last_error: Option<SourceError>,
-}
-
-#[derive(Default)]
-struct CacheSlot {
-    refresh: AsyncMutex<()>,
-    state: AsyncMutex<SlotState>,
+    last_error: Option<AppError>,
 }
 
 pub struct RankingService {
     source: Arc<dyn RankingSource>,
     policy: CachePolicy,
-    slots: Mutex<HashMap<CacheKey, Arc<CacheSlot>>>,
+    slots: Mutex<HashMap<CacheKey, Arc<AsyncMutex<SlotState>>>>,
 }
 
 const MAX_CACHE_KEYS: usize = 1024;
@@ -190,29 +145,17 @@ impl RankingService {
             slots.entry(key).or_default().clone()
         };
 
-        {
-            let state = slot.state.lock().await;
-            if let Some(snapshot) = &state.snapshot {
-                if snapshot.fetched_at.elapsed() < self.policy.fresh {
-                    return Ok(response(region, &request, snapshot, "fresh"));
-                }
+        let mut state = slot.lock().await;
+        if let Some(snapshot) = &state.snapshot {
+            if snapshot.fetched_at.elapsed() < self.policy.fresh {
+                return Ok(response(region, &request, snapshot, "fresh"));
             }
         }
-
-        let _refresh = slot.refresh.lock().await;
+        if state
+            .retry_after
+            .is_some_and(|until| Instant::now() < until)
         {
-            let state = slot.state.lock().await;
-            if let Some(snapshot) = &state.snapshot {
-                if snapshot.fetched_at.elapsed() < self.policy.fresh {
-                    return Ok(response(region, &request, snapshot, "fresh"));
-                }
-            }
-            if state
-                .retry_after
-                .is_some_and(|until| Instant::now() < until)
-            {
-                return cached_or_error(region, &request, &state, self.policy.stale);
-            }
+            return cached_or_error(region, &request, &state, self.policy.stale);
         }
 
         let result = self
@@ -223,7 +166,6 @@ impl RankingService {
                 validate_points(&request, &points)?;
                 Ok(points)
             });
-        let mut state = slot.state.lock().await;
         match result {
             Ok(points) => {
                 let observed_at_unix_ms = SystemTime::now()
@@ -253,14 +195,14 @@ impl RankingService {
     }
 }
 
-fn validate_points(request: &RankingRequest, points: &[RankingPoint]) -> Result<(), SourceError> {
+fn validate_points(request: &RankingRequest, points: &[RankingPoint]) -> Result<(), AppError> {
     let requested: HashSet<i32> = request.ranks.iter().copied().collect();
     let mut seen = HashSet::new();
     if points
         .iter()
         .any(|item| item.point < 0 || !requested.contains(&item.rank) || !seen.insert(item.rank))
     {
-        return Err(SourceError::InvalidResponse);
+        return Err(AppError::UpstreamInvalidResponse);
     }
     Ok(())
 }
@@ -278,8 +220,8 @@ fn cached_or_error(
     }
     Err(state
         .last_error
-        .as_ref()
-        .map_or(AppError::UpstreamUnavailable, SourceError::app_error))
+        .clone()
+        .unwrap_or(AppError::UpstreamUnavailable))
 }
 
 fn response(

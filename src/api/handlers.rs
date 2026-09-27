@@ -4,20 +4,41 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sirius_api_proxy::peer::Operation;
 
 use super::SharedState;
 use crate::{
-    client::sirius::{envelope, Query as SiriusQuery, SiriusClient},
+    client::sirius::{envelope, SiriusClient},
     error::AppError,
     offline_master,
     ranking::RankingRequest,
     region::Region,
 };
 
+async fn upstream_status(state: &SharedState) -> Value {
+    match &state.sirius {
+        Some(client) if state.config.region(Region::Jp).enabled => {
+            client
+                .upstream_status(state.config.upstream_status_ttl)
+                .await
+        }
+        _ => json!({"configured":false,"status":"disabled","last_observed_at":null,"age_ms":null}),
+    }
+}
+
 pub async fn health(State(state): State<SharedState>) -> Json<Value> {
-    Json(
-        json!({"status": "ok", "service": "penlight-notes-api", "upstream_ready": state.sirius.as_ref().is_some_and(|client| client.ready())}),
-    )
+    let upstream = upstream_status(&state).await;
+    let master_update = match &state.sirius {
+        Some(client) => {
+            let raw = client.core.master_update_status().await;
+            // Health is public: expose task state, never account data or private diagnostics.
+            json!({"status":raw["status"], "started_at":raw["started_at"], "completed_at":raw["completed_at"]})
+        }
+        None => json!({"status":"disabled"}),
+    };
+    Json(json!({"status":"ok", "service":"penlight-notes-api",
+        "upstream_ready":upstream["status"] == "available", "upstream":upstream,
+        "master_update":master_update}))
 }
 
 pub async fn version() -> Json<Value> {
@@ -27,6 +48,7 @@ pub async fn version() -> Json<Value> {
 }
 
 pub async fn servers(State(config): State<SharedState>) -> Json<Value> {
+    let upstream = upstream_status(&config).await;
     let servers: Vec<Value> = config
         .config
         .regions
@@ -35,9 +57,9 @@ pub async fn servers(State(config): State<SharedState>) -> Json<Value> {
             json!({
                 "region": region.region,
                 "enabled": region.enabled,
-                "client_version": region.client_version,
-                "upstream_configured": region.sirius.is_some() || region.base_url.is_some(),
-                "upstream_ready": region.region == Region::Jp && region.enabled && config.sirius.as_ref().is_some_and(|client| client.ready()),
+                "client_version": region.sirius.as_ref().map(|protocol| &protocol.client_version),
+                "upstream_configured": region.sirius.is_some(),
+                "upstream_ready": region.region == Region::Jp && region.enabled && upstream["status"] == "available",
                 "status": if !region.enabled { "disabled" } else if region.sirius.is_some() { "protocol_configured" } else { "protocol_pending" },
             })
         })
@@ -51,7 +73,7 @@ pub async fn application(
 ) -> Result<Json<Value>, AppError> {
     let region = Region::parse(&region)?;
     online(&config, region)?
-        .query(SiriusQuery::System)
+        .application()
         .await
         .map(envelope)
         .map(Json)
@@ -97,7 +119,7 @@ pub async fn announcements(
 ) -> Result<Json<Value>, AppError> {
     let Query(query) = query.map_err(|_| AppError::InvalidQuery)?;
     online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::Announcements(query.tab))
+        .query(Operation::Announcements { tab: query.tab })
         .await
         .map(envelope)
         .map(Json)
@@ -108,7 +130,7 @@ pub async fn announcement(
     Path((region, id)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::Announcement(positive(&id)?))
+        .query(Operation::Announcement { id: positive(&id)? })
         .await
         .map(envelope)
         .map(Json)
@@ -118,11 +140,16 @@ pub async fn player_profile(
     State(state): State<SharedState>,
     Path((region, id)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::Profile(positive(&id)?))
-        .await
-        .map(envelope)
-        .map(Json)
+    let client = online(&state, Region::parse(&region)?)?;
+    let raw = client
+        .query(Operation::Profile {
+            profile_id: positive(&id)?,
+        })
+        .await?;
+    let summary = client.profile_summary(&raw).await;
+    let mut response = envelope(raw);
+    response["summary"] = summary;
+    Ok(Json(response))
 }
 
 pub async fn event_rankings(
@@ -133,7 +160,10 @@ pub async fn event_rankings(
     let Query(query) = query.map_err(|_| AppError::InvalidRankingQuery)?;
     let request = RankingRequest::parse(&event, &query.ranks)?;
     online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::EventRanking(request))
+        .query(Operation::EventRanking {
+            event_id: request.event_id,
+            ranks: request.ranks,
+        })
         .await
         .map(envelope)
         .map(Json)
@@ -144,7 +174,10 @@ pub async fn event_deck(
     Path((region, event, player)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, AppError> {
     online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::EventDeck(positive(&event)?, player))
+        .query(Operation::EventDeck {
+            event_id: positive(&event)?,
+            player_id: player,
+        })
         .await
         .map(envelope)
         .map(Json)
@@ -155,7 +188,9 @@ pub async fn music_rankings(
     Path((region, id)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::MusicRanking(positive(&id)?))
+        .query(Operation::MusicRanking {
+            music_id: positive(&id)?,
+        })
         .await
         .map(envelope)
         .map(Json)
@@ -166,7 +201,9 @@ pub async fn challenge_rankings(
     Path((region, id)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::ChallengeRanking(positive(&id)?))
+        .query(Operation::ChallengeRanking {
+            challenge_music_id: positive(&id)?,
+        })
         .await
         .map(envelope)
         .map(Json)
@@ -177,7 +214,7 @@ pub async fn account(
     Path(region): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let data = private_online(&state, Region::parse(&region)?)?
-        .query(SiriusQuery::Account)
+        .whoami()
         .await?;
     if !data["playerId"].as_str().is_some_and(|id| !id.is_empty()) {
         return Err(AppError::UpstreamInvalidResponse);

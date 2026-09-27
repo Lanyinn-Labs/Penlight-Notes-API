@@ -16,12 +16,6 @@ import urllib.request
 import zipfile
 
 
-def offline_config(root):
-    config = json.loads((root / 'config/jp.example.json').read_text())
-    config.update(accounts=[], master_directory=None, endpoint='https://127.0.0.1:9')
-    return config
-
-
 def verify(archive, expected_target=None):
     archive = Path(archive).resolve()
     checksum = archive.with_name(archive.name + '.sha256').read_text().split()[0]
@@ -57,23 +51,21 @@ def verify(archive, expected_target=None):
             assert not set(parts) & {'artifacts', 'secrets', '.local-backups', 'target', '.git', '__pycache__'}
             assert not name.endswith(('.har', '.pcap', '.pcapng', '.local.json', '.local.yaml', '.local.yml'))
             assert not any(p.startswith('.env') and p != '.env.example' for p in parts)
-        for name in ['LICENSE', 'THIRD-PARTY-NOTICES.md', 'config/jp.example.json', '.env.example',
+        for name in ['LICENSE', 'THIRD-PARTY-NOTICES.md', 'data/jp-client.json', '.env.example',
                      'vendor/sirius-api-proxy/LICENSE', 'vendor/sirius-api-proxy/LICENSE-protobuf']:
             assert name in files, name
         assert any(name.endswith('.proto') for name in files), 'missing protocol files'
         license_text = (root / 'vendor/sirius-api-proxy/LICENSE').read_text()
         assert 'Haruki Dev Team' in license_text and 'Sirius Project' in license_text
         executable = root / ('penlight-notes-api.exe' if manifest['target'].startswith('windows') else 'penlight-notes-api')
-        config_path = root / 'config/smoke.local.json'
-        config_path.write_text(json.dumps(offline_config(root)))
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
         environment = {k: v for k, v in os.environ.items()
-                       if not k.startswith(('OURNOTES_', 'SIRIUS_', 'RANKING_'))}
+                       if not k.startswith('PENLIGHT_')}
         token = secrets.token_hex(16)
-        environment.update(HOST='127.0.0.1', PORT=str(port), API_KEY=token,
-                           OURNOTES_JP_PROTOCOL_CONFIG=str(config_path), RUST_LOG='warn')
+        environment.update(PENLIGHT_LISTEN=f'127.0.0.1:{port}', PENLIGHT_API_KEY=token,
+                           PENLIGHT_JP_ONLINE='true', PENLIGHT_JP_ENDPOINT='https://127.0.0.1:9', RUST_LOG='warn')
         log = root / 'smoke.log'
         with log.open('wb') as output:
             process = subprocess.Popen([str(executable)], cwd=root, env=environment,

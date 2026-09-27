@@ -22,8 +22,8 @@ def main():
     args = parser.parse_args()
     constants = read_jp_constants(args.metadata.read_bytes())
     environment = os.environ.copy()
-    environment["SIRIUS_MASTER_KEY_HEX"] = constants["key"].hex()
-    environment["SIRIUS_MASTER_IV_HEX"] = constants["iv"].hex()
+    environment["PENLIGHT_MASTER_KEY_HEX"] = constants["key"].hex()
+    environment["PENLIGHT_MASTER_IV_HEX"] = constants["iv"].hex()
     result = subprocess.run([
         str(args.executable.resolve()), "master-import",
         str(args.encrypted_directory), str(args.output_directory),

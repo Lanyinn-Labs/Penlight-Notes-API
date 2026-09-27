@@ -1,11 +1,17 @@
 services:
   api:
-    build: .
+    image: ${PENLIGHT_IMAGE:-ghcr.io/lanyinn-labs/penlight-notes-api:main}
     ports:
-      - "127.0.0.1:${PORT:-8081}:8081"
+      - "127.0.0.1:8081:8081"
     env_file:
       - .env
     environment:
-      HOST: 0.0.0.0
-      PORT: 8081
+      PENLIGHT_LISTEN: 0.0.0.0:8081
+    volumes:
+      - client-config:/app/runtime
+      - ./secrets:/app/secrets:ro
+      - ./artifacts/jp/master-store:/app/artifacts/jp/master-store
     restart: unless-stopped
+
+volumes:
+  client-config:
