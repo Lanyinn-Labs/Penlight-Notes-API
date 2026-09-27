@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import JP 1.0.2 encrypted Master files using the embedded Sirius implementation.
+"""Import supported JP encrypted Master files using the embedded Sirius implementation.
 
 Run with py3rijndael installed (used by the shared metadata reader). Verified
 client constants are passed in the child environment and never printed.

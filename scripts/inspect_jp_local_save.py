@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Inspect copies of JP 1.0.2 local saves without printing private values.
+"""Inspect copies of JP local saves without printing private values.
 
-Requires py3rijndael. Keys are recovered from the verified APK metadata and
-never printed. Successful plaintext is saved with mode 0600 under artifacts/.
-Matching the Master header alone does not prove that a save uses its key.
+Requires py3rijndael. Keys are recovered from verified 1.0.3 APK metadata and
+never printed. The 1.0.3 save layout has not been verified; incompatible files
+are rejected. Successful plaintext is saved with mode 0600 under artifacts/.
 """
 
 import argparse

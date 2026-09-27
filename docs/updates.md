@@ -41,20 +41,13 @@ sync 使用发布者的日服路径，要求 HTTPS，不需要 CDN 或解密密�
 
 ```bash
 python3 scripts/check_android_version.py
-# 只生成适配说明。
-python3 scripts/check_android_version.py --write-candidate docs/android-update-candidate.md
-# 在审查工作区准备构建版本变更与适配说明。
-python3 scripts/check_android_version.py \
-  --prepare-update --write-candidate docs/android-update-candidate.md
 ```
 
-脚本返回 current、update_available 或 store_older。商店身份或页面元数据不再匹配时检测失败，不从页面任意数字猜版本；商店版本回退不会降低构建版本。默认只检测，不下载 APK或修改部署中的环境变量。
+脚本返回 current、update_available 或 store_older。商店身份或页面元数据不再匹配时检测失败，不从页面任意数字猜版本；商店版本回退会报告 store_older。检测只读，不下载 APK 或修改配置。
 
-[Android version monitor](../.github/workflows/android-version.yml) 每六小时检查一次，也可手动运行。发现新版本后，在专用 automation/android-client-update 分支更新 JSON 中的客户端版本与适配清单，保留原有 CDN 认证和 key/IV 等字段，创建或刷新草稿 PR，并显式触发 CI。
+[Android version monitor](../.github/workflows/android-version.yml) 每六小时检查一次，也可手动运行。工作流只在 Actions 日志中输出检测结果，不创建分支或 PR，也不修改客户端配置。GitHub 定时任务可能延迟。
 
-PR 基于仓库实际默认分支的最新基线；内容相同不重复推送，PR 缺失时补建。商店版本与默认分支一致时关闭遗留候选 PR。GitHub 定时任务可能延迟；仓库 Actions 和组织策略须允许 GITHUB_TOKEN 创建 PR。该令牌创建的 PR 不会自动触发普通 PR 工作流，因此显式启动 CI。
-
-维护者核对新客户端、现有账号认证、CDN 认证、Master 密钥/IV/格式和协议，在同一个 PR 更新 `data/jp-client.json` 与必要的协议代码后合并。Google Play 检测不会取得新 CDN 认证或 key/IV；草稿自动改版本不代表兼容性验证通过。
+发现新版本后，维护者从已核验的客户端构建中比较版本、现有账号认证、CDN 认证、Master 密钥/IV/格式和协议，验证在线请求与 Master 更新，再手动更新 `data/jp-client.json` 及必要的协议代码。Google Play 检测本身不会取得新 CDN 认证或 key/IV，也不能证明新版本兼容。
 
 仅版本号、CDN 认证或 Master key/IV 变化时，适配 PR 合并后无需等待镜像重新编译。已经安装运行时配置入口的 Docker 镜像，重启时会下载 main 上的最新 JSON：
 

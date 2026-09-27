@@ -90,7 +90,7 @@ APK 快照和 Sirius Master 存储是两种不同格式，只能配置一个日�
 
 ## Master 导入
 
-从自有 Android 客户端复制 `files/Master`，使用已验证的日服 1.0.2 元数据导入：
+从自有 Android 客户端复制 `files/Master`，使用已验证的日服 1.0.3 元数据导入：
 
 ```bash
 cargo build --locked

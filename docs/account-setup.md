@@ -16,7 +16,7 @@
 
 ## 从自己的 Android 本地存档恢复
 
-随附 `scripts/inspect_jp_local_save.py` 支持已验证的日服 Android 1.0.2 存档格式。需要自行取得客户端元数据和本地存档副本；无需修改存档。普通设备未必允许读取这些文件。
+随附 `scripts/inspect_jp_local_save.py` 使用已验证的日服 Android 1.0.3 元数据尝试解密本地存档；1.0.3 存档格式尚未单独核验，解密或 JSON 校验失败时会跳过。需要自行取得客户端元数据和本地存档副本；无需修改存档。普通设备未必允许读取这些文件。
 
 将元数据放入 `artifacts/jp/global-metadata.dat`，将存档副本放入单独目录，然后执行：
 

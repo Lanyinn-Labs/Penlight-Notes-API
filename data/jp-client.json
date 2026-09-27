@@ -1,5 +1,5 @@
 {
-  "client_version": "1.0.2",
+  "client_version": "1.0.3",
   "endpoint": "https://api.bang-dream-on.jp",
   "protocol_directory": "vendor/sirius-api-proxy/protocol/sirius/1.0.3",
   "cdn_root": "https://static.bang-dream-on.jp",

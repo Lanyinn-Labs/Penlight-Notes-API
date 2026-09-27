@@ -18,9 +18,9 @@ class EntrypointTests(unittest.TestCase):
             root = Path(temporary)
             config = root / 'client.json'
             if cached_protocol is not None:
-                config.write_text(json.dumps({'client_version': '1.0.2', 'protocol_directory': cached_protocol}))
+                config.write_text(json.dumps({'client_version': '1.0.3', 'protocol_directory': cached_protocol}))
             baseline = root / 'baseline.json'
-            baseline.write_text(json.dumps({'client_version': '1.0.2', 'protocol_directory': 'available'}))
+            baseline.write_text(json.dumps({'client_version': '1.0.3', 'protocol_directory': 'available'}))
             # Map the image's absolute resource path into the test filesystem.
             entrypoint = root / 'entrypoint.sh'
             entrypoint.write_text((ROOT / 'scripts/docker-entrypoint.sh').read_text().replace(
@@ -65,33 +65,33 @@ else:
 
     def test_valid_config_replaces_cache_before_program_starts(self):
         output, log, config = self.run_refresh(json.dumps({
-            'client_version': '1.0.3', 'protocol_directory': 'available'}))
-        self.assertEqual(output, '1.0.3')
-        self.assertEqual(config['client_version'], '1.0.3')
+            'client_version': '1.0.4', 'protocol_directory': 'available'}))
+        self.assertEqual(output, '1.0.4')
+        self.assertEqual(config['client_version'], '1.0.4')
         self.assertIn('Updated runtime client configuration', log)
 
     def test_download_failure_keeps_cache_and_starts_program(self):
         output, log, config = self.run_refresh('unused', fetch_fails=True)
-        self.assertEqual(output, '1.0.2')
-        self.assertEqual(config['client_version'], '1.0.2')
+        self.assertEqual(output, '1.0.3')
+        self.assertEqual(config['client_version'], '1.0.3')
         self.assertIn('keeping the last valid configuration', log)
 
     def test_invalid_config_and_missing_protocol_keep_cache(self):
         for response in ['private-sentinel', json.dumps({
-                'client_version': '1.0.3', 'protocol_directory': 'unavailable'})]:
+                'client_version': '1.0.4', 'protocol_directory': 'unavailable'})]:
             output, log, config = self.run_refresh(response)
-            self.assertEqual(output, '1.0.2')
-            self.assertEqual(config['client_version'], '1.0.2')
+            self.assertEqual(output, '1.0.3')
+            self.assertEqual(config['client_version'], '1.0.3')
             self.assertNotIn('private-sentinel', log)
 
     def test_first_offline_start_uses_image_baseline(self):
         output, _, config = self.run_refresh('unused', fetch_fails=True, cached_protocol=None)
-        self.assertEqual(output, '1.0.2')
+        self.assertEqual(output, '1.0.3')
         self.assertEqual(config['protocol_directory'], 'available')
 
     def test_new_image_replaces_incompatible_cache_before_offline_start(self):
         output, _, config = self.run_refresh('unused', fetch_fails=True, cached_protocol='removed-protocol')
-        self.assertEqual(output, '1.0.2')
+        self.assertEqual(output, '1.0.3')
         self.assertEqual(config['protocol_directory'], 'available')
 
 

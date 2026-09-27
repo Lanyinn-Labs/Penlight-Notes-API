@@ -142,7 +142,7 @@ async fn configured_upstream_is_not_reported_as_ready() {
     let mut config = Config::default();
     config.regions[1].sirius = Some(serde_json::from_value(serde_json::json!({
         "region":"jp", "platform":"Android", "environment":"release",
-        "endpoint":"https://example.invalid", "client_version":"1.0.2",
+        "endpoint":"https://example.invalid", "client_version":"1.0.3",
         "protocol_directory":std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"),
         "api_token_env":"unused", "internal_token_env":"unused", "accounts":[],
         "default_cdn_root":"https://static.bang-dream-on.jp",

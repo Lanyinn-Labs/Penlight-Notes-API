@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Validate and decrypt Master tables from the Japanese Android split APKs.
 
-Requires py3rijndael. The FieldRVA offsets and fingerprints below were verified
-against the Japanese Android build extracted on 2026-09-24. A changed build must
-be checked before these offsets can be reused.
+Requires py3rijndael. The metadata layout and FieldRVA fingerprints below were
+verified against the Japanese Android 1.0.3 build. Other builds must be checked
+before their offsets can be used.
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ from decrypt_master import decrypt_file, file_sha256
 
 METADATA_PATH = "assets/bin/Data/Managed/Metadata/global-metadata.dat"
 MASTER_ROOT = "assets/Master/"
-FIELD_DATA_INDEX = {"header": 474976, "key": 474872, "iv": 474760}
+METADATA_SHA256 = "0602eee6505bc4313d8bc9ecb5a1ef5f19de9b945f478fb7c73b5f7355284d30"
+FIELD_DATA_INDEX = {"header": 475088, "key": 474984, "iv": 20832}
 FIELD_SHA256 = {
     "header": "6a8a8e599a57e654983fcc8ed280ce9bdc638f0531b99c06c5be10bd6c4c689b",
     "key": "661b3a4e30cbbe6e159c42b2f3c93193f01a35105bf80f689f9ee401c9c5ea16",
@@ -29,6 +30,8 @@ FIELD_SHA256 = {
 
 
 def read_jp_constants(metadata: bytes) -> dict[str, bytes]:
+    if hashlib.sha256(metadata).hexdigest() != METADATA_SHA256:
+        raise ValueError("unverified Japanese APK metadata")
     header = bytes(value ^ 0x66 for value in metadata[:380])
     data_offset, data_size, _ = struct.unpack_from("<III", header, 8 + 8 * 12)
     if data_offset + data_size > len(metadata):

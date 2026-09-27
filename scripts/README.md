@@ -2,7 +2,7 @@
 
 | 脚本 | 用途 |
 | --- | --- |
-| `check_android_version.py` | 检测 Google Play 官方安卓版本，生成适配候选及可审查的构建默认版本变更 |
+| `check_android_version.py` | 只读检测 Google Play 官方安卓版本并与当前配置比较 |
 | `check_release.py` | 校验来源及 GitHub 版本标签 |
 | `package_release.py` | 按公开文件清单打包运行环境 |
 | `smoke_release.py` | 解压并校验下载包，验证离线启动及认证 |
@@ -12,7 +12,7 @@
 | `import_jp_master.py` | 从已验证的日服元数据读取常量，调用进程内 Master 导入器 |
 | `inspect_jp_local_save.py` | 从自有日服存档副本恢复现有账号凭据 |
 | `decrypt_master.py` | 导出已验证的国际服 1.0.1 APK Master JSON |
-| `decrypt_master_split_apk.py` | 导出已验证的日服 1.0.2 分包 Master JSON，也为前两个日服工具提供元数据读取函数 |
+| `decrypt_master_split_apk.py` | 导出已验证的日服 1.0.3 分包 Master JSON，也为前两个日服工具提供元数据读取函数 |
 
 发布工具需要 Python 3.11 或更高版本，不依赖第三方 Python 包。账号和 Master 工具需要 `py3rijndael`，可用 `uv run --no-project --with py3rijndael python scripts/<script>.py --help` 查看参数。Python 至少使用 3.10。
 

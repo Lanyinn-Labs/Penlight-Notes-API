@@ -21,7 +21,7 @@ fn settings() -> sirius_api_proxy::config::Config {
     // Build the same environment-backed JP settings without mutating process environment.
     let mut protocol: sirius_api_proxy::config::Config = serde_json::from_value(json!({
         "region":"jp", "platform":"Android", "environment":"release",
-        "endpoint":"https://api.bang-dream-on.jp", "client_version":"1.0.2",
+        "endpoint":"https://api.bang-dream-on.jp", "client_version":"1.0.3",
         "protocol_directory":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"),
         "api_token_env":"unused", "internal_token_env":"unused", "accounts":[],
         "default_cdn_root":"https://static.bang-dream-on.jp",
