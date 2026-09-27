@@ -54,7 +54,7 @@ class AndroidVersionTests(unittest.TestCase):
                 capture_output=True, text=True)
             self.assertEqual(process.returncode, 0, process.stderr)
             self.assertEqual(monitor.read_version(version), '1.0.2')
-            self.assertIn('尚未修改运行配置', output.read_text())
+            self.assertIn('尚未修改运行配置', output.read_text(encoding='utf-8'))
 
     def test_prepare_version_validates_baseline_and_input(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -90,7 +90,7 @@ class AndroidVersionTests(unittest.TestCase):
                 self.assertEqual(json.loads(version.read_text())['master'], {'key_hex':'preserved-key', 'iv_hex':'preserved-iv'})
                 self.assertIn(f'status={status}', github.read_text())
                 if status == 'update_available':
-                    self.assertIn('本草稿已更新客户端配置中的版本', output.read_text())
+                    self.assertIn('本草稿已更新客户端配置中的版本', output.read_text(encoding='utf-8'))
             self.assertFalse(output.exists())
 
 
