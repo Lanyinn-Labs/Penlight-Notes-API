@@ -256,7 +256,7 @@ pub async fn user_resource(
     field: &'static str,
 ) -> Result<Json<Value>, AppError> {
     let data = private_online(&state, Region::parse(&region)?)?
-        .account_data()
+        .account_data_shared()
         .await?;
     let value = data["playerData"].get(field).cloned().unwrap_or_else(|| {
         if matches!(

@@ -1,6 +1,6 @@
 //! Master table schemas and optional decrypted records recovered from each APK.
 
-use std::{collections::HashMap, path::Path, sync::OnceLock};
+use std::{borrow::Cow, collections::HashMap, path::Path, sync::OnceLock};
 
 use serde_json::{json, Value};
 
@@ -95,13 +95,17 @@ pub async fn records(region: Region, directory: &Path, name: &str) -> Result<Val
     let content = tokio::fs::read(directory.join(format!("{name}.json")))
         .await
         .map_err(|_| AppError::MasterDataUnavailable)?;
-    let mut document: Value =
-        serde_json::from_slice(&content).map_err(|_| AppError::MasterDataUnavailable)?;
-    let entries = document
-        .as_object_mut()
-        .and_then(|object| object.remove("_allData"))
-        .filter(Value::is_array)
-        .ok_or(AppError::MasterDataUnavailable)?;
+    let entries = tokio::task::spawn_blocking(move || {
+        let mut document: Value =
+            serde_json::from_slice(&content).map_err(|_| AppError::MasterDataUnavailable)?;
+        document
+            .as_object_mut()
+            .and_then(|object| object.remove("_allData"))
+            .filter(Value::is_array)
+            .ok_or(AppError::MasterDataUnavailable)
+    })
+    .await
+    .map_err(|_| AppError::MasterDataUnavailable)??;
     Ok(json!({
         "region": schema["region"],
         "source": "apk_master_snapshot",
@@ -172,7 +176,12 @@ pub async fn jp_catalog(directory: &Path, resource: &str) -> Result<Value, AppEr
     } else {
         None
     };
-    normalize_jp_catalog(document, text_document.as_ref(), resource)
+    let resource = resource.to_owned();
+    tokio::task::spawn_blocking(move || {
+        normalize_jp_catalog(document, text_document.as_ref(), &resource)
+    })
+    .await
+    .map_err(|_| AppError::MasterDataUnavailable)?
 }
 
 pub fn normalize_jp_catalog(
@@ -188,19 +197,34 @@ pub fn normalize_jp_catalog(
 
     if needs_text {
         let text_document = text_document.ok_or(AppError::MasterDataUnavailable)?;
-        let texts: HashMap<String, &str> = text_document["entries"]
+        let texts: HashMap<Cow<'_, str>, &str> = text_document["entries"]
             .as_array()
             .ok_or(AppError::MasterDataUnavailable)?
             .iter()
             .filter_map(|entry| Some((text_key(&entry["_id"])?, entry["_japanese"].as_str()?)))
             .collect();
-        for entry in entries.iter_mut() {
-            let Some(object) = entry.as_object_mut() else {
-                return Err(AppError::MasterDataUnavailable);
-            };
-            if let Some(id) = object.get("_id").cloned() {
-                object.insert("id".into(), id);
-            }
+        enrich_catalog_entries(entries, &spec, Some(&texts))?;
+    } else {
+        enrich_catalog_entries(entries, &spec, None)?;
+    }
+    document["resource"] = json!(resource);
+    document["table"] = json!(spec.table);
+    Ok(document)
+}
+
+fn enrich_catalog_entries(
+    entries: &mut [Value],
+    spec: &CatalogSpec,
+    texts: Option<&HashMap<Cow<'_, str>, &str>>,
+) -> Result<(), AppError> {
+    for entry in entries {
+        let object = entry
+            .as_object_mut()
+            .ok_or(AppError::MasterDataUnavailable)?;
+        if let Some(id) = object.get("_id").cloned() {
+            object.insert("id".into(), id);
+        }
+        if let Some(texts) = texts {
             for (field, output) in [
                 (spec.name_field, "name_ja"),
                 (spec.subtitle_field, "subtitle_ja"),
@@ -214,25 +238,14 @@ pub fn normalize_jp_catalog(
                 }
             }
         }
-    } else {
-        for entry in entries.iter_mut() {
-            let Some(object) = entry.as_object_mut() else {
-                return Err(AppError::MasterDataUnavailable);
-            };
-            if let Some(id) = object.get("_id").cloned() {
-                object.insert("id".into(), id);
-            }
-        }
     }
-    document["resource"] = json!(resource);
-    document["table"] = json!(spec.table);
-    Ok(document)
+    Ok(())
 }
 
-fn text_key(value: &Value) -> Option<String> {
+fn text_key(value: &Value) -> Option<Cow<'_, str>> {
     match value {
-        Value::String(key) => Some(key.clone()),
-        Value::Number(key) => Some(key.to_string()),
+        Value::String(key) => Some(Cow::Borrowed(key)),
+        Value::Number(key) => Some(Cow::Owned(key.to_string())),
         _ => None,
     }
 }
@@ -260,4 +273,26 @@ pub async fn jp_catalog_entry(
         .remove("entries");
     document["entry"] = entry;
     Ok(document)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_text_ids_preserve_string_and_numeric_matches() {
+        let document = json!({"entries":[
+            {"_id":1,"_nameTextID":"name","_subtitleTextID":42},
+            {"_id":2,"_nameTextID":"missing"}
+        ]});
+        let texts = json!({"entries":[
+            {"_id":"name","_japanese":"名前"},
+            {"_id":42,"_japanese":"副題"}
+        ]});
+        let result = normalize_jp_catalog(document, Some(&texts), "cards").unwrap();
+        assert_eq!(result["entries"][0]["id"], 1);
+        assert_eq!(result["entries"][0]["name_ja"], "名前");
+        assert_eq!(result["entries"][0]["subtitle_ja"], "副題");
+        assert!(result["entries"][1].get("name_ja").is_none());
+    }
 }

@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "penlight-notes-api"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "axum",
  "chrono",
@@ -1510,6 +1510,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sirius-api-proxy",
+ "subtle",
  "thiserror",
  "tokio",
  "tower",

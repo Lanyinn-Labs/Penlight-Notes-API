@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 pub struct SiriusClient {
     pub core: Arc<GameClient>,
     settings: SiriusConfig,
-    player_data: Mutex<Option<(Instant, Value)>>,
+    player_data: Mutex<Option<(Instant, Arc<Value>)>>,
 }
 
 impl SiriusClient {
@@ -84,6 +84,10 @@ impl SiriusClient {
     }
 
     pub async fn account_data(&self) -> Result<Value, AppError> {
+        self.account_data_shared().await.map(|data| (*data).clone())
+    }
+
+    pub(crate) async fn account_data_shared(&self) -> Result<Arc<Value>, AppError> {
         let mut cache = self.player_data.lock().await;
         if let Some((at, data)) = cache.as_ref() {
             if at.elapsed() < Duration::from_secs(15) {
@@ -98,6 +102,7 @@ impl SiriusClient {
         if !data["playerData"].is_object() {
             return Err(AppError::UpstreamInvalidResponse);
         }
+        let data = Arc::new(data);
         *cache = Some((Instant::now(), data.clone()));
         Ok(data)
     }
@@ -152,26 +157,26 @@ impl SiriusClient {
         let snapshot = manifest.snapshot.clone();
         let hash = file.sha256.clone();
         let table = table.to_owned();
-        let bytes = tokio::task::spawn_blocking(move || {
-            sirius_api_proxy::master_registry::table(
+        let entries = tokio::task::spawn_blocking(move || {
+            let bytes = sirius_api_proxy::master_registry::table(
                 &root,
                 sirius_api_proxy::region::Region::Jp,
                 &snapshot,
                 &table,
                 &hash,
             )
-            .map(|doc| doc.bytes)
+            .map_err(|_| AppError::MasterDataUnavailable)?
+            .bytes;
+            let mut document: Value =
+                serde_json::from_slice(&bytes).map_err(|_| AppError::MasterDataUnavailable)?;
+            document
+                .as_object_mut()
+                .and_then(|map| map.remove("_allData"))
+                .filter(Value::is_array)
+                .ok_or(AppError::MasterDataUnavailable)
         })
         .await
-        .map_err(|_| AppError::MasterDataUnavailable)?
-        .map_err(|_| AppError::MasterDataUnavailable)?;
-        let mut document: Value =
-            serde_json::from_slice(&bytes).map_err(|_| AppError::MasterDataUnavailable)?;
-        let entries = document
-            .as_object_mut()
-            .and_then(|map| map.remove("_allData"))
-            .filter(Value::is_array)
-            .ok_or(AppError::MasterDataUnavailable)?;
+        .map_err(|_| AppError::MasterDataUnavailable)??;
         Ok(
             json!({"region":"jp", "source":"master_snapshot", "master_version":manifest.version, "snapshot":manifest.snapshot, "resource_version":manifest.resource_version, "entries":entries}),
         )
@@ -191,7 +196,12 @@ impl SiriusClient {
         } else {
             None
         };
-        crate::offline_master::normalize_jp_catalog(document, texts.as_ref(), resource)
+        let resource = resource.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::offline_master::normalize_jp_catalog(document, texts.as_ref(), &resource)
+        })
+        .await
+        .map_err(|_| AppError::MasterDataUnavailable)?
     }
 
     pub async fn profile_summary(&self, raw: &Value) -> Value {

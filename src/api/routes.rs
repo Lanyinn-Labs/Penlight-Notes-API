@@ -6,6 +6,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
 use super::{handlers, ApiState, SharedState};
@@ -157,7 +158,9 @@ async fn authorize(
             .get("authorization")
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Bearer "));
-        if key != Some(expected.as_str()) && bearer != Some(expected.as_str()) {
+        if !key.is_some_and(|candidate| api_key_matches(expected, candidate))
+            && !bearer.is_some_and(|candidate| api_key_matches(expected, candidate))
+        {
             return Err(AppError::Unauthorized);
         }
     }
@@ -165,4 +168,8 @@ async fn authorize(
     tokio::time::timeout(config.gate.timeout(), next.run(request))
         .await
         .map_err(|_| AppError::ApiTimeout)
+}
+
+fn api_key_matches(expected: &str, candidate: &str) -> bool {
+    expected.as_bytes().ct_eq(candidate.as_bytes()).into()
 }

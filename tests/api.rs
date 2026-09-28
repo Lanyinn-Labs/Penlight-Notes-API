@@ -124,6 +124,18 @@ async fn authentication_protects_api_but_not_health() {
         .0,
         401
     );
+    for candidate in ["test-ke", "test-key-extra"] {
+        assert_eq!(
+            call(
+                config.clone(),
+                "/api/global/application",
+                Some(("x-api-key", candidate))
+            )
+            .await
+            .0,
+            401
+        );
+    }
     for header in [
         ("x-api-key", "test-key"),
         ("authorization", "Bearer test-key"),
