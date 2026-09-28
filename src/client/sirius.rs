@@ -186,8 +186,12 @@ impl SiriusClient {
         let spec = crate::offline_master::catalog_spec(resource).ok_or(AppError::NotFound)?;
         let manifest = self.master_manifest().await?;
         let document = self.master_records_at(&manifest, spec.table).await?;
-        let texts = self.master_records_at(&manifest, "MasterText").await?;
-        crate::offline_master::normalize_jp_catalog(document, Some(&texts), resource)
+        let texts = if spec.needs_text(&document) {
+            Some(self.master_records_at(&manifest, "MasterText").await?)
+        } else {
+            None
+        };
+        crate::offline_master::normalize_jp_catalog(document, texts.as_ref(), resource)
     }
 
     pub async fn profile_summary(&self, raw: &Value) -> Value {

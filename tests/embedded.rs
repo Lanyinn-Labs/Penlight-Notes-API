@@ -119,22 +119,32 @@ impl Drop for Directory {
 }
 
 fn snapshot(root: &std::path::Path, name: &str, version: &str, id: i64) {
+    write_snapshot(
+        root,
+        name,
+        version,
+        &[
+            (
+                "MasterMemberCard",
+                json!({"_allData":[{"_id":id,"_nameTextID":"name"}]}),
+            ),
+            (
+                "MasterText",
+                json!({"_allData":[{"_id":"name","_japanese":format!("カード{id}")}]}),
+            ),
+        ],
+    );
+}
+
+fn write_snapshot(root: &std::path::Path, name: &str, version: &str, tables: &[(&str, Value)]) {
     let path = root.join(name);
     fs::create_dir(&path).unwrap();
-    let tables = [
-        (
-            "MasterMemberCard",
-            json!({"_allData":[{"_id":id,"_nameTextID":"name"}]}),
-        ),
-        (
-            "MasterText",
-            json!({"_allData":[{"_id":"name","_japanese":format!("カード{id}")}]}),
-        ),
-    ];
+    let mut tables = tables.iter().collect::<Vec<_>>();
+    tables.sort_by_key(|(name, _)| *name);
     let mut files = vec![];
     let mut source = vec![];
-    for (table, value) in tables {
-        let bytes = serde_json::to_vec(&value).unwrap();
+    for (table, value) in &tables {
+        let bytes = serde_json::to_vec(value).unwrap();
         fs::write(path.join(format!("{table}.json")), &bytes).unwrap();
         files.push(sirius_api_proxy::master_registry::file(
             format!("{table}.json"),
@@ -152,8 +162,44 @@ fn snapshot(root: &std::path::Path, name: &str, version: &str, id: i64) {
         serde_json::to_vec(&json!({"version":version,"files":source})).unwrap(),
     )
     .unwrap();
-    fs::write(path.join("receipt.json"),serde_json::to_vec(&json!({"version":version,"snapshot":name,"tables":2,"source":"local-import","region":"jp"})).unwrap()).unwrap();
+    fs::write(path.join("receipt.json"),serde_json::to_vec(&json!({"version":version,"snapshot":name,"tables":tables.len(),"source":"local-import","region":"jp"})).unwrap()).unwrap();
     fs::write(root.join("CURRENT"), name).unwrap();
+}
+
+#[tokio::test]
+async fn online_catalog_reads_text_only_when_entries_need_it() {
+    let directory = Directory::new();
+    write_snapshot(
+        &directory.0,
+        "master-no-text",
+        "v1",
+        &[
+            ("MasterEvent", json!({"_allData":[{"_id":7}]})),
+            ("MasterMemberCard", json!({"_allData":[]})),
+            (
+                "MasterCharacter",
+                json!({"_allData":[{"_id":1,"_nameTextID":"name"}]}),
+            ),
+        ],
+    );
+    let mut config = settings();
+    config.master_directory = Some(directory.0.clone());
+    let client = SiriusClient::new(config.clone()).unwrap();
+    assert_eq!(
+        client.catalog("events").await.unwrap()["entries"][0]["id"],
+        7
+    );
+    assert!(client.catalog("cards").await.unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(client.catalog("characters").await.is_err());
+
+    let mut frontend = Config::default();
+    frontend.regions[1].sirius = Some(config);
+    let (status, events) = get(api::build(Arc::new(frontend)), "/api/jp/events").await;
+    assert_eq!(status, 200);
+    assert_eq!(events["entries"][0]["id"], 7);
 }
 
 #[tokio::test]

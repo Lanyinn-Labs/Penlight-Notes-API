@@ -130,6 +130,15 @@ pub(crate) struct CatalogSpec {
     subtitle_field: Option<&'static str>,
 }
 
+impl CatalogSpec {
+    pub(crate) fn needs_text(&self, document: &Value) -> bool {
+        self.name_field.is_some()
+            && document["entries"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty())
+    }
+}
+
 pub(crate) fn catalog_spec(resource: &str) -> Option<CatalogSpec> {
     let (table, name_field, subtitle_field) = match resource {
         "cards" => (
@@ -158,11 +167,7 @@ pub(crate) fn catalog_spec(resource: &str) -> Option<CatalogSpec> {
 pub async fn jp_catalog(directory: &Path, resource: &str) -> Result<Value, AppError> {
     let spec = catalog_spec(resource).ok_or(AppError::NotFound)?;
     let document = records(Region::Jp, directory, spec.table).await?;
-    let text_document = if spec.name_field.is_some()
-        && document["entries"]
-            .as_array()
-            .is_some_and(|entries| !entries.is_empty())
-    {
+    let text_document = if spec.needs_text(&document) {
         Some(records(Region::Jp, directory, "MasterText").await?)
     } else {
         None
@@ -176,11 +181,12 @@ pub fn normalize_jp_catalog(
     resource: &str,
 ) -> Result<Value, AppError> {
     let spec = catalog_spec(resource).ok_or(AppError::NotFound)?;
+    let needs_text = spec.needs_text(&document);
     let entries = document["entries"]
         .as_array_mut()
         .ok_or(AppError::MasterDataUnavailable)?;
 
-    if !entries.is_empty() && spec.name_field.is_some() {
+    if needs_text {
         let text_document = text_document.ok_or(AppError::MasterDataUnavailable)?;
         let texts: HashMap<String, &str> = text_document["entries"]
             .as_array()
