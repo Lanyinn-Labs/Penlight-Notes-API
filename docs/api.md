@@ -4,7 +4,7 @@
 
 游戏接口以 `/api/{region}` 开头，区服为 `jp` 或 `global`。以下在线接口目前支持日服；未配置日服协议、或查询未接入的国际服时返回 `501 protocol_pending`。关闭区服返回 `503 region_disabled`。
 
-设置 `PENLIGHT_API_KEY` 后，所有 `/api/*` 请求必须提供 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`。`/user/*` 始终要求配置并通过 API Key 认证。响应为 JSON；原始 Protobuf JSON 中的 64 位整数可能使用字符串。
+设置 `PENLIGHT_API_KEY` 后，所有 `/api/*` 和 `/internal/v1/*` 请求必须提供 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`。留空时这些查询免认证；`/user/*` 始终要求配置并通过 API Key 认证。响应为 JSON；原始 Protobuf JSON 中的 64 位整数可能使用字符串。
 
 ## 服务状态
 
@@ -23,6 +23,8 @@
 认证通过后，`/api/*` 使用全实例共享的令牌桶和并发限制。默认持续 30 请求/秒、突发 60 个、最多同时处理 16 个请求；超过速率或并发分别返回 `429 api_rate_limited`、`429 api_busy`，带 `Retry-After: 1`，不会排队。请求总超时默认 30 秒，返回 `504 api_timeout`。调用方应退避重试，限流配置见 [配置参考](configuration.md)。多容器实例各自计数。
 
 ## 在线查询
+
+`GET /internal/v1/jp/resources/snapshot` 刷新并返回日服资源快照，供资源更新器读取资源版本、平台摘要及 CDN 目录。响应包含 `snapshot` 和 `stale: false`；请求受与 `/api/*` 相同的认证和限流保护。未配置日服在线协议时返回 `501 protocol_pending`。
 
 | GET 路径（均以 `/api/jp` 为前缀） | 说明 |
 | --- | --- |

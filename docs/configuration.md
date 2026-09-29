@@ -25,7 +25,7 @@ cargo run --locked
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PENLIGHT_LISTEN` | `127.0.0.1:8081` | 完整监听地址；IPv6 使用 `[::1]:8081` |
-| `PENLIGHT_API_KEY` | 空 | API 访问密钥；为空时公共查询免认证，`/user/*` 不可访问 |
+| `PENLIGHT_API_KEY` | 空 | API 访问密钥；为空时公共查询和资源快照免认证，`/user/*` 不可访问 |
 | `RUST_LOG` | `info` | 日志过滤 |
 | `PENLIGHT_MAX_CONCURRENT` | `16` | `/api/*` 并发上限，范围 1–65536 |
 | `PENLIGHT_REQUESTS_PER_SECOND` | `30` | 全实例令牌桶每秒补充速率 |

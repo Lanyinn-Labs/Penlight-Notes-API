@@ -47,6 +47,15 @@ impl SiriusClient {
         upstream_snapshot(&observation, chrono::Utc::now(), ttl)
     }
 
+    pub async fn resource_snapshot(&self) -> Result<Value, AppError> {
+        let snapshot = self
+            .core
+            .refresh_resource_snapshot()
+            .await
+            .map_err(map_error)?;
+        Ok(json!({"snapshot": snapshot, "stale": false}))
+    }
+
     pub async fn application(&self) -> Result<Value, AppError> {
         let execution = self.core.public_query(Operation::Version {}).await;
         let available = match execution.result {

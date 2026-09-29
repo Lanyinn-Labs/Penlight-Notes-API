@@ -67,6 +67,16 @@ pub async fn servers(State(config): State<SharedState>) -> Json<Value> {
     Json(json!({"servers": servers}))
 }
 
+pub async fn resource_snapshot(
+    State(state): State<SharedState>,
+    Path(region): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    online(&state, Region::parse(&region)?)?
+        .resource_snapshot()
+        .await
+        .map(Json)
+}
+
 pub async fn application(
     State(config): State<SharedState>,
     Path(region): Path<String>,

@@ -131,12 +131,20 @@ fn assemble(
     let api = api
         .fallback(|| async { AppError::NotFound })
         .layer(middleware::from_fn_with_state(state.clone(), authorize));
+    let internal = Router::new()
+        .route(
+            "/{region}/resources/snapshot",
+            get(handlers::resource_snapshot),
+        )
+        .fallback(|| async { AppError::NotFound })
+        .layer(middleware::from_fn_with_state(state.clone(), authorize));
 
     Router::new()
         .route("/health", get(handlers::health))
         .route("/version", get(handlers::version))
         .route("/servers", get(handlers::servers))
         .nest("/api", api)
+        .nest("/internal/v1", internal)
         .fallback(|| async { AppError::NotFound })
         .method_not_allowed_fallback(|| async { AppError::MethodNotAllowed })
         .layer(TraceLayer::new_for_http())

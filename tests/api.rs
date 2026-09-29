@@ -150,6 +150,24 @@ async fn authentication_protects_api_but_not_health() {
 }
 
 #[tokio::test]
+async fn resource_snapshot_uses_optional_api_key_and_online_jp_protocol() {
+    let path = "/internal/v1/jp/resources/snapshot";
+    assert_eq!(call(Config::default(), path, None).await.0, 501);
+
+    let config = Config {
+        api_key: Some("test-key".into()),
+        ..Config::default()
+    };
+    assert_eq!(call(config.clone(), path, None).await.0, 401);
+    assert_eq!(
+        call(config, path, Some(("authorization", "Bearer test-key")))
+            .await
+            .0,
+        501
+    );
+}
+
+#[tokio::test]
 async fn configured_upstream_is_not_reported_as_ready() {
     let mut config = Config::default();
     config.regions[1].sirius = Some(serde_json::from_value(serde_json::json!({

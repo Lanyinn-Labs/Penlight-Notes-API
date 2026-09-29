@@ -16,12 +16,12 @@ CI 不使用真实游戏凭据，不查询官方服务器。
 
 1. 修改根目录 `Cargo.toml` 的 package.version，并通过 Cargo 更新锁文件中的本项目版本。
 2. 更新 `CHANGELOG.md`，提交变更，确认 main 的检查通过。
-3. 为该提交创建匹配的版本标签并推送。例如当前版本 0.2.4：
+3. 为该提交创建匹配的版本标签并推送。例如当前版本 0.2.5：
 
 ```bash
-git tag v0.2.4
+git tag v0.2.5
 git push origin main
-git push origin v0.2.4
+git push origin v0.2.5
 ```
 
 版本标签必须与根 Cargo.toml 完全匹配，不匹配会在构建前失败。操作前确认当前提交就是准备发布的版本。
@@ -53,7 +53,7 @@ ghcr.io/lanyinn-labs/penlight-notes-api
 实际镜像路径由 GitHub 仓库名称自动生成并转换为小写。目前构建 linux/amd64；每次版本发布生成完整版本、主次版本和提交 SHA 标签，稳定版本还会生成 latest。
 
 ```bash
-docker pull ghcr.io/lanyinn-labs/penlight-notes-api:0.2.4
+docker pull ghcr.io/lanyinn-labs/penlight-notes-api:0.2.5
 ```
 
 main push 自动验证并发布 `:main` 及提交 SHA 标签，部署服务器可以直接拉取。版本标签发布仍保留完整版本、主次版本和 latest 标签。手动运行 Docker 时，默认不发布；选中 publish 才推送。GHCR 使用 GITHUB_TOKEN，无需配置 Docker Hub 密码。组织的 Actions/Packages 权限必须允许写入包；首次发布后，在 GitHub 包设置中检查公开可见性。
@@ -91,7 +91,7 @@ Python 3.11 或更高版本，无额外 Python 依赖：
 python3 scripts/check_release.py
 cargo build --release --locked
 python3 scripts/package_release.py --target linux-x64
-python3 scripts/smoke_release.py dist/penlight-notes-api-0.2.4-linux-x64.tar.gz
+python3 scripts/smoke_release.py dist/penlight-notes-api-0.2.5-linux-x64.tar.gz
 ```
 
 Docker 环境可用时：
