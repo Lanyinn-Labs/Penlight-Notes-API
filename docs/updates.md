@@ -37,6 +37,8 @@ sync 使用发布者的日服路径，要求 HTTPS，不需要 CDN 或解密密�
 
 ## 安卓版本检测与适配
 
+2026-09-30 已在线验证 Android `1.0.4` 的版本查询、资源快照及 Master 下载解密；运行时版本已更新为 `1.0.4`，继续使用已验证兼容的 `sirius/1.0.3` 协议文件。已有 Docker 部署可在此配置发布到 main 后通过 `docker compose restart api` 拉取更新。若 `.env` 显式设置了 `PENLIGHT_JP_CLIENT_VERSION`，需同步更新或移除该覆盖值。
+
 [检测脚本](../scripts/check_android_version.py) 读取日本区 Google Play 官方页面，验证包名 `com.bushiroad.sirius`，与 [客户端配置](../data/jp-client.json) 比较。配置中的版本、CDN 用户名/密码、Master key/IV 和协议路径由启动时读取；Docker 自动下载并缓存最新 JSON。
 
 ```bash

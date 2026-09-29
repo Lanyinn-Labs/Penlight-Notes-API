@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- 将日服 Android 客户端版本更新为 1.0.4，恢复被 CLIENT_UPDATE_REQUIRED 拒绝的在线查询、资源快照及 Master 更新。
+- 健康状态增加 upstream.application_code，直接显示官方返回的应用错误码。
+- 在线验证资源快照、公告及 238 张 Master 表的下载解密；继续使用兼容的 1.0.3 协议文件。
+
 ## 0.2.5
 
 - 增加日服资源快照接口，供资源更新器检测资源版本及下载目录。

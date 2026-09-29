@@ -364,7 +364,8 @@ fn upstream_snapshot(
         _ => "unavailable",
     };
     json!({"configured":true, "status":status, "last_observed_at":observation.observed_at,
-        "age_ms":age_ms, "grpc_status":observation.grpc_status, "maintenance":observation.maintenance})
+        "age_ms":age_ms, "grpc_status":observation.grpc_status,
+        "application_code":observation.application_code, "maintenance":observation.maintenance})
 }
 
 #[cfg(test)]
@@ -391,6 +392,12 @@ mod health_tests {
             "unavailable"
         );
         observation.maintenance = false;
+        observation.application_code = Some("CLIENT_UPDATE_REQUIRED".into());
+        observation.grpc_status = Some(2);
+        let health = upstream_snapshot(&observation, now, ttl);
+        assert_eq!(health["status"], "unavailable");
+        assert_eq!(health["application_code"], "CLIENT_UPDATE_REQUIRED");
+        observation.application_code = None;
         observation.grpc_status = Some(16);
         assert_eq!(
             upstream_snapshot(&observation, now, ttl)["status"],

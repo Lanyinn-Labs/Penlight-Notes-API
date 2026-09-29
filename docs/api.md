@@ -16,6 +16,8 @@
 
 这些接口无需认证，不执行网络探测，也不占用接口限流额度。`/health` 的 `status: ok` 表示 HTTP 服务运行，`upstream` 包含最近实际通信的 `last_observed_at`、`age_ms`、`grpc_status` 和 `maintenance`。状态为 disabled（未启用）、unknown（尚无记录）、available、unavailable 或 stale（超过 `PENLIGHT_STATUS_TTL_SECONDS`，默认 300 秒）。记录来自底层客户端，包括普通查询和后台 Master 版本检查；缓存命中、本地 Master 读取不刷新时间。`upstream_ready` 保留为兼容字段，仅在 available 时为 true。它不代表所有账号、接口均可用。
 
+`upstream.application_code` 展示上游返回的应用错误码，无错误时为 null。例如 `CLIENT_UPDATE_REQUIRED` 表示当前客户端版本已被官方拒绝，需要适配并更新客户端配置；单独的 `grpc_status: 2` 无法区分具体原因。
+
 `master_update` 单独展示后台任务的 status、started_at、completed_at，不返回私有数据。区服 status 为 disabled、protocol_pending 或 protocol_configured；配置成功不等于官方服务可用。
 
 ## 请求保护
