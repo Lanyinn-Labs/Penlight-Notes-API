@@ -18,14 +18,16 @@ state directly, so it needs no local source files. It does not initialize or mut
 schema: first publish/import/migrate using the documented database writer, and grant the
 registry role SELECT access to the existing tables. Database passwords must differ from
 the registry bearer. Verified TLS, lazy bounded pooling, read deadlines and corruption
-checks match [the database mirror](MASTER_DATABASE.md). A database outage returns 503;
-there is no file fallback. Restart to rotate tokens or connection settings.
+checks match [the database mirror](MASTER_DATABASE.md). Reads use the connection's
+`read_timeout_seconds` (default the smaller of `timeout_seconds` and 30); with an owner worker,
+its database publication uses `timeout_seconds`, so the writer budget can stay long while reads
+stay short. A database outage or an expired read returns 503; there is no file fallback. Restart to rotate tokens or connection settings.
 
 ## Routes and consumers
 
 All Master reads require exactly one `Authorization: Bearer ...` header. Missing, incorrect
-and duplicate headers return 401. `/health` is public and reports process liveness only;
-it does not assert that Master data or the database is ready. Game and internal proxy
+and duplicate headers return 401. `/health` is public and reports process liveness, version and
+`uptime_secs` (whole seconds since process start) only; it does not assert that Master data or the database is ready. Game and internal proxy
 routes are absent.
 
 | Route under `/api/v1/master-data` | Meaning |
@@ -48,10 +50,18 @@ local snapshot UUID. Always use the ID returned by the registry; a local writer 
 a database registry address. Retention can remove old content, producing 404. Manifest ETags
 cover the adapted bytes, and manifests require revalidation. Verified table responses have
 immutable private caching. Integrity verification precedes conditional 304 handling.
+The optional root `http_compression: {enabled: true}` negotiates gzip/zstd on these public
+routes only, never on `/health` or the internal owner routes; an encoded response sends its
+ETag weak (`W/"<hash>"`), which `If-None-Match` still matches. See
+[response compression](HTTP_COMPRESSION.md).
 
 History returns `{backend, history}`. File history contains committed snapshot IDs and uses
-`next_before` as its snapshot cursor. PostgreSQL history contains decimal-string sequences,
-content hashes and retention flags; use its `next_before` sequence cursor. Do not reuse a
+`next_before` as its snapshot cursor; since 1.3.0 its entries also include a nullable
+`resource_version`. PostgreSQL history contains decimal-string sequences, content hashes,
+retention flags, `published_at` and nullable `version`, `resource_version`, `file_count` and
+`total_size` (null on events written before 1.3.0, see
+[MASTER_DATABASE.md](MASTER_DATABASE.md#database-mirror-read-api)); use its `next_before` sequence
+cursor. Do not reuse a
 cursor after changing backends. History uses private `no-store` caching. The endpoint does
 not pretend that file installation chronology and database publication chronology are identical.
 
@@ -82,10 +92,15 @@ successful partial archive. Build work is bounded to 120 seconds after manifest 
 additional simultaneous bundle requests return 503. Temporary files and permits are dropped on
 failure, disconnect or completion, including cancellation while a bounded blocking write finishes.
 
-The response includes exact Content-Length, an ETag covering the actual tar bytes, Master version,
-scoped content hash and a safe content-derived download filename. Bundle responses use private
-`no-cache`: reimporting identical file content can change the embedded local snapshot UUID and
-therefore the archive bytes. Conditional 304 is considered only after full source verification
+The table route applies the same [table read admission](MASTER_REGISTRY.md#table-read-admission)
+as the proxy: 16 process-wide permits, a FIFO wait of up to 5 s, then 503 `master_unavailable`.
+Malformed table requests are rejected before they queue. This gate is separate from the two
+bundle permits; the tables a bundle loads count only against the bundle gate.
+
+The response is never content-encoded. It includes exact Content-Length, an ETag covering the
+actual tar bytes, Master version, scoped content hash and a safe content-derived download
+filename. Bundle responses use private `no-cache`: reimporting identical file content can
+change the embedded local snapshot UUID and therefore the archive bytes. Conditional 304 is considered only after full source verification
 and archive construction, so it cannot conceal later corruption. Range/resume is not implemented.
 Clients must still check successful HTTP completion before using or extracting a downloaded file.
 
@@ -107,6 +122,9 @@ owner:
     request_timeout_ms: 60000
   # PostgreSQL backends require this local verified snapshot directory:
   # staging_directory: ./registry-master
+  # Optional; see "Snapshot retention" in MASTER_REGISTRY.md:
+  # retention:
+  #   keep_snapshots: 20 # 2..10000
 ```
 
 File backends synchronize into their configured serving directory and reject `staging_directory`
@@ -114,6 +132,13 @@ to avoid ambiguous ownership. PostgreSQL backends require that directory: first 
 installs a fully verified local snapshot, then it transactionally publishes to the database.
 With this worker enabled, the database role needs the writer's schema/publication permissions;
 a SELECT-only role is suitable only for a registry without an owner worker.
+
+`owner.retention` prunes the snapshots this owner's synchronization writes: the files backend's
+serving directory, or the PostgreSQL `staging_directory`. It requires `source`, because a
+local-only owner writes no snapshots, and it is independent of the upstream owner's retention.
+The PostgreSQL mirror keeps its own `keep_snapshots`, counted in distinct content hashes. After
+a files backend has been pruned, its history, lookup by content identity, bundles and pinned
+reads stop at the retention boundary, and pruned identities answer 404.
 
 Public read, internal administration and source bearer values must all differ. Database passwords
 must also differ from all three. Source transport uses verified HTTPS, no ambient proxy, no redirects

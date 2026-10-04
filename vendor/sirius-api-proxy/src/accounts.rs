@@ -52,10 +52,61 @@ pub(crate) struct Credentials {
     pub(crate) player_id: String,
     pub(crate) credential: String,
 }
+#[derive(Default)]
 struct Health {
+    /// Consecutive transient failures.
     failures: u32,
+    /// The part of `failures` charged as path-class faults during path streak `path_streak`;
+    /// withdrawn when that streak is attributed to the path (see [`crate::path_health`]).
+    path_failures: u32,
+    path_streak: u64,
+    /// Cooldown from a signal: AEGIS_*, CONCURRENT_DEVICE, the login interval or daily cap.
     until: Option<Instant>,
+    /// Cooldown from reaching `failure_threshold`.
+    threshold_until: Option<Instant>,
     disabled: bool,
+}
+impl Health {
+    fn cooldown_until(&self) -> Option<Instant> {
+        self.until.max(self.threshold_until)
+    }
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.path_failures = 0;
+        self.until = None;
+        self.threshold_until = None;
+    }
+    /// A transient failure; reaching the threshold cools the account down. `streak` marks a
+    /// path-class fault charged during that path streak.
+    fn transient(&mut self, policy: &PoolPolicy, streak: Option<u64>) {
+        self.failures = self.failures.saturating_add(1);
+        if let Some(streak) = streak {
+            if self.path_streak != streak {
+                self.path_streak = streak;
+                self.path_failures = 0;
+            }
+            self.path_failures = self.path_failures.saturating_add(1);
+        }
+        if self.failures >= policy.failure_threshold {
+            self.threshold_until =
+                Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds));
+        }
+    }
+    /// A path-class fault (timeout, transport, protocol, bare gRPC 14), paid as `charge` says.
+    fn path_fault(&mut self, policy: &PoolPolicy, charge: Charge) {
+        if let Charge::Account { streak } = charge {
+            self.transient(policy, streak);
+        }
+    }
+}
+/// Who pays for a path-class fault, decided by [`crate::path_health::PathHealth::charge`] when
+/// the call is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Charge {
+    /// The account; `streak` is the path streak the fault belongs to, if one is in progress.
+    Account { streak: Option<u64> },
+    /// The shared path: the account is not charged.
+    Path,
 }
 pub(crate) enum Source {
     Static(Credentials),
@@ -70,6 +121,8 @@ pub(crate) struct Account {
 }
 /// Game headers for one authenticated call. Built per call; never stored or logged.
 pub(crate) struct Auth {
+    /// Configured account name (not a secret): the source of path-health attribution.
+    pub account: String,
     pub player_id: String,
     pub credential: String,
     /// Global only: the SDK uid sent as `x-player-bid`.
@@ -100,6 +153,13 @@ pub struct AccountStatus {
     /// Global only: last application or SDK error class (`[A-Z0-9_]`), never text.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error_code: Option<String>,
+    /// Global only: the SDK's numeric code when `last_error_code` is `SDK_REFUSED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_sdk_code: Option<i64>,
+    /// Global only: the identity's SDK session, shared by every region: `none`, `valid`,
+    /// `stale`, `expired` or `refused`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sdk_session: Option<&'static str>,
 }
 pub(crate) struct Pool {
     entries: Vec<Arc<Account>>,
@@ -223,8 +283,10 @@ pub fn validate(config: &Config) -> Result<(), AppError> {
 }
 impl Account {
     pub fn available(&self) -> bool {
-        let h = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        !h.disabled && h.until.is_none_or(|until| until <= Instant::now())
+        let h = self.health();
+        !h.disabled
+            && h.cooldown_until()
+                .is_none_or(|until| until <= Instant::now())
     }
     pub(crate) fn global(&self) -> Option<&GlobalAccount> {
         match &self.source {
@@ -246,6 +308,7 @@ impl Account {
     pub(crate) fn auth(&self) -> Option<Auth> {
         match &self.source {
             Source::Static(c) => Some(Auth {
+                account: self.name.clone(),
                 player_id: c.player_id.clone(),
                 credential: c.credential.clone(),
                 bid: None,
@@ -253,6 +316,7 @@ impl Account {
             Source::Global(g) => {
                 let state = g.state();
                 state.session.as_ref().map(|s| Auth {
+                    account: self.name.clone(),
                     player_id: s.player_id.clone(),
                     credential: s.credential.clone(),
                     bid: Some(g.identity.sdk.uid.clone()),
@@ -270,22 +334,29 @@ impl Account {
         let mut h = self.health();
         h.until = Some(h.until.map_or(until, |current| current.max(until)));
     }
-    /// A transient failure; reaching the threshold cools the account down.
-    pub(crate) fn transient_failure(&self, policy: &PoolPolicy) {
+    /// Withdraws the path-class failures charged during path streak `streak`, which has turned
+    /// out to be the path's fault. The threshold cooldown is lifted if the remaining failures
+    /// are below the threshold; signal cooldowns and `disabled` are never touched.
+    pub(crate) fn revoke_path_failures(&self, streak: u64, policy: &PoolPolicy) {
         let mut h = self.health();
-        h.failures = h.failures.saturating_add(1);
-        if h.failures >= policy.failure_threshold {
-            h.until = Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds));
+        if h.path_streak != streak || h.path_failures == 0 {
+            return;
+        }
+        h.failures = h.failures.saturating_sub(h.path_failures);
+        h.path_failures = 0;
+        if h.failures < policy.failure_threshold {
+            h.threshold_until = None;
         }
     }
     /// Global: apply a login or call outcome signalled by `x-sirius-error-code` (preferred) or
-    /// the gRPC status.
+    /// the gRPC status. `charge` decides who pays for a path-class fault.
     pub(crate) fn global_signal(
         &self,
         result: &Result<serde_json::Value, AppError>,
         code: Option<&str>,
         policy: &PoolPolicy,
         login: &LoginConfig,
+        charge: Charge,
     ) {
         let Some(g) = self.global() else {
             return;
@@ -293,18 +364,17 @@ impl Account {
         let now = Instant::now();
         let error = match result {
             Ok(_) => {
-                let mut h = self.health();
-                h.failures = 0;
-                h.until = None;
+                self.health().succeeded();
                 let mut s = g.state();
                 s.invalidations = 0;
                 s.last_error_code = None;
+                s.last_sdk_code = None;
                 return;
             }
             Err(error) => error,
         };
         let status = match error {
-            AppError::Grpc(status) => Some(*status),
+            AppError::Grpc(status) | AppError::Maintenance(status) => Some(*status),
             _ => None,
         };
         let code = code.filter(|c| {
@@ -313,12 +383,17 @@ impl Account {
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         });
         if let Some(code) = code {
-            g.state().last_error_code = Some(code.to_owned());
+            let mut s = g.state();
+            s.last_error_code = Some(code.to_owned());
+            s.last_sdk_code = None;
         }
         let invalidate = |sdk_stale: bool| {
+            if sdk_stale {
+                let generation = g.state().sdk_generation;
+                g.sdk.mark_stale(generation);
+            }
             let mut s = g.state();
             s.session = None;
-            s.sdk_stale |= sdk_stale;
             s.invalidations = s.invalidations.saturating_add(1);
             s.invalidations
         };
@@ -351,6 +426,8 @@ impl Account {
                 }
             }
             Some("UNDER_MAINTENANCE") => {}
+            // Stale proxy version headers: the session and the account are fine.
+            Some(c) if crate::client::version_signal(Some(c)) => {}
             _ => match (error, status) {
                 (_, Some(16)) => {
                     if invalidate(true) >= 2 {
@@ -359,14 +436,29 @@ impl Account {
                 }
                 (_, Some(7)) => self.disable(),
                 (AppError::Timeout | AppError::Transport | AppError::Protocol, _)
-                | (_, Some(8 | 13 | 14)) => self.transient_failure(policy),
+                | (_, Some(14)) => self.health().path_fault(policy, charge),
+                (_, Some(8 | 13)) => self.health().transient(policy, None),
                 _ => {}
             },
         }
     }
 }
 impl Pool {
+    /// Loads with memory-only SDK sessions of its own.
+    #[cfg(test)]
     pub fn load(config: &Config, generation: u64) -> Result<Self, AppError> {
+        Self::load_with(
+            config,
+            generation,
+            &*crate::sdk_session::SdkSessions::open(None)?,
+        )
+    }
+    /// Loads with the deployment's shared SDK sessions.
+    pub(crate) fn load_with(
+        config: &Config,
+        generation: u64,
+        sessions: &crate::sdk_session::SdkSessions,
+    ) -> Result<Self, AppError> {
         validate(config)?;
         let legacy;
         let entries = if config.accounts.is_empty() {
@@ -395,7 +487,11 @@ impl Pool {
                 if !ids.insert(format!("global:{}", identity.sdk.uid)) {
                     return Err(AppError::Config("invalid or duplicate account identity"));
                 }
-                Source::Global(Box::new(GlobalAccount::new(identity, config.region)))
+                Source::Global(Box::new(GlobalAccount::new(
+                    identity,
+                    config.region,
+                    sessions,
+                )))
             } else {
                 let credentials = if let Some(path) = &c.credentials_file {
                     let bytes = read_private_file(
@@ -437,11 +533,7 @@ impl Pool {
                 source,
                 lock: tokio::sync::Mutex::new(()),
                 active: AtomicUsize::new(0),
-                health: Mutex::new(Health {
-                    failures: 0,
-                    until: None,
-                    disabled: false,
-                }),
+                health: Mutex::new(Health::default()),
             }));
         }
         Ok(Self {
@@ -474,8 +566,39 @@ impl Pool {
             state.last_login_at = old.last_login_at;
         }
     }
+    /// Applies [`Account::revoke_path_failures`] to every account.
+    pub(crate) fn revoke_path_failures(&self, streak: u64, policy: &PoolPolicy) {
+        for account in &self.entries {
+            account.revoke_path_failures(streak, policy);
+        }
+    }
     pub(crate) fn find(&self, name: &str) -> Option<Arc<Account>> {
         self.entries.iter().find(|a| a.name == name).cloned()
+    }
+    /// The available account a public call would lease next: rotation from `next`, fewest
+    /// active calls first.
+    fn public_index(&self) -> Option<usize> {
+        (0..self.entries.len())
+            .map(|offset| (self.next + offset) % self.entries.len())
+            .filter(|&i| self.entries[i].available())
+            .min_by_key(|&i| self.entries[i].active.load(Ordering::Relaxed))
+    }
+    /// The account `select(None, false)` would lease right now, without leasing it: neither
+    /// the rotation nor the active count moves.
+    pub(crate) fn peek_public(&self) -> Option<Arc<Account>> {
+        self.public_index().map(|i| self.entries[i].clone())
+    }
+    /// Every account in rotation order, whatever its health.
+    pub(crate) fn rotation(&self) -> Vec<Arc<Account>> {
+        (0..self.entries.len())
+            .map(|offset| self.entries[(self.next + offset) % self.entries.len()].clone())
+            .collect()
+    }
+    #[cfg(test)]
+    pub(crate) fn cool_down_all_for_test(&self, duration: Duration) {
+        for account in &self.entries {
+            account.cool_down(Instant::now() + duration);
+        }
     }
     pub fn select(&mut self, name: Option<&str>, private: bool) -> Result<Lease, AppError> {
         let index = if let Some(name) = name {
@@ -486,11 +609,7 @@ impl Pool {
         } else if private {
             0
         } else {
-            (0..self.entries.len())
-                .map(|offset| (self.next + offset) % self.entries.len())
-                .filter(|&i| self.entries[i].available())
-                .min_by_key(|&i| self.entries[i].active.load(Ordering::Relaxed))
-                .ok_or(AppError::AccountUnavailable)?
+            self.public_index().ok_or(AppError::AccountUnavailable)?
         };
         let account = self
             .entries
@@ -508,13 +627,13 @@ impl Pool {
             .iter()
             .map(|a| {
                 let h = a.health();
-                let cooling = h.until.is_some_and(|t| t > now);
+                let cooling = h.cooldown_until().is_some_and(|t| t > now);
                 let mut status = AccountStatus {
                     name: a.name.clone(),
                     active_calls: a.active.load(Ordering::Relaxed),
                     consecutive_failures: h.failures,
                     cooldown_remaining_seconds: h
-                        .until
+                        .cooldown_until()
                         .map(|t| {
                             let remaining = t.saturating_duration_since(now);
                             remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
@@ -525,6 +644,8 @@ impl Pool {
                     last_login_at: None,
                     logins_24h: None,
                     last_error_code: None,
+                    last_sdk_code: None,
+                    sdk_session: None,
                 };
                 if let Some(g) = a.global() {
                     let mut s = g.state();
@@ -543,6 +664,8 @@ impl Pool {
                     status.last_login_at = s.last_login_at;
                     status.logins_24h = Some(s.attempts.len());
                     status.last_error_code = s.last_error_code.clone();
+                    status.last_sdk_code = s.last_sdk_code;
+                    status.sdk_session = Some(g.sdk.label(chrono::Utc::now()));
                 }
                 status
             })
@@ -550,38 +673,36 @@ impl Pool {
     }
 }
 impl Lease {
-    pub fn report(
+    /// Applies a call outcome to the account. `charge` decides who pays for a path-class fault.
+    pub(crate) fn report(
         &self,
         result: &Result<serde_json::Value, AppError>,
         code: Option<&str>,
         policy: &PoolPolicy,
         login: Option<&LoginConfig>,
+        charge: Charge,
     ) {
         if let (Some(login), Some(_)) = (login, self.account.global()) {
-            self.account.global_signal(result, code, policy, login);
+            self.account
+                .global_signal(result, code, policy, login, charge);
+            return;
+        }
+        if code == Some("UNDER_MAINTENANCE") || crate::client::version_signal(code) {
+            // Maintenance and stale version headers say nothing about this account, whatever
+            // the gRPC status (also covers gRPC 14 + maintenance).
             return;
         }
         let mut h = self.account.health();
         match result {
-            Ok(_) => {
-                h.failures = 0;
-                h.until = None;
-            }
+            Ok(_) => h.succeeded(),
             Err(AppError::Grpc(7 | 16)) => {
                 h.disabled = true;
                 h.failures = h.failures.saturating_add(1);
             }
             Err(
-                AppError::Timeout
-                | AppError::Transport
-                | AppError::Protocol
-                | AppError::Grpc(8 | 13 | 14),
-            ) => {
-                h.failures = h.failures.saturating_add(1);
-                if h.failures >= policy.failure_threshold {
-                    h.until = Some(Instant::now() + Duration::from_secs(policy.cooldown_seconds));
-                }
-            }
+                AppError::Timeout | AppError::Transport | AppError::Protocol | AppError::Grpc(14),
+            ) => h.path_fault(policy, charge),
+            Err(AppError::Grpc(8 | 13)) => h.transient(policy, None),
             _ => {}
         }
     }

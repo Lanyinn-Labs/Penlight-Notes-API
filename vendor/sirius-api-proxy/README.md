@@ -20,7 +20,7 @@ in [LICENSE](LICENSE); see [sources](docs/SOURCES.md). This is an unofficial pro
   searchable JSONB, publication history and scoped snapshot retention.
 - Version-pinned resource snapshots for Sirius Asset Updater, with CDN allowlists and secret references.
 
-The full proxy baseline is JP iOS 1.0.3; Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version **1.2.1** is
+The full proxy baseline is JP 1.0.4 (an additive update of iOS 1.0.3, extracted from the Android client); Global Android 1.0.1 has its own bundle of the same operations plus SDK guest login. The application release version (**1.3.3**) is
 independent of the game's client version, protocol label and resource version.
 Only explicitly supported RPCs for the selected region are exposed; arbitrary RPC forwarding is unavailable.
 
@@ -33,11 +33,13 @@ Configure `region: jp`, `hk`, `en` or `kr`; `cn` is reserved and currently rejec
 network activity. Use one instance per region. JP retains its existing functionality; Global
 supports verified server discovery/version queries, player operations with SDK guest accounts, the Master data pipeline (download,
 registry, sync, Git and database publication) and schema-3 resource snapshots for the asset
-updater (`resource_snapshot`). A production end-to-end Global asset acceptance run is still
-pending. Global player operations use SDK guest accounts that log in lazily with `PlayerLogin`
-([Global accounts](docs/ACCOUNTS.md#global-accounts)); login and player data are live-verified,
-the other Global reads are implemented but not yet exercised live. See [region support and upgrade
-instructions](docs/REGIONS.md) before deploying paired v1.2.1 services.
+updater (`resource_snapshot`), with a production end-to-end Global asset acceptance (1.2.1).
+Global player operations use SDK guest accounts that log in lazily with `PlayerLogin`
+([Global accounts](docs/ACCOUNTS.md#global-accounts)); login, player data, announcements, song
+ranking and profile lookup are live-verified, event ranking/deck and challenge ranking are
+implemented but not yet exercised live. The Global servers do not share players: query the region
+that owns a profile ID. See [region support and upgrade instructions](docs/REGIONS.md) before
+deploying with Sirius Asset Updater 1.2.1 or later.
 
 ## Quick start
 
@@ -72,9 +74,18 @@ Set `session_lock: false` to allow concurrent upstream RPCs for the same configu
 restart the proxy to apply the change. Upstream concurrency support is not confirmed, and
 server instability can also cause request failures. Keep the default unless testing or
 operating with that uncertainty. The default 20-second request deadline includes time waiting for
-serialization, bootstrap or protocol activation. Initial authenticated Version discovery
-remains single-flight, and protocol reload waits for all active logical calls in either mode.
+serialization, bootstrap or protocol activation. Version discovery and freshness refresh
+remain single-flight, and protocol reload waits for all active logical calls in either mode.
 With concurrency enabled, upstream observations reflect response completion order.
+Calls without an account are not serialized by `session_lock`: up to
+`upstream.anonymous_max_inflight` (default 4; 1 restores the 1.2.x behavior) run at once, and
+identical concurrent anonymous reads share one upstream RPC, errors included
+([shared in-flight reads](docs/REQUEST_POLICY.md#shared-in-flight-reads)).
+Response-cache hits are answered before any of this queueing and lease no account
+([hits before admission](docs/RESPONSE_CACHE.md#hits-before-admission)).
+A pooled game connection that stops answering is detected by HTTP/2 PING and fails its calls as
+`upstream_transport` well before the deadline
+([connection liveness](docs/REQUEST_POLICY.md#connection-liveness)).
 
 CDN secrets are optional for API-only use. Resource snapshots become ready only when the
 observed CDN and credential match configuration. Secret values are never included in responses.
@@ -87,7 +98,7 @@ a per-client `X-Sirius-Token` when [client authorization](docs/CLIENT_AUTH.md) i
 
 | Route | Token | Result |
 | --- | --- | --- |
-| `GET /health` | None | Process health and service version, not upstream availability |
+| `GET /health` | None | Process liveness, service version and `uptime_secs` (whole seconds since process start, monotonic; resets on restart), not upstream availability |
 | `GET /api/v1/system` | API | Region, supported RPCs, version and availability observation |
 | `GET /api/v1/regions` | API | Region capabilities, including reserved CN |
 | `GET /api/v1/servers` | API | Global server list; JP returns 501 |
@@ -98,8 +109,8 @@ a per-client `X-Sirius-Token` when [client authorization](docs/CLIENT_AUTH.md) i
 | `GET /api/v1/events/{event_id}/players/{player_id}/deck` | API | Event deck |
 | `GET /api/v1/songs/{song_id}/rankings` | API | Song ranking without the service account's myRank |
 | `GET /api/v1/challenge-songs/{challenge_song_id}/rankings` | API | Challenge ranking without myRank/myScore |
-| `GET /api/v1/master-data` | API | Local Master version and table index |
-| `GET /api/v1/master-data/tables/{name}` | API | Original table JSON with x-master-version |
+| `GET /api/v1/master-data` | API | Local Master version and table index; ETag, 304 on If-None-Match |
+| `GET /api/v1/master-data/tables/{name}` | API | Original table JSON with x-master-version and a content ETag; 304 on If-None-Match |
 | `GET /internal/v1/protocol` | Internal | Protocol fingerprint, codec and generation |
 | `POST /internal/v1/protocol/reload` | Internal | Validate and activate the configured proto bundle |
 | `GET /internal/v1/master-data/updater` | Internal | Last update status; does not trigger an update |
@@ -107,14 +118,40 @@ a per-client `X-Sirius-Token` when [client authorization](docs/CLIENT_AUTH.md) i
 | `GET /internal/v1/account/player-data` | Internal | Read the service account's private data |
 | `GET /internal/v1/resources/snapshot` | Internal | Last observed resource snapshot |
 
+Both current Master reads answer `Cache-Control: private, no-cache` and verify the snapshot
+before evaluating `If-None-Match`, so a corrupted table answers 503, never 304.
+
 HTTP `v1` is independent of game versions. Environment and upstream are deployment settings,
 not request parameters. Protobuf JSON int64/uint64 values are strings; original Master JSON
 may contain numeric integers that require a lossless parser.
 
 `/system` returns HTTP 200 with `status: unavailable` for valid upstream business errors;
-network/protocol failures return 502 and timeouts return 504. Other upstream errors map to
+network/protocol failures return 502 and timeouts return 504, and 503 `upstream_unavailable`
+while the [upstream path is open](docs/REQUEST_POLICY.md#upstream-path-health). Other upstream errors map to
 502/503. Invalid caller tokens return 401; an unconfigured game account returns 503.
 Raw credential fields and grpc-message values are not returned to callers.
+
+Errors are JSON `{"error": "<message>", "code": "<code>"}`; game failures add `grpc_status`.
+Match on `code`, which is stable; the message may be reworded. Framework rejections (malformed
+path/query/body, unknown route, wrong method, oversized or wrongly typed body) use the same shape
+without echoing the input.
+
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `maintenance` | 503 | The game answered `UNDER_MAINTENANCE`; not retried, no account penalty |
+| `upstream_grpc` | 502 (503 for gRPC 14) | Another game gRPC failure; see `grpc_status` |
+| `upstream_timeout` / `upstream_transport` / `upstream_proxy` / `upstream_protocol` | 504 / 502 | Upstream call failed |
+| `account_unavailable` | 503 | No game account is configured or healthy |
+| `upstream_unavailable` | 503 | The region's game path (or Global SDK path) is failing; refused before contacting it, retry shortly |
+| `node_unavailable`, `peer_account_unavailable`, `snapshot_unavailable`, `master_unavailable`, `auth_unavailable` | 503 | Dependency temporarily unavailable; Master table reads also answer `master_unavailable` after 5 s under load ([admission](docs/MASTER_REGISTRY.md#table-read-admission)), retry later |
+| `not_found` | 404 | Unknown route, Master item or looked-up player |
+| `invalid_request` | 400 (422 for a well-formed JSON body of the wrong shape) | Rejected input |
+| `method_not_allowed`, `payload_too_large`, `unsupported_media_type` | 405, 413, 415 | Framework rejections |
+| `unauthorized`, `forbidden` | 401, 403 | Caller authentication/authorization |
+| `unsupported_operation` | 501 | Not supported for this region's protocol |
+| `peer_identity_mismatch` | 409 | Peer protocol identity changed |
+| `protocol_definition_invalid` | 422 | Proto bundle reload failed |
+| `invalid_configuration` | 502 | Server-side configuration error |
 
 ## Master data and protocol updates
 
@@ -135,6 +172,8 @@ Configure `master_directory` to serve snapshots. Remote updates verify manifest 
 decrypt and parse every table, recheck the version and atomically switch CURRENT.
 Failed updates preserve the old snapshot; a writer lock prevents concurrent publication.
 Optional background updates run at the configured interval without overlapping.
+Snapshots are kept indefinitely by default; optional `master_retention` keeps only the newest
+installations along the committed chain ([snapshot retention](docs/MASTER_REGISTRY.md#snapshot-retention)).
 See [Master CDN proxy, retry and deadline configuration](docs/MASTER_NETWORK.md).
 
 Protocol reload rejects incompatible changes with HTTP 422 and keeps the previous schema.
@@ -143,9 +182,11 @@ See [protocol updates](docs/PROTO_RELOAD.md) and [deployment checks](docs/DEPLOY
 
 ## Deployment and scope
 
-The Docker image contains the executable and protocol bundle. Mount configuration, supply
+The Docker image contains the executable, protocol bundle and the `git` executable used by `master_git`. Mount configuration, supply
 secrets and set `listen: 0.0.0.0:9999` inside the container. Persist `/app/master-data` if enabled.
 Restrict internal routes at the reverse proxy as well as through their separate token.
+Image builds read only the Cargo files, `build.rs`, `src`, `protocol` and `LICENSE*`; local
+configuration never enters the build context.
 
 The current JP baseline has been exercised for identity, account data, public profiles,
 announcements, song rankings, 235 Master tables and native/dynamic protocol switching.
@@ -164,13 +205,18 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 ```
 
-Tests use local fixtures and do not require the game servers. Release archives include the
-runtime protocol bundle, examples, documentation and licenses. See [release preparation](docs/RELEASING.md).
+Tests use local fixtures and do not require the game servers. The optional per-stage latency
+measurement is the ignored `perf_stages` test; see
+[measuring codec cost](docs/PROTO_RELOAD.md#measuring-codec-cost) for its release-build command.
+Release archives include the runtime protocol bundle, examples, documentation and licenses. See [release preparation](docs/RELEASING.md).
 Repository visibility and workflow activation are separate from preparing a release.
 
 For optional HTTPS listening, see [listener TLS](docs/LISTENER_TLS.md).
 
 Configure optional [access logs and trusted proxies](docs/ACCESS_LOG.md) at the service root.
+
+Negotiated gzip/zstd for public JSON responses is opt-in at the service root; see
+[response compression](docs/HTTP_COMPRESSION.md).
 
 See [application logging](docs/APPLICATION_LOG.md) for process logs, separate from HTTP access logs.
 

@@ -49,9 +49,14 @@ cargo run --locked
 | `PENLIGHT_JP_ONLINE` | 按需自动开启 | 有账号路径或 Master 模式为 download/sync 时开启，可显式覆盖 |
 | `PENLIGHT_JP_CLIENT_VERSION` | 客户端 JSON | 在线请求客户端版本；通常不需要覆盖 |
 | `PENLIGHT_JP_ENDPOINT` | `https://api.bang-dream-on.jp` | HTTPS 游戏服务 origin |
-| `PENLIGHT_JP_PROTOCOL_DIR` | `vendor/sirius-api-proxy/protocol/sirius/1.0.3` | 随附 Protobuf 目录 |
+| `PENLIGHT_JP_PROTOCOL_DIR` | `vendor/sirius-api-proxy/protocol/sirius/1.0.4` | 随附 Protobuf 目录 |
 | `PENLIGHT_JP_SESSION_LOCK` | `true` | 序列化同一账号的会话 |
 | `PENLIGHT_JP_TIMEOUT_MS` | `20000` | 上游请求超时 |
+| `PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT` | 上游默认最多 4 | 无账号请求并发，设为 1 恢复串行 |
+| `PENLIGHT_JP_COALESCE_PUBLIC_READS` | `true` | 合并相同的并发公开排名请求 |
+| `PENLIGHT_JP_VERSION_MAX_AGE_SECONDS` | `600` | Master 版本请求头最大年龄，60–86400 秒 |
+| `PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS` | 上游按请求超时计算 | HTTP/2 PING 间隔；0 关闭 |
+| `PENLIGHT_JP_HTTP2_KEEPALIVE_TIMEOUT_MS` | 上游按请求超时计算 | PING 确认超时；与间隔之和须小于请求超时 |
 | `PENLIGHT_JP_MAX_INFLIGHT` | `64` | 上游并发上限 |
 | `PENLIGHT_JP_ACCOUNT_FAILURE_THRESHOLD` | `2` | 账号连续失败阈值 |
 | `PENLIGHT_JP_ACCOUNT_COOLDOWN_SECONDS` | `30` | 失败账号冷却时间 |

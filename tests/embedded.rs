@@ -21,8 +21,8 @@ fn settings() -> sirius_api_proxy::config::Config {
     // Build the same environment-backed JP settings without mutating process environment.
     let mut protocol: sirius_api_proxy::config::Config = serde_json::from_value(json!({
         "region":"jp", "platform":"Android", "environment":"release",
-        "endpoint":"https://api.bang-dream-on.jp", "client_version":"1.0.3",
-        "protocol_directory":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/sirius-api-proxy/protocol/sirius/1.0.3"),
+        "endpoint":"https://api.bang-dream-on.jp", "client_version":"1.0.4",
+        "protocol_directory":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/sirius-api-proxy/protocol/sirius/1.0.4"),
         "api_token_env":"unused", "internal_token_env":"unused", "accounts":[],
         "default_cdn_root":"https://static.bang-dream-on.jp",
         "cdn_credential_env":{"https://static.bang-dream-on.jp":"PENLIGHT_CDN_PASSWORD"}
@@ -62,6 +62,27 @@ async fn embedded_protocol_initializes_without_a_proxy_listener() {
     let status = serde_json::to_value(client.core.protocol_status().unwrap()).unwrap();
     assert_eq!(status["family"], "jp");
     assert_eq!(status["codec"], "native");
+    assert_eq!(status["version"], "1.0.4");
+    let bundle =
+        sirius_api_proxy::protocol::ProtocolBundle::load(&settings().protocol_directory).unwrap();
+    let player = bundle
+        .pool
+        .get_message_by_name("entity.PlayerData")
+        .unwrap();
+    assert_eq!(
+        player.get_field(61).unwrap().json_name(),
+        "characterCurrentCostumes"
+    );
+    assert_eq!(
+        player.get_field(62).unwrap().json_name(),
+        "characterUnlockedCostumes"
+    );
+    assert!(bundle
+        .pool
+        .get_message_by_name("entity.Announcement")
+        .unwrap()
+        .get_field_by_name("platform")
+        .is_some());
     assert!(!client.ready().await);
     assert_eq!(
         client
@@ -252,6 +273,14 @@ fn upstream_errors_preserve_business_status_without_private_diagnostics() {
     ));
     assert!(matches!(map_error(Upstream::Grpc(5)), AppError::NotFound));
     assert!(matches!(
+        map_error(Upstream::Maintenance(14)),
+        AppError::UpstreamMaintenance
+    ));
+    assert!(matches!(
+        map_error(Upstream::UpstreamUnavailable),
+        AppError::UpstreamUnavailable
+    ));
+    assert!(matches!(
         map_error(Upstream::Timeout),
         AppError::UpstreamTimeout
     ));
@@ -261,7 +290,7 @@ fn upstream_errors_preserve_business_status_without_private_diagnostics() {
     ));
     assert_eq!(
         map_error(Upstream::Config("a private diagnostic")).to_string(),
-        "game service returned an invalid ranking response"
+        "game service returned an invalid response"
     );
 }
 

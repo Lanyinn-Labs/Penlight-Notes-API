@@ -43,13 +43,34 @@ region. A region's dedicated peer credential may be shared among its cooperating
 All target attempts and admission share one absolute deadline. Request/connect/body bounds still
 apply to each HTTP peer attempt. Anonymous reads can continue after target transport/protocol
 failures while budget remains. Authenticated queries continue only when the attempt is known not
-to have executed: connection failure, contract/capability rejection, or an explicit account
-admission rejection before game dispatch. Ambiguous timeout/transport/protocol failures return
-immediately for authenticated reads. No concurrent hedging or same-target retry is performed by
+to have executed: connection failure, contract/capability rejection, an explicit account
+admission rejection before game dispatch, which also covers an executor whose
+[upstream path is open](REQUEST_POLICY.md#upstream-path-health) (no wire change), or, since
+1.3.0, an HTTP 400, 401, 404, 405, 413, 415 or 422 answer from the peer route, which a Sirius
+executor (1.2.0 onward) sends only before dispatch
+([pre-dispatch statuses](PEER_QUERIES.md#pre-dispatch-http-statuses)). A wrong peer token, a
+peer route or region the node does not serve (including a 1.1.x node or a `regional_paths`
+mismatch), and an operation an older executor does not know during a rolling upgrade are
+therefore served by the next node. These answers still count as target failures and cool the
+node down; their body is never read, and `upstream_transport` is returned if no node completes.
+Ambiguous timeout/transport/protocol failures and every other peer HTTP status (3xx, 403, 408,
+409, 429 and 5xx included) return immediately for authenticated reads. This assumes that an
+HTTP intermediary between nodes answers those seven statuses only while receiving a request,
+never after forwarding it; nginx, Caddy, Cloudflare and Envoy report upstream-phase failures as
+502/503/504. No concurrent hedging or same-target retry is performed by
 the router. The executing node retains its existing local anonymous retry policy.
+Before any target is chosen, identical concurrent public reads (same identity, protocol
+generation and operation; rankings only with `upstream.coalesce_public_reads`) share one routed
+execution: one router admission and at most one peer POST per target, whose outcome, error or
+observation answers every joined request (see
+[shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)). This is not hedging: no
+extra request is sent.
 
-Game gRPC outcomes, including maintenance/unavailable results, are terminal rather than presumed
-target failures. Target failures increment a passive counter; after the threshold they enter
+Game gRPC outcomes, including maintenance/unavailable results, and `not_found` (a
+looked-up player that does not exist) are terminal rather than presumed target failures. A peer
+reports maintenance as its gRPC status plus `observation.maintenance` (describing that call); the
+caller answers 503 `maintenance` (a 1.2.3 caller answers 502), so the wire format is unchanged.
+Target failures increment a passive counter; after the threshold they enter
 cooldown. An expired cooldown admits one probe while other calls use remaining targets. Successful
 execution or a valid game outcome resets the counter. Cancelling a probe releases its slot.
 Health is in-memory and resets on process restart. If every target is cooling down, the request
@@ -59,6 +80,16 @@ returns unavailable. Bounds: 100..300000 ms total timeout/cooldown, 1..4096 infl
 `GET /internal/v1/nodes` (or `/internal/v1/{region}/nodes`) requires the administrative token and
 shows ordered names, priorities, failure counts, probe status and remaining cooldown. Origins,
 credential references and values are not returned. The public bearer cannot access this status.
+
+Health changes are logged once per transition, with the configured node name and the stable
+error `code` of the failure (never an origin or credential): `node_router_ready` (info, at
+startup), `node_cooldown_started` and `node_probe_failed` (warn, with `cooldown_ms`),
+`node_recovered` (info) and `node_unavailable` (warn, for each call that no node completed,
+including every call while all nodes cool down). Every target
+failure is also logged at debug as `node_target_failed` with `failover` (whether another node is
+tried). Since 1.3.0 `node_target_failed`, `node_cooldown_started` and `node_probe_failed` also
+carry the peer's HTTP `status` when it answered a non-200 one (a number, never its body), so a
+401 or 404 misconfiguration is visible without debug logging.
 
 ## Scope
 
@@ -71,7 +102,9 @@ background workers. Master table HTTP reads remain local snapshot reads.
 
 `/system` returns the selected executor's observation. Remote observations never update the local
 resource snapshot, account pool or CDN credentials. Each executor owns its local response cache;
-there is no new shared cross-node cache. Ranking account-relative fields remain stripped at the
+there is no new shared cross-node cache. The router's own admission (`max_inflight`) still applies
+to every routed query; a response-cache hit skips only the executor GameClient's admission
+([hits before admission](RESPONSE_CACHE.md#hits-before-admission)). Ranking account-relative fields remain stripped at the
 public boundary. Schema reload changes the identity used for subsequent peer requests; an old
 identity queued at the executor is rejected before dispatch.
 

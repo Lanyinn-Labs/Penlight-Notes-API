@@ -1,11 +1,14 @@
 //! Validated Master files and immutable JSON snapshots. No database models.
 use crate::{region::Region, rijndael::Rijndael256};
 use flate2::read::GzDecoder;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{Deserializer, MapAccess, SeqAccess, Visitor},
+    Deserialize, Serialize,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    fs,
+    fmt, fs,
     io::{Read, Write},
     path::Path,
 };
@@ -54,6 +57,9 @@ impl WriterLock {
 
 pub struct MasterDocument {
     pub version: String,
+    /// Lowercase hex SHA-256 of `bytes`, computed from the same pinned snapshot after
+    /// integrity checks.
+    pub sha256: String,
     pub bytes: Vec<u8>,
 }
 
@@ -75,6 +81,29 @@ fn read_current_checked(
     table: Option<&str>,
     expected: Option<Region>,
 ) -> Result<MasterDocument, MasterError> {
+    read_current_inner(directory, table, expected).map(|(document, _)| document)
+}
+/// For unchanged polls only: the installed `table` of `region` is `version` and intact. An
+/// indexed table whose length and SHA-256 match was validated as JSON before its index was
+/// written, so only legacy unindexed tables are parsed again.
+pub(crate) fn current_table_intact(
+    directory: &Path,
+    table: &str,
+    region: Region,
+    version: &str,
+) -> bool {
+    matches!(
+        read_current_inner(directory, Some(table), Some(region)),
+        Ok((document, indexed))
+            if document.version == version && (indexed || validate_json(&document.bytes).is_ok())
+    )
+}
+/// Also reports whether a table read was checked against the snapshot index.
+fn read_current_inner(
+    directory: &Path,
+    table: Option<&str>,
+    expected: Option<Region>,
+) -> Result<(MasterDocument, bool), MasterError> {
     let pointer = read_bounded(&directory.join("CURRENT"), 128)?;
     let snapshot = std::str::from_utf8(&pointer).map_err(|_| MasterError::Format)?;
     if !snapshot.starts_with("master-") || !safe_component(snapshot) {
@@ -92,7 +121,7 @@ fn read_current_checked(
     if expected.is_some_and(|expected| expected != region) {
         return Err(MasterError::Format);
     }
-    let bytes = if let Some(table) = table {
+    let (sha256, bytes, indexed) = if let Some(table) = table {
         if !safe_component(table)
             || !manifest
                 .files
@@ -102,8 +131,15 @@ fn read_current_checked(
             return Err(MasterError::NotFound);
         }
         let bytes = read_bounded(&directory.join(format!("{table}.json")), MAX_JSON)?;
-        crate::master_registry::verify_indexed(&directory, &manifest, table, &bytes)?;
-        bytes
+        let sha256 = crate::master_registry::digest(&bytes);
+        let indexed = crate::master_registry::verify_indexed_digest(
+            &directory,
+            &manifest,
+            table,
+            bytes.len() as u64,
+            &sha256,
+        )?;
+        (sha256, bytes, indexed)
     } else {
         let source = receipt
             .get("source")
@@ -121,12 +157,17 @@ fn read_current_checked(
         if let Some(resource) = recorded_resource_version(&receipt)? {
             status["resource_version"] = resource.into();
         }
-        serde_json::to_vec(&status).map_err(|_| MasterError::Format)?
+        let bytes = serde_json::to_vec(&status).map_err(|_| MasterError::Format)?;
+        (crate::master_registry::digest(&bytes), bytes, false)
     };
-    Ok(MasterDocument {
-        version: manifest.version,
-        bytes,
-    })
+    Ok((
+        MasterDocument {
+            version: manifest.version,
+            sha256,
+            bytes,
+        },
+        indexed,
+    ))
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -261,6 +302,55 @@ impl Manifest {
         Ok(manifest)
     }
 }
+/// Walks one JSON value through `deserialize_any` and keeps nothing. Unlike `IgnoredAny`,
+/// which skips strings and numbers by scanning them, it runs the same checks as parsing into
+/// `Value`: the recursion limit, UTF-8 and escapes in strings and keys, and number range.
+/// Duplicate keys stay accepted, as with `Value`.
+struct JsonShape;
+impl<'de> Deserialize<'de> for JsonShape {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(JsonShape)
+    }
+}
+impl<'de> Visitor<'de> for JsonShape {
+    type Value = JsonShape;
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_unit<E>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self, A::Error> {
+        while seq.next_element::<JsonShape>()?.is_some() {}
+        Ok(self)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        while map.next_key::<JsonShape>()?.is_some() {
+            map.next_value::<JsonShape>()?;
+        }
+        Ok(self)
+    }
+}
+/// Accepts and rejects exactly what `serde_json::from_slice::<Value>` does (trailing bytes
+/// included) without building the document. Callers map the error; it is never logged.
+pub(crate) fn validate_json(bytes: &[u8]) -> Result<(), serde_json::Error> {
+    serde_json::from_slice::<JsonShape>(bytes).map(|_| ())
+}
 pub struct MasterDecoder {
     cipher: Rijndael256,
     iv: [u8; 32],
@@ -293,7 +383,7 @@ impl MasterDecoder {
             return Err(MasterError::Limit);
         }
         // Validate without rewriting numbers or the original table schema.
-        serde_json::from_slice::<serde_json::Value>(&json).map_err(|_| MasterError::Format)?;
+        validate_json(&json).map_err(|_| MasterError::Format)?;
         Ok(json)
     }
 }
@@ -316,7 +406,7 @@ pub(crate) fn sync_existing_file(path: &Path) -> std::io::Result<()> {
 // Unix supports fsync on directory handles. Windows File::open cannot open a
 // directory as a normal file. Every data file and CURRENT is still synced
 // through its writable handle before atomic publication on all platforms.
-fn sync_directory(path: &Path) -> Result<(), MasterError> {
+pub(crate) fn sync_directory(path: &Path) -> Result<(), MasterError> {
     #[cfg(unix)]
     fs::File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
@@ -491,7 +581,7 @@ pub(crate) fn prepare_registry(
         {
             return Err(MasterError::Integrity);
         }
-        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| MasterError::Format)?;
+        validate_json(&bytes).map_err(|_| MasterError::Format)?;
         sync_existing_file(&path)?;
         total += entry.size;
     }

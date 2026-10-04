@@ -264,6 +264,23 @@ fn jp_protocol<F: Fn(&str) -> Option<String>>(
     let mut upstream = sirius_api_proxy::config::UpstreamConfig::default();
     upstream.timeout_ms = values.parse("PENLIGHT_JP_TIMEOUT_MS", upstream.timeout_ms)?;
     upstream.max_inflight = values.parse("PENLIGHT_JP_MAX_INFLIGHT", upstream.max_inflight)?;
+    upstream.anonymous_max_inflight = values
+        .optional("PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT")
+        .map(|_| values.parse("PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT", 4))
+        .transpose()?;
+    upstream.coalesce_public_reads = values.parse("PENLIGHT_JP_COALESCE_PUBLIC_READS", true)?;
+    upstream.version_max_age_seconds = values.parse(
+        "PENLIGHT_JP_VERSION_MAX_AGE_SECONDS",
+        upstream.version_max_age_seconds,
+    )?;
+    upstream.http2_keepalive_interval_ms = values
+        .optional("PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS")
+        .map(|_| values.parse("PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS", 10000))
+        .transpose()?;
+    upstream.http2_keepalive_timeout_ms = values
+        .optional("PENLIGHT_JP_HTTP2_KEEPALIVE_TIMEOUT_MS")
+        .map(|_| values.parse("PENLIGHT_JP_HTTP2_KEEPALIVE_TIMEOUT_MS", 5000))
+        .transpose()?;
     upstream.proxy_url_env = values
         .optional("PENLIGHT_JP_PROXY_URL")
         .map(|_| "PENLIGHT_JP_PROXY_URL".into());
@@ -382,6 +399,8 @@ fn jp_protocol<F: Fn(&str) -> Option<String>>(
         internal_token_env: "PENLIGHT_UNUSED_INTERNAL_TOKEN".into(),
         listen: None,
         tls: None,
+        http_compression: None,
+        master_retention: None,
         access_log: None,
         logging: None,
         client_auth: None,
@@ -519,6 +538,30 @@ mod tests {
         let protocol = config.regions[1].sirius.as_ref().unwrap();
         assert!(protocol.accounts.is_empty());
         assert_eq!(protocol.client_version, "1.0.3");
+    }
+
+    #[test]
+    fn upstream_133_controls_validate_before_startup() {
+        let config = load(&[("PENLIGHT_JP_ONLINE", "true")]).unwrap();
+        let upstream = &config.regions[1].sirius.as_ref().unwrap().upstream;
+        assert!(upstream.coalesce_public_reads);
+        assert_eq!(upstream.version_max_age_seconds, 600);
+        for (name, value) in [
+            ("PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT", "0"),
+            ("PENLIGHT_JP_VERSION_MAX_AGE_SECONDS", "59"),
+            ("PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS", "19000"),
+            ("PENLIGHT_JP_HTTP2_KEEPALIVE_TIMEOUT_MS", "20000"),
+        ] {
+            assert!(
+                load(&[("PENLIGHT_JP_ONLINE", "true"), (name, value)]).is_err(),
+                "{name}"
+            );
+        }
+        assert!(load(&[
+            ("PENLIGHT_JP_ONLINE", "true"),
+            ("PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS", "0")
+        ])
+        .is_ok());
     }
 
     #[test]

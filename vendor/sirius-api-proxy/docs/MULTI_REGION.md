@@ -6,7 +6,8 @@ remove regions you do not operate. Global CDN roots are the first line of each r
 verified server list; supply the corresponding environment secrets.
 
 The top-level `listen` binds one HTTP listener, or HTTPS when [top-level TLS](LISTENER_TLS.md) is configured. `regions` maps region names to the
-same client settings used by a single-region file, excluding `listen`, `tls` and `access_log`. Each map
+same client settings used by a single-region file, excluding `listen`, `tls`, `access_log` and
+[`http_compression`](HTTP_COMPRESSION.md), which are set once at the root. Each map
 key must match its client's region. A deprecated `tw` key is read as `hk`
 ([the `hk` identifier](REGIONS.md#the-hk-identifier)); a map with both is rejected. Empty maps, unknown settings, nested listeners,
 CN and mismatched known service roots fail at startup before binding the listener.
@@ -23,7 +24,8 @@ Paths remain relative to the process working directory, as in single-region mode
 All existing resource suffixes are available under each region's prefix. Operations a
 region does not support (for example `servers` on JP) return 501 without an upstream call. There is no implicit default
 region route in this mode: `/api/v1/system` and unconfigured regions return 404.
-Health is unauthenticated process liveness, not proof that every game server is ready.
+Health is unauthenticated process liveness, not proof that every game server is ready. Its
+`uptime_secs` counts whole seconds since the process started, shared by all regions.
 
 Each region owns its client, protocol generation, observations, snapshot, game account
 and session lock. Protocol reload affects only the selected region. Master workers

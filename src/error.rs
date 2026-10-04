@@ -28,9 +28,11 @@ pub enum AppError {
     UpstreamAuthenticationUnavailable,
     #[error("game service is rate limiting requests")]
     UpstreamRateLimited,
+    #[error("game service is under maintenance")]
+    UpstreamMaintenance,
     #[error("game service is unavailable")]
     UpstreamUnavailable,
-    #[error("game service returned an invalid ranking response")]
+    #[error("game service returned an invalid response")]
     UpstreamInvalidResponse,
     #[error("decrypted Master snapshot is not configured or is unavailable")]
     MasterDataUnavailable,
@@ -64,6 +66,7 @@ impl IntoResponse for AppError {
                 "upstream_authentication_unavailable",
             ),
             Self::UpstreamRateLimited => (StatusCode::SERVICE_UNAVAILABLE, "upstream_rate_limited"),
+            Self::UpstreamMaintenance => (StatusCode::SERVICE_UNAVAILABLE, "upstream_maintenance"),
             Self::UpstreamUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable"),
             Self::UpstreamInvalidResponse => (StatusCode::BAD_GATEWAY, "upstream_invalid_response"),
             Self::MasterDataUnavailable => {

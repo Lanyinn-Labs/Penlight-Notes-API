@@ -20,6 +20,8 @@ pub struct MultiConfig {
     pub tls: Option<crate::server::TlsConfig>,
     #[serde(default)]
     pub access_log: Option<crate::access_log::Config>,
+    #[serde(default)]
+    pub http_compression: Option<crate::http_compression::Config>,
     #[serde(deserialize_with = "region_map")]
     pub regions: BTreeMap<String, Config>,
 }
@@ -125,9 +127,10 @@ impl DeploymentConfig {
                         || c.tls.is_some()
                         || c.access_log.is_some()
                         || c.logging.is_some()
+                        || c.http_compression.is_some()
                     {
                         return Err(AppError::Config(
-                            "listen, tls, logging and access_log belong at the deployment root, not inside regions",
+                            "listen, tls, logging, access_log and http_compression belong at the deployment root, not inside regions",
                         ));
                     }
                     c.validate()?;
@@ -147,6 +150,19 @@ impl DeploymentConfig {
                     return Err(AppError::Config(
                         "Master directories, Git state directories and Git remotes must be distinct per region",
                     ));
+                }
+                // The regions share one SDK session per identity, so one state directory.
+                let mut sdk_state = m
+                    .regions
+                    .values()
+                    .filter_map(|c| c.global_login.as_ref())
+                    .map(|l| &l.state_directory);
+                if let Some(first) = sdk_state.next() {
+                    if sdk_state.any(|d| d != first) {
+                        return Err(AppError::Config(
+                            "global_login.state_directory must be the same in every region",
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -319,13 +335,26 @@ impl DeploymentConfig {
         let mut git_publishers = Vec::new();
         let mut notifiers = Vec::new();
         let mut router = api::health_router();
+        // Deployment-wide, like access_log; only the public API routers are wrapped.
+        let compression = match self {
+            Self::Single(c) => c.http_compression.clone(),
+            Self::Multi(m) => m.http_compression.clone(),
+        };
         let mut updaters = Vec::new();
         let mut syncers = Vec::new();
         let mut asset_dispatchers = Vec::new();
+        // One SDK session per Global identity for the whole deployment (validated: every
+        // region names the same state directory).
+        let sdk_sessions = crate::sdk_session::SdkSessions::open(
+            configs
+                .iter()
+                .find_map(|c| c.global_login.as_ref())
+                .and_then(|l| l.state_directory.as_deref()),
+        )?;
         for ((c, (public, internal)), peer_token) in
             configs.into_iter().zip(tokens).zip(peer_tokens)
         {
-            let client = GameClient::new(c.clone())?;
+            let client = GameClient::with_sdk_sessions(c.clone(), sdk_sessions.clone())?;
             let dispatcher = if c.asset_dispatch.is_some() {
                 Some(crate::asset_dispatch::Worker::new(c, client.clone())?)
             } else {
@@ -378,6 +407,7 @@ impl DeploymentConfig {
                 internal,
                 &api_prefix,
                 &internal_prefix,
+                compression.as_ref(),
             ));
         }
         let access = match self {

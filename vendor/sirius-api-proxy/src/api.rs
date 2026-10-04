@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 pub(crate) async fn authorize(
     State(token): State<Arc<str>>,
@@ -61,11 +61,40 @@ pub fn router(client: Arc<GameClient>, api_token: String, internal_token: String
         internal_token,
         "/api/v1",
         "/internal/v1",
+        None,
     ))
 }
 
+static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+fn started() -> Instant {
+    *STARTED.get_or_init(Instant::now)
+}
+/// Records the process start reported as `/health` `uptime_secs`; `main()` calls this first.
+/// Later calls keep the first instant. Without `main()` (library or test use) the clock starts
+/// at the first `health_router()` build or `health_body()` call.
+pub fn mark_started() {
+    started();
+}
+#[cfg(test)]
+pub(crate) fn started_at() -> Instant {
+    started()
+}
+/// Whole seconds from `start` to `now`, truncated; 0 if `now` is earlier.
+pub(crate) fn uptime_secs_between(start: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(start).as_secs()
+}
+/// The `/health` body shared by the API, multi-region and registry servers: liveness only.
+pub(crate) fn health_body(service: &'static str) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "service": service,
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime_secs_between(started(), Instant::now()),
+    }))
+}
 pub fn health_router() -> Router {
-    Router::new().route("/health",get(||async {Json(json!({"status":"ok","service":"sirius-api-proxy","version":env!("CARGO_PKG_VERSION")}))}))
+    started();
+    Router::new().route("/health", get(|| async { health_body("sirius-api-proxy") }))
 }
 
 pub fn router_at(
@@ -74,6 +103,7 @@ pub fn router_at(
     internal_token: String,
     api_prefix: &str,
     internal_prefix: &str,
+    compression: Option<&crate::http_compression::Config>,
 ) -> Router {
     let api = Router::new()
         .route("/system", get(system))
@@ -127,6 +157,8 @@ pub fn router_at(
             (Arc::<str>::from(api_token), client.clone()),
             authorize_api,
         ));
+    // Public reads only; internal account, identity and player-data output stays identity.
+    let api = crate::http_compression::wrap(api, compression);
     let internal = Router::new()
         .route("/nodes", get(nodes))
         .route("/protocol", get(protocol_status))
@@ -180,13 +212,26 @@ async fn protocol_reload(
     c.reload_protocol().await.map(Json)
 }
 
-async fn master_document(c: Arc<GameClient>, table: Option<String>) -> Result<Response, AppError> {
+/// CURRENT-relative reads revalidate with a content ETag. Integrity, region and table
+/// checks all run before the conditional match, so corruption answers 503, never 304.
+/// Table reads (not the status document) pass the table read admission first.
+async fn master_document(
+    c: Arc<GameClient>,
+    table: Option<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
     let directory = c
         .master_directory()
         .ok_or(AppError::MasterUnavailable)?
         .to_path_buf();
     let region = c.region();
+    let admission = match table {
+        Some(_) => Some(c.table_reads().admit().await?),
+        None => None,
+    };
+    let held = admission.clone();
     let document = tokio::task::spawn_blocking(move || {
+        let _held = held;
         crate::master::read_current_in(&directory, table.as_deref(), region)
     })
     .await
@@ -195,20 +240,29 @@ async fn master_document(c: Arc<GameClient>, table: Option<String>) -> Result<Re
         crate::master::MasterError::NotFound => AppError::NotFound,
         _ => AppError::MasterUnavailable,
     })?;
-    Response::builder()
-        .header("content-type", "application/json")
-        .header("x-master-version", document.version)
-        .body(axum::body::Body::from(document.bytes))
-        .map_err(|_| AppError::MasterUnavailable)
+    registry_document(
+        crate::master_registry::Document {
+            etag: format!("\"{}\"", document.sha256),
+            version: document.version,
+            bytes: document.bytes,
+        },
+        headers,
+        false,
+    )
+    .map(|response| crate::master_admission::attach(admission, response))
 }
-async fn master_status(State(c): State<Arc<GameClient>>) -> Result<Response, AppError> {
-    master_document(c, None).await
+async fn master_status(
+    State(c): State<Arc<GameClient>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    master_document(c, None, headers).await
 }
 async fn master_table(
     State(c): State<Arc<GameClient>>,
     Path(table): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
-    master_document(c, Some(table)).await
+    master_document(c, Some(table), headers).await
 }
 /// Per-operation status: `live_verified` was exercised against the production service;
 /// `implemented_unverified` uses the verified protocol but was not exercised live.
@@ -230,7 +284,18 @@ fn operations(region: crate::region::Region) -> Value {
         Region::Cn => "reserved",
         Region::Jp if operation == "account_login" => "static_credentials",
         Region::Jp => "live_verified",
-        _ if matches!(operation, "version" | "account_login" | "player_data") => "live_verified",
+        _ if matches!(
+            operation,
+            "version"
+                | "account_login"
+                | "player_data"
+                | "announcements"
+                | "profile"
+                | "music_ranking"
+        ) =>
+        {
+            "live_verified"
+        }
         _ => "implemented_unverified",
     };
     let mut map = serde_json::Map::new();
@@ -266,7 +331,7 @@ async fn system(State(c): State<Arc<GameClient>>) -> Result<Json<Value>, AppErro
         Ok(_) => Ok(Json(
             json!({"status":"available","region":c.region(),"area_id":c.region().area_id(),"platform":c.platform(),"protocol_family":c.region().family(),"supported_rpcs":c.supported_routes(),"observation":execution.observation}),
         )),
-        Err(AppError::Grpc(_)) => Ok(Json(
+        Err(AppError::Grpc(_) | AppError::Maintenance(_)) => Ok(Json(
             json!({"status":"unavailable","region":c.region(),"platform":c.platform(),"observation":execution.observation}),
         )),
         Err(e) => Err(e),
@@ -460,17 +525,25 @@ async fn registry_response(
         platform: c.platform(),
     };
     let pinned = table.is_some();
-    let document = tokio::task::spawn_blocking(move || match table {
-        Some((table, hash)) => crate::master_registry::table(
-            &root,
-            scope.region,
-            snapshot
-                .as_deref()
-                .ok_or(crate::master::MasterError::Format)?,
-            &table,
-            &hash,
-        ),
-        None => crate::master_registry::manifest(&root, snapshot.as_deref(), scope),
+    let admission = match table {
+        Some(_) => Some(c.table_reads().admit().await?),
+        None => None,
+    };
+    let held = admission.clone();
+    let document = tokio::task::spawn_blocking(move || {
+        let _held = held;
+        match table {
+            Some((table, hash)) => crate::master_registry::table(
+                &root,
+                scope.region,
+                snapshot
+                    .as_deref()
+                    .ok_or(crate::master::MasterError::Format)?,
+                &table,
+                &hash,
+            ),
+            None => crate::master_registry::manifest(&root, snapshot.as_deref(), scope),
+        }
     })
     .await
     .map_err(|_| AppError::MasterUnavailable)?
@@ -479,6 +552,7 @@ async fn registry_response(
         _ => AppError::MasterUnavailable,
     })?;
     registry_document(document, headers, pinned)
+        .map(|response| crate::master_admission::attach(admission, response))
 }
 pub(crate) fn registry_document(
     document: crate::master_registry::Document,
@@ -652,6 +726,11 @@ async fn database_response(
     let reader = c
         .master_database_reader()
         .ok_or(AppError::MasterUnavailable)?;
+    // The admission wait precedes the read deadline: worst case is both budgets in turn.
+    let admission = match table {
+        Some(_) => Some(c.table_reads().admit().await?),
+        None => None,
+    };
     let doc = reader
         .document(&database_scope(&c), hash.as_deref(), table.as_deref())
         .await
@@ -659,6 +738,7 @@ async fn database_response(
     // Manifests contain the first local snapshot UUID for retained content. Retention
     // may permit later re-publication with another UUID, so only exact tables are immutable.
     registry_document(doc, headers, table.is_some())
+        .map(|response| crate::master_admission::attach(admission, response))
 }
 async fn database_current(
     State(c): State<Arc<GameClient>>,

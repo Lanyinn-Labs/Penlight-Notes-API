@@ -39,7 +39,12 @@ on a UTF-8 boundary. Only application targets are enabled, even at debug/trace; 
 HTTP/TLS/debug payload logging is disabled. `RUST_LOG` is not an alternate configuration path.
 
 Allowed fields are message/event/stage/region/job_id/status/error_code, progress counters
-(completed/failed/total/bytes/cache_hits), listen/operation/attempt. Headers, bodies, URLs,
+(completed/failed/total/bytes/cache_hits), listen/operation/attempt, the asset dispatch
+profile/target (a destination digest prefix) and the node routing node/cooldown_ms/failover
+(a configured node name, never its origin); node routing failures may also carry the peer's
+HTTP `status` as a number. Upstream path health events
+(`upstream_path_*`, `sdk_path_*`, see [REQUEST_POLICY.md](REQUEST_POLICY.md#upstream-path-health))
+use only event/region/error_code/cooldown_ms and never name an account. Headers, bodies, URLs,
 credentials, raw decoder errors and resource names are not recorded by application call sites.
 This is a field/target policy, not a sanitizer for arbitrary secrets embedded in allowed fields;
 keep future event messages static and use sanitized error codes. CLI error diagnostics and
@@ -52,5 +57,5 @@ For API deployments, place logging beside listen/tls/access_log at the deploymen
 A multi-region deployment rejects logging inside individual regions. `master-update` and
 `master-sync` use the single-region configuration and `registry-serve` uses its own file.
 Every other one-shot command (`master-import`, `master-git-commit`, `master-git-push`,
-`master-db-import`, `master-db-migrate`, `asset-dispatch-*`, `global-account`) and `--version`
-use default logging, even when it reads `SIRIUS_CONFIG_PATH`.
+`master-git-adopt`, `master-db-import`, `master-db-migrate`, `asset-dispatch-*`,
+`global-account`) and `--version` use default logging, even when it reads `SIRIUS_CONFIG_PATH`.

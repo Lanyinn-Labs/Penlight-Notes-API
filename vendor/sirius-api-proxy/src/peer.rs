@@ -132,22 +132,34 @@ pub enum Failure {
     Transport {},
     Protocol {},
     Game { grpc_status: u16 },
+    NotFound {},
 }
 impl From<AppError> for Failure {
     fn from(error: AppError) -> Self {
         match error {
             AppError::UnsupportedRegionOperation => Self::UnsupportedOperation {},
-            AppError::PeerAccountUnavailable => Self::UnavailableBeforeDispatch {},
+            // An open upstream path refuses before any game contact (defense in depth: the
+            // executor already maps it to PeerAccountUnavailable).
+            AppError::PeerAccountUnavailable | AppError::UpstreamUnavailable => {
+                Self::UnavailableBeforeDispatch {}
+            }
             AppError::AccountUnavailable => Self::AccountUnavailable {},
             AppError::Timeout => Self::Timeout {},
             AppError::Transport | AppError::Proxy => Self::Transport {},
-            AppError::Grpc(grpc_status) => Self::Game { grpc_status },
+            // Old receivers see the plain gRPC status; new ones use the reply's observation.
+            AppError::Grpc(grpc_status) | AppError::Maintenance(grpc_status) => {
+                Self::Game { grpc_status }
+            }
             AppError::PeerIdentityMismatch => Self::IdentityMismatch {},
+            AppError::NotFound => Self::NotFound {},
             _ => Self::Protocol {},
         }
     }
 }
 
+/// No layer that can answer a `peer_transport::PRE_DISPATCH_STATUSES` status after the handler
+/// starts (timeout, compression, admission, panic catching) may wrap this router: 1.3.0 callers
+/// fail authenticated reads over on those statuses.
 pub fn router(client: Arc<GameClient>, prefix: &str, token: String) -> Router {
     Router::new()
         .nest(
@@ -162,6 +174,9 @@ pub fn router(client: Arc<GameClient>, prefix: &str, token: String) -> Router {
         )
         .with_state(client)
 }
+/// HTTP errors are returned only before `call_peer`. Once it is invoked, every outcome must be
+/// HTTP 200 with a typed `Failure`, because callers treat `PRE_DISPATCH_STATUSES` from this
+/// route as proof of non-execution.
 async fn query(
     State(client): State<Arc<GameClient>>,
     Json(request): Json<Request>,
@@ -171,6 +186,7 @@ async fn query(
     }
     let (route, input) = request.operation.rpc()?;
     let identity = client.peer_identity()?;
+    let mut maintenance = None;
     let outcome = if identity != request.identity {
         Outcome::Failure {
             kind: Failure::IdentityMismatch {},
@@ -189,9 +205,18 @@ async fn query(
                 }
                 Outcome::Success { data }
             }
-            Err(error) => Outcome::Failure { kind: error.into() },
+            Err(error) => {
+                maintenance = Some(matches!(error, AppError::Maintenance(_)));
+                Outcome::Failure { kind: error.into() }
+            }
         }
     };
+    // The shared observation may already reflect a later call; a failure's maintenance flag must
+    // describe this call, because 1.2.4 callers map it to 503 `maintenance`.
+    let mut observation = client.observation().await;
+    if let Some(maintenance) = maintenance {
+        observation.maintenance = maintenance;
+    }
     // Echo requested identity to bind replies; failure does not claim acceptance.
     Ok((
         StatusCode::OK,
@@ -199,7 +224,7 @@ async fn query(
             request_id: request.request_id,
             identity: request.identity,
             outcome,
-            observation: client.observation().await,
+            observation,
         }),
     ))
 }

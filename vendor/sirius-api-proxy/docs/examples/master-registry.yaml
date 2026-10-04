@@ -17,7 +17,8 @@ backend:
 #     database: sirius_master
 #     username: sirius_reader
 #     password_env: SIRIUS_MASTER_DATABASE_PASSWORD
-#     timeout_seconds: 30
+#     timeout_seconds: 30 # owner publication; also caps the default read deadline
+#     read_timeout_seconds: 30 # each read; with an owner, keep this short and raise timeout_seconds
 # Use a dedicated SELECT-only role on already initialized sirius_master_* tables.
 # tls:
 #   certificate_file: ./registry-cert.pem
@@ -26,6 +27,9 @@ backend:
 #   format: json
 #   output:
 #     type: stderr
+# Negotiated gzip/zstd for the public Master JSON routes; default off. See docs/HTTP_COMPRESSION.md.
+# http_compression:
+#   enabled: true
 
 # Optional verified Master owner (credentials must all differ):
 # owner:
@@ -38,6 +42,8 @@ backend:
 #     timeout_seconds: 600
 #     request_timeout_ms: 60000
 #   staging_directory: ./registry-master # PostgreSQL only; omit for files
+#   retention: # optional; prunes the directory this owner writes (requires source)
+#     keep_snapshots: 20
 
 # For local-only publication, omit owner.source and set:
 # owner:

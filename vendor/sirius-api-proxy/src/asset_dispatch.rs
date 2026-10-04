@@ -1,7 +1,8 @@
 //! Background catalog observation and durable updater reconciliation.
 use crate::{
+    asset_dispatch_admin::{DispatchStatus, ObservationStatus, ReconcileStatus},
     asset_jobs::{self, Operation, Request, Status},
-    asset_outbox::{Identity, Outbox, State},
+    asset_outbox::{Entry, Identity, Outbox, State},
     client::GameClient,
     config::Config as GameConfig,
     error::AppError,
@@ -133,6 +134,45 @@ pub struct Worker {
     remotes: Vec<Remote>,
     control: crate::asset_dispatch_admin::Control,
     commands: tokio::sync::mpsc::Receiver<crate::asset_dispatch_admin::Command>,
+    /// Busy answers (429/503) per entry since this process started; bounded by
+    /// [`MAX_REFUSALS`] before the entry fails as `submission_refused`.
+    refusals: std::collections::HashMap<String, u32>,
+    status: watch::Sender<DispatchStatus>,
+    /// Transport failures in the current reconciliation pass.
+    transport_errors: usize,
+}
+/// Every code this worker persists; the status route counts any other code as `other`.
+pub(crate) const FAILURE_CODES: &[&str] = &[
+    "target_removed",
+    "submission_ambiguous",
+    "job_identity_mismatch",
+    "job_failed",
+    "job_cancelled",
+    "outcome_mismatch",
+    "job_pruned",
+    "submission_refused",
+    "submission_rejected",
+    "submission_unauthorized",
+    "idempotency_conflict",
+    "asset_dispatch_request_invalid",
+    "invalid_job_response",
+];
+/// Like the original's busy retry (10 × one interval), but only for answers that guarantee the
+/// updater did not accept the job; the same Idempotency-Key is reused.
+const MAX_REFUSALS: u32 = 10;
+/// Terminal classification of a submission the updater answered with a definite HTTP status.
+fn rejected_submission(status: u16) -> Option<&'static str> {
+    match status {
+        400 | 404 | 405 | 413 | 415 | 422 => Some("submission_rejected"),
+        401 | 403 => Some("submission_unauthorized"),
+        409 => Some("idempotency_conflict"),
+        _ => None,
+    }
+}
+/// Log label for a target without its origin or token.
+fn target_label(entry: &Entry) -> &str {
+    let digest = &entry.identity.destination_sha256;
+    &digest[..digest.len().min(12)]
 }
 impl Worker {
     pub fn new(
@@ -171,10 +211,14 @@ impl Worker {
             )
             .into());
         }
-        let (control, commands) = crate::asset_dispatch_admin::channel();
+        let (control, commands, status) = crate::asset_dispatch_admin::channel(
+            DispatchStatus::pending(&outbox, cfg.history_capacity),
+        );
         Ok(Self {
             control,
             commands,
+            status,
+            transport_errors: 0,
             region: config.region,
             environment: config.environment.clone(),
             platform: config.platform().name().into(),
@@ -182,6 +226,7 @@ impl Worker {
             config: cfg,
             outbox,
             remotes,
+            refusals: Default::default(),
         })
     }
     pub fn control(&self) -> crate::asset_dispatch_admin::Control {
@@ -205,24 +250,51 @@ impl Worker {
         }
         Ok(())
     }
+    /// Publishes counts, time and outcome (never error text) of this pass.
     pub async fn reconcile(&mut self) -> Result<(), crate::asset_outbox::Error> {
+        self.transport_errors = 0;
+        let mut batch = 0;
+        let result = self.reconcile_batch(&mut batch).await;
+        let transport_errors = self.transport_errors;
+        self.publish(|s| {
+            s.last_reconcile = Some(ReconcileStatus {
+                at: chrono::Utc::now(),
+                result: if result.is_ok() {
+                    "completed"
+                } else {
+                    "storage_failed"
+                },
+                batch,
+                transport_errors,
+            })
+        });
+        result
+    }
+    async fn reconcile_batch(
+        &mut self,
+        batch: &mut usize,
+    ) -> Result<(), crate::asset_outbox::Error> {
         let entries = self.outbox.next_batch(16)?;
+        *batch = entries.len();
         for (key, entry) in entries {
             let Some(remote) = self.remotes.iter().find(|r| {
                 r.digest == entry.identity.destination_sha256
                     && r.config.profile == entry.identity.request.profile
             }) else {
-                self.fail(&key, "target_removed")?;
+                self.fail(&key, &entry, "target_removed", None)?;
                 continue;
             };
+            let pending = matches!(entry.state, State::Pending);
             let result = match &entry.state {
                 State::Pending => {
                     self.outbox.begin_send(&key)?;
+                    // Make the persisted `sending` visible before a possibly long POST.
+                    self.publish(|_| {});
                     remote.client.submit(&entry.identity.request, &key).await
                 }
                 State::Sending { .. } => {
                     // No remote retention guarantee exists: never replay an ambiguous POST automatically.
-                    self.fail(&key, "submission_ambiguous")?;
+                    self.fail(&key, &entry, "submission_ambiguous", None)?;
                     continue;
                 }
                 State::Submitted { job_id } => {
@@ -234,15 +306,16 @@ impl Worker {
                 Ok(job) => {
                     let expected = format!("{:x}", Sha256::digest(key.as_bytes()));
                     if job.idempotency_sha256.as_deref() != Some(expected.as_str()) {
-                        self.fail(&key, "job_identity_mismatch")?;
+                        self.fail(&key, &entry, "job_identity_mismatch", None)?;
                         continue;
                     }
-                    if matches!(entry.state, State::Pending) {
+                    if pending {
                         self.outbox.acknowledge(&key, &job.id)?;
+                        self.refusals.remove(&key);
                     }
                     match job.status {
-                        Status::Failed => self.fail(&key, "job_failed")?,
-                        Status::Cancelled => self.fail(&key, "job_cancelled")?,
+                        Status::Failed => self.fail(&key, &entry, "job_failed", None)?,
+                        Status::Cancelled => self.fail(&key, &entry, "job_cancelled", None)?,
                         Status::Completed => {
                             if let Some(outcome) =
                                 job.outcome.filter(|o| matches_outcome(&entry.identity, o))
@@ -254,7 +327,7 @@ impl Worker {
                                     outcome.publication_id,
                                 )?;
                             } else {
-                                self.fail(&key, "outcome_mismatch")?;
+                                self.fail(&key, &entry, "outcome_mismatch", None)?;
                             }
                         }
                         _ => {}
@@ -263,66 +336,176 @@ impl Worker {
                 Err(asset_jobs::Error::Status(404))
                     if matches!(entry.state, State::Submitted { .. }) =>
                 {
-                    self.fail(&key, "job_pruned")?
+                    self.fail(&key, &entry, "job_pruned", Some(404))?
                 }
-                Err(asset_jobs::Error::Protocol) => self.fail(&key, "invalid_job_response")?,
-                Err(_) => {
-                    tracing::warn!(
-                        error_code = "asset_dispatch_transport",
-                        "Asset job request failed; persisted state retained"
-                    );
+                // A definite answer to the POST: the updater did not accept the job.
+                Err(asset_jobs::Error::Status(status @ (429 | 503))) if pending => {
+                    let refusals = self.refusals.entry(key.clone()).or_default();
+                    *refusals += 1;
+                    if *refusals >= MAX_REFUSALS {
+                        self.refusals.remove(&key);
+                        self.fail(&key, &entry, "submission_refused", Some(status))?;
+                    } else {
+                        self.outbox.refused(&key)?;
+                        tracing::warn!(
+                            region = self.region.name(),
+                            profile = entry.identity.request.profile.as_str(),
+                            target = target_label(&entry),
+                            stage = "submit",
+                            status,
+                            error_code = "asset_dispatch_busy",
+                            "Asset updater is busy; the job will be submitted again"
+                        );
+                    }
                 }
+                Err(asset_jobs::Error::Status(status)) if pending => {
+                    if let Some(code) = rejected_submission(status) {
+                        self.refusals.remove(&key);
+                        self.fail(&key, &entry, code, Some(status))?;
+                    } else {
+                        self.transport_warning(&entry, pending, Some(status));
+                    }
+                }
+                // Raised before any request is sent (invalid key or request).
+                Err(asset_jobs::Error::Config) if pending => {
+                    self.fail(&key, &entry, "asset_dispatch_request_invalid", None)?
+                }
+                Err(asset_jobs::Error::Protocol) => {
+                    self.fail(&key, &entry, "invalid_job_response", None)?
+                }
+                Err(asset_jobs::Error::Status(status)) => {
+                    self.transport_warning(&entry, pending, Some(status))
+                }
+                Err(_) => self.transport_warning(&entry, pending, None),
             }
         }
         Ok(())
     }
-    fn fail(&mut self, key: &str, code: &str) -> Result<(), crate::asset_outbox::Error> {
+    fn fail(
+        &mut self,
+        key: &str,
+        entry: &Entry,
+        code: &str,
+        status: Option<u16>,
+    ) -> Result<(), crate::asset_outbox::Error> {
         self.outbox.fail(key, code)?;
+        self.refusals.remove(key);
         tracing::warn!(
             region = self.region.name(),
+            profile = entry.identity.request.profile.as_str(),
+            target = target_label(entry),
+            status,
             error_code = code,
             "Asset dispatch requires operator reconciliation"
         );
         Ok(())
     }
+    fn transport_warning(&mut self, entry: &Entry, pending: bool, status: Option<u16>) {
+        self.transport_errors += 1;
+        tracing::warn!(
+            region = self.region.name(),
+            profile = entry.identity.request.profile.as_str(),
+            target = target_label(entry),
+            stage = if pending { "submit" } else { "poll" },
+            status,
+            error_code = "asset_dispatch_transport",
+            "Asset job request failed; persisted state retained"
+        );
+    }
+    /// Applies `change` and refreshes the timestamp and working-ledger counts.
+    fn publish(&self, change: impl FnOnce(&mut DispatchStatus)) {
+        let (entries, failed_by_code) = crate::asset_dispatch_admin::summarize(
+            &self.outbox,
+            self.config.history_capacity,
+            &self.refusals,
+        );
+        self.status.send_modify(|s| {
+            change(s);
+            s.updated_at = chrono::Utc::now();
+            s.entries = entries;
+            s.failed_by_code = failed_by_code;
+        });
+    }
     pub async fn run(mut self, mut stop: watch::Receiver<bool>) {
+        let reason = self.cycles(&mut stop).await;
+        self.publish(|s| {
+            s.status = "stopped";
+            s.stop_reason = Some(reason);
+            s.cycle_started_at = None;
+            s.next_cycle_at = None;
+        });
+    }
+    /// Returns the stop reason reported by the status route.
+    async fn cycles(&mut self, stop: &mut watch::Receiver<bool>) -> &'static str {
         loop {
             if *stop.borrow() {
-                break;
+                return "shutdown";
             }
-            let snapshot =
-                tokio::select! {r=self.game.refresh_resource_snapshot()=>r,_=stop.changed()=>break};
-            match snapshot {
-                Ok(snapshot) => {
-                    if self.observe(&snapshot).is_err() {
+            self.publish(|s| {
+                s.status = "observing";
+                s.cycle_started_at = Some(chrono::Utc::now());
+                s.next_cycle_at = None;
+            });
+            let snapshot = tokio::select! {r=self.game.refresh_resource_snapshot()=>r,_=stop.changed()=>return "shutdown"};
+            let (result, resource_version) = match snapshot {
+                Ok(snapshot) => match self.observe(&snapshot) {
+                    Ok(()) => ("recorded", Some(snapshot.resource_version)),
+                    Err(error) => {
                         tracing::error!(
                             error_code = "asset_outbox_observe",
                             "Failed to persist asset observation"
                         );
+                        let result = match error {
+                            crate::asset_outbox::Error::Full => "capacity_exhausted",
+                            crate::asset_outbox::Error::Invalid => "rejected",
+                            crate::asset_outbox::Error::Storage
+                            | crate::asset_outbox::Error::Locked => "storage_failed",
+                        };
+                        (result, None)
                     }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        error_code = "asset_observation_failed",
+                        "Asset version observation unavailable"
+                    );
+                    ("unavailable", None)
                 }
-                Err(_) => tracing::warn!(
-                    error_code = "asset_observation_failed",
-                    "Asset version observation unavailable"
-                ),
-            }
-            let result = tokio::select! {r=self.reconcile()=>r,_=stop.changed()=>break};
+            };
+            self.publish(|s| {
+                s.status = "reconciling";
+                s.last_observation = Some(ObservationStatus {
+                    at: chrono::Utc::now(),
+                    result,
+                    resource_version,
+                });
+            });
+            let result = tokio::select! {r=self.reconcile()=>r,_=stop.changed()=>return "shutdown"};
             if result.is_err() {
                 tracing::error!(
                     error_code = "asset_outbox_storage",
                     "Asset dispatch stopped after persistence failure"
                 );
-                break;
+                return "asset_outbox_storage";
             }
-            let pause = tokio::time::sleep(Duration::from_secs(self.config.interval_seconds));
+            let interval = self.config.interval_seconds;
+            self.publish(|s| {
+                let now = chrono::Utc::now();
+                s.status = "idle";
+                s.cycle_started_at = None;
+                s.last_cycle_at = Some(now);
+                s.next_cycle_at = Some(now + chrono::TimeDelta::seconds(interval as i64));
+            });
+            let pause = tokio::time::sleep(Duration::from_secs(interval));
             tokio::pin!(pause);
             loop {
                 tokio::select! {
                     biased;
-                    _ = stop.changed() => return,
+                    _ = stop.changed() => return "shutdown",
                     _ = &mut pause => break,
                     Some(command) = self.commands.recv() => {
                         crate::asset_dispatch_admin::handle(command, &mut self.outbox);
+                        self.publish(|_| {});
                     }
                 }
             }

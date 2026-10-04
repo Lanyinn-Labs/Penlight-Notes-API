@@ -11,8 +11,8 @@ regions:
     platform: "iOS"
     environment: "release"
     endpoint: "https://api.bang-dream-on.jp"
-    client_version: "1.0.3"
-    protocol_directory: "protocol/sirius/1.0.3"
+    client_version: "1.0.4"
+    protocol_directory: "protocol/sirius/1.0.4"
     api_token_env: "SIRIUS_JP_API_TOKEN"
     internal_token_env: "SIRIUS_JP_INTERNAL_TOKEN"
     master_directory: "data/jp/master"
@@ -27,6 +27,9 @@ regions:
       state_directory: "data/jp/master-git"
       layout: "indented_root"
       branch: "main"
+      # Seconds for all Git commands of one publication attempt (default 120, 10-600).
+      # Raise it for a large first push over a slow link.
+      timeout_seconds: 300
       commit:
         author: {name: "Sirius Master Publisher", email: "sirius-master@localhost"}
       remote:

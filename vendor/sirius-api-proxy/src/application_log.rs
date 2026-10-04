@@ -146,6 +146,12 @@ fn permitted(name: &str) -> bool {
             | "listen"
             | "operation"
             | "attempt"
+            | "profile"
+            | "target"
+            | "node"
+            | "sdk_code"
+            | "cooldown_ms"
+            | "failover"
     )
 }
 fn bounded(value: &str) -> String {

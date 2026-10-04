@@ -1,7 +1,7 @@
 {
   "client_version": "1.0.4",
   "endpoint": "https://api.bang-dream-on.jp",
-  "protocol_directory": "vendor/sirius-api-proxy/protocol/sirius/1.0.3",
+  "protocol_directory": "vendor/sirius-api-proxy/protocol/sirius/1.0.4",
   "cdn_root": "https://static.bang-dream-on.jp",
   "master": {
     "key_hex": "0532791c510a08eb7ede6b46c6ba71ea9aa2a3cfb678a595f89d67c8a5e493b6",

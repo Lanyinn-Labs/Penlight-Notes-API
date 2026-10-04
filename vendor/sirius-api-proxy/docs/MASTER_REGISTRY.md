@@ -21,7 +21,9 @@ Multi-region deployments insert `{region}` after `/api/v1`, for example
 receipt (legacy receipts without a region are JP). A table identifier is the existing
 name without `.json`, for example `MasterExample`. Only names listed in the source manifest
 are served. Unsafe paths and linked snapshot/file entries are rejected. Retained snapshots
-remain addressable after a new snapshot becomes current; these endpoints do not prune history.
+remain addressable after a new snapshot becomes current; these endpoints never prune history.
+By default every snapshot is kept; optional [snapshot retention](#snapshot-retention) removes
+installations older than a configured window, after which their pinned URLs answer 404.
 
 The manifest contains schema version 1, region/environment/platform scope, snapshot identifier,
 Master version, sorted plaintext file names/sizes/SHA-256, a `content_sha256`, and the original
@@ -72,6 +74,44 @@ A matching condition returns an empty 304. Digest-qualified table URLs return a 
 `private, max-age=31536000, immutable`. Authorization still precedes all handlers. A file is
 read and verified before returning a conditional response, so a missing/corrupted file cannot
 be concealed by a stale ETag. `x-master-version` is present on successful/conditional responses.
+When [response compression](HTTP_COMPRESSION.md) is enabled and negotiated, an encoded JSON
+response sends the same hash as a weak ETag (`W/"<hash>"`); weak `If-None-Match` values still
+match. Bundles are never content-encoded, so their exact Content-Length holds.
+
+The CURRENT-relative `/master-data` and `/master-data/tables/{name}` reads use the same
+conditional handling. Their strong ETag is the SHA-256 of the exact bytes returned, so a
+table's current ETag equals its digest-qualified ETag. They answer `private, no-cache`. CURRENT
+is pinned once, so the version, ETag and bytes come from one snapshot, and the region, table
+name and `tables.json` integrity checks run before any 304. The status ETag covers the snapshot
+identifier, so it changes on reimport and differs between nodes; a table ETag stays equal for
+identical bytes, and its 304 carries the new `x-master-version`. Legacy snapshots without
+`tables.json` get an ETag over the bytes read, with no index check. There is no
+`Last-Modified`: file times differ per node and per reimport. These reads remain convenience
+reads; consumers that need a consistent set must pin the manifest and must not combine it with
+CURRENT-relative table reads.
+
+### Table read admission
+
+Every table read loads, hashes and checks the whole file before answering, then keeps its bytes
+until the connection has taken the last of them. Table reads therefore pass a fixed admission gate:
+`/master-data/tables/{name}`, `/master-data/snapshots/{id}/tables/{name}/{hash}`,
+`/master-data/database/by-hash/{hash}/tables/{name}` and the standalone registry's table route.
+One proxy process has 16 permits shared by all its regions; a standalone registry process has
+its own 16. A read that finds none waits in FIFO order for up to 5 s and then answers 503
+`master_unavailable`, logged at most once a minute as `master_read_busy` so operators can tell
+it from an integrity 503. A 200 hands its body to the connection in 64 KiB copies, which the
+connection takes only as its write buffer drains, and keeps its permit until it has taken the
+last one or the client disconnects; a 304 or an error releases it at once. After release a connection still holds at most its own write buffer (a few hundred KiB of
+copies), never the table. Content-Length is unchanged.
+
+This bounds decoded table bytes held for reads and responses to about 24 MB with real tables of
+about 1.5 MB, 16 × 64 MiB in theory. Slow or stalled authenticated clients hold their permits
+while they read, so 16 of them can make other table reads wait and fail; there is no send
+timeout. Manifests, `/master-data`, history and bundles are not admitted here (bundles keep
+their own two permits), including a legacy snapshot without `tables.json`, whose manifest
+reads every table; reimport it to write the index. The built-in consumer fetches one table at a
+time, so it uses at most one permit, and the wait absorbs short bursts that would otherwise fail
+its cycle. Nothing is configurable and no `Retry-After` is sent.
 
 ## Local integrity and older snapshots
 
@@ -125,12 +165,17 @@ filesystem publication is not preemptible; filesystem stalls may exceed the netw
 
 The consumer pins the owner's scoped manifest, validates its content identity, verifies cached
 local tables before reuse, and downloads missing or corrupt files through pinned digest URLs.
-All files must match their declared byte length and SHA-256 and parse as JSON before publication.
+All files must match their declared byte length and SHA-256 and validate as JSON before
+publication.
 A second manifest check rejects owner content changes during the transfer. New owner snapshot
 UUIDs with identical content are accepted. The consumer creates its own local snapshot UUID and
 receipt (`source: registry`), retaining the same content identity. It can serve the same read
-protocol to downstream consumers. Unchanged polls still verify every installed table, allowing
-local corruption to be detected and repaired. Previous snapshots are retained.
+protocol to downstream consumers. Unchanged polls still verify every installed table's byte
+length and SHA-256 against the snapshot index (`tables.json`), whose tables were validated as
+JSON before the index was written, so local corruption is still detected and repaired without
+reparsing every table. Tables of legacy snapshots without an index are parsed again. Serving
+reads (pinned tables, bundles, Git and database exports) always validate the JSON. Previous
+snapshots are retained.
 
 The existing filesystem writer lock excludes imports/CDN updates/other consumers. Shutdown
 cancels outstanding synchronization; a blocking preparation may finish, but cannot publish
@@ -161,7 +206,9 @@ An invalid existing pointer/predecessor fails publication rather than silently s
 `GET /api/v1/master-data/history?limit=20` uses the same public bearer as other Master reads
 (and the regional prefix in multi-region deployments). Limits are 1..100, default 20; unknown
 query fields fail. Responses are private/no-store and contain scope, pinned `head`, entries,
-`has_more`, `next_before`, and `legacy_boundary`. Entries include snapshot UUID, source version, scoped content
+`has_more`, `next_before`, `legacy_boundary` and, only when true, `retention_boundary` (absent
+means false; see [snapshot retention](#snapshot-retention)). Entries include snapshot UUID, source version, nullable
+`resource_version` (the asset version in the snapshot's manifest, since 1.3.0), scoped content
 SHA-256, file count, plaintext byte total and nullable `published_at`. This is installation
 history: explicit reimports of identical content remain visible with equal content hashes;
 ordinary unchanged CDN/sync polls do not install and thus add no record. Read paths never call
@@ -182,8 +229,63 @@ A syntactically invalid cursor returns 400; a missing or orphan snapshot, or a c
 legacy boundary, returns 404. A cursor at the oldest entry returns an empty final page. Cursors
 are bounded to 128 characters; each request traverses at most 10,000 links, including the skipped
 prefix. Hitting that safety bound fails explicitly with 503, not a truncated success. Deep
-history indexing, external database persistence and retention/compaction remain separate work.
-Existing snapshot directories are not pruned.
+history indexing and external database persistence remain separate work. Snapshot directories
+are pruned only by the optional [snapshot retention](#snapshot-retention); traversal then stops
+at its recorded boundary with `retention_boundary: true`, and a cursor naming a pruned snapshot
+returns 404.
+
+## Snapshot retention
+
+Snapshots are kept indefinitely unless a writer is configured to prune them. A profile with
+`master_directory` and either `master_update` or `master_sync` may set:
+
+```yaml
+master_retention:
+  keep_snapshots: 20 # 2..10000
+```
+
+A standalone registry owner sets `owner.retention` instead (see
+[REGISTRY_SERVICE.md](REGISTRY_SERVICE.md)). Without a writer in the same process the field is
+rejected rather than silently ignored; `master-import` does not read configuration and never
+prunes, so the next service pass applies the policy.
+
+Retention counts installations along CURRENT's committed predecessor chain, newest first. An
+identical reimport is its own installation and counts once, unlike the PostgreSQL mirror's
+`keep_snapshots`, which counts distinct content hashes. The minimum of 2 keeps the snapshot
+CURRENT just replaced readable for pinned readers. The maximum equals the history traversal
+bound, so `master-db-migrate` can still read the whole retained window.
+
+A pass runs after each update or sync pass has settled its result, including unchanged polls, so
+enabling retention converges within one interval. It runs outside the update deadline and never
+changes the reported outcome; it takes the directory's writer lock and is skipped for that cycle
+when another writer (for example `master-import`) holds it. Update and sync results gain
+`pruned_snapshots` when retention is configured and the pass succeeded. A failed pass logs
+`master_retention_failed` and keeps what it did not remove.
+
+Before deleting anything, the pass durably writes `retention.json` in the snapshot directory,
+naming the oldest retained snapshot. Readers honour that boundary even if retention is later
+unconfigured, because older snapshots no longer exist; a malformed record fails reads with 503.
+Raising `keep_snapshots` never moves the boundary back. Candidates beyond the boundary are then
+removed oldest first, at most 64 per pass: each is renamed to `.master-pruned-*` (leaving its
+canonical path atomically) and then deleted. A rename failure (for example an open handle on
+Windows) stops the pass with the remaining candidates still reachable, to retry next cycle. A
+`.master-pruned-*` directory left by a failed deletion is unreachable and safe to delete by hand.
+
+The pass follows only the committed chain and never scans the directory: staging, download and
+sync temporaries, orphaned snapshots, legacy snapshots without a publication record, and linked
+entries are left alone (a linked candidate fails the pass before anything is removed). A chain
+that reaches a legacy snapshot inside the window prunes nothing.
+
+History, lookup by content identity, complete bundles and migration stop at the boundary; pruned
+snapshot, table, manifest and content-identity URLs answer 404. A reader walking the chain while
+a pass moves the boundary rechecks it when a directory vanishes and truncates at the boundary;
+a missing directory without that evidence still fails explicitly. A consumer, bundle stream or
+Git/database worker that pinned a snapshot fails only when two publications land during its read,
+and succeeds on its next retry.
+
+Downgrading after a pass has pruned: 1.2.x does not know `retention.json`, so its history,
+lookup by content identity and `master-db-migrate` fail on the missing predecessors. Current
+reads, manifests, tables, updates and synchronization are unaffected.
 
 ## Remaining restoration
 
@@ -272,7 +374,8 @@ Master-read bearer, and regional deployments use the corresponding regional pref
 
 The lookup pins CURRENT and walks its committed predecessor chain. It selects the newest
 matching installation, returns 404 when no reachable match exists, and stops at a legacy
-snapshot without a publication record. It does not scan unrelated directories, so a staged
+snapshot without a publication record or at the [retention](#snapshot-retention) boundary (a
+pruned content identity returns 404). It does not scan unrelated directories, so a staged
 or orphaned snapshot is never exposed as a published hash. Corruption and the 10,000-link
 traversal limit return 503 rather than an incomplete successful result. This is a bounded
 local-history lookup; a persistent deep-history index and optional database backend remain
@@ -348,8 +451,24 @@ previous commit. This describes the default `native` layout; see
 reference update commits the new tree; failed validation leaves the prior reference unchanged.
 A cancelled/failed command may leave unreachable Git objects, and loss of the response at the
 reference update is ambiguous: rerun the identical operation to inspect/reuse the committed tree.
-The source CURRENT pointer is never changed by Git publication. Git commands share a 120-second
-budget after local preparation; synchronous local reads can exceed that preparation time.
+The source CURRENT pointer is never changed by Git publication. All Git commands of one
+publication attempt (init, ref reads, remote check, hashing, commit, signing, push and
+verification) share one deadline, `master_git.timeout_seconds` (default 120; range 10–600). It
+starts after local preparation; synchronous local reads can exceed that preparation time.
+
+Each new commit has the subject `Sirius Master <region> <version>`. Since 1.3.0 it is followed
+by a second paragraph holding one Git trailer, `Sirius-Content-SHA256: <content_sha256>`: the
+scoped content identity served at [`by-hash/{content_sha256}/manifest`](#lookup-by-content-identity).
+Read it with `git log --format='%h %(trailers:key=Sirius-Content-SHA256,valueonly)'`.
+
+- The trailer is informational. Sirius never reads it back, and it is not proof of content:
+  anyone who can push to a repository can forge it. Verify the tree or the registry manifest.
+- It is not a one-to-one link. Identical trees reuse the earlier commit, which keeps its
+  message: its trailer may name another content identity with the same tree, and commits made
+  before 1.3.0 have none. No commit is created only to add a trailer. With `indented_root`,
+  one content identity can appear in several commits, for example when only the asset version
+  changes. Changing the branch or layout starts separate commits.
+- Git is an asynchronous downstream mirror, so the registry's CURRENT may already have moved on.
 
 By default, commits use `Sirius Master Publisher <sirius-master@localhost>` and are unsigned.
 The commit policy below can override author/committer identity and enable signatures. Ambient `GIT_*` variables are removed before process execution to prevent
@@ -369,8 +488,9 @@ The command uses the same verified snapshot, scoped state lock, layout and branc
 checks the remote branch before creating a new local commit. An absent remote branch can be
 created; a remote equal to or behind the local branch can be advanced. A remote ahead of or
 diverged from local history fails verification before adding a local commit. A new empty
-local store will not overwrite an existing remote branch; retain/recover the original managed
-state and reconcile deliberately. The command never force-pushes, merges or resets either
+local store will not overwrite an existing remote branch; retain the original managed state, or
+recover it explicitly with [`master-git-adopt`](#adopting-remote-history). The command never
+force-pushes, merges or resets either
 branch to conceal divergence. The force marker used when fetching only refreshes a private
 local inspection ref; it is never part of a push refspec.
 
@@ -380,8 +500,16 @@ remote-ref query must confirm exactly the submitted commit before `remote_verifi
 is returned. `changed` refers to creation of a local commit, not whether network work occurred.
 Remote races, errors and timeouts produce an error, never a false publication receipt. The
 source Master CURRENT pointer is independent and is never rolled back by Git failures. All
-Git work, including checks, commit creation, push and acknowledgement, shares the existing
-120-second budget after local preparation.
+Git work, including checks, commit creation, push and acknowledgement, shares the single
+`master_git.timeout_seconds` budget after local preparation. HTTP(S) remote transfers also
+abort once they stay below 1000 bytes/s for 30 seconds (`http.lowSpeedLimit`/`lowSpeedTime`),
+which fails a stalled transfer as a Git error before the budget runs out. This does not bound
+connection setup; the total deadline does.
+
+Set `SIRIUS_MASTER_GIT_TIMEOUT_SECONDS` (an integer from 10 to 600, digits only) to override the
+profile's `master_git.timeout_seconds` for one `master-git-commit`, `master-git-push` or
+`master-git-adopt` run, for example for a large first push. An invalid value fails before any
+Git command and is not echoed. Precedence is the variable, then the profile, then 120.
 
 For HTTP authorization, set `SIRIUS_MASTER_GIT_AUTHORIZATION` externally to a complete single
 header value such as `Authorization: Bearer …` or `Authorization: Basic …`. Do not put credentials
@@ -398,6 +526,58 @@ mirrors and tests, with authorization unset. The library's HTTP test opt-in is n
 the CLI. Final production Git acceptance, including a packaged Windows binary, remains a
 separate release requirement.
 
+### Adopting remote history
+
+```sh
+SIRIUS_CONFIG_PATH=owner.yaml sirius-api-proxy master-git-adopt ./master-git-state https://git.example/master-data.git
+```
+
+When the local managed state was lost, or the remote branch gained commits that Sirius did not
+create (for example a README), publication keeps failing with `remote_history`. This one-shot
+command makes the remote branch the local managed branch so publication can continue. Argument
+and environment handling (`SIRIUS_MASTER_GIT_AUTHORIZATION`, `SIRIUS_MASTER_GIT_PROXY_URL`,
+HTTPS or explicit `file://` only) are exactly those of `master-git-push`. It reads the profile's
+region, environment, platform, `master_git.layout`, `master_git.branch` and
+`master_git.timeout_seconds` (adoption shares one such budget); it does not need
+`master_directory` and ignores `master_git.commit`, `state_directory`, `interval_seconds` and
+`remote`. The state directory follows the same ownership rules: a missing or empty directory is
+initialized for the profile's scope, and a foreign non-empty directory or another scope's state
+is refused.
+
+The remote history is adopted only if its newest commit with a `Sirius Master <region>
+<version>` subject, among the latest 64 first-parent commits, is a Sirius publication for this
+profile: the region matches (the pre-1.2.1 alias of `hk` is read as `hk`), the version is a
+valid Master version, and the tree has exactly the configured layout, a flat set of regular
+`.json` files. For `native`, `sirius-publication.json` must record the same scope (including
+environment and platform), version and table names as the tree. For `indented_root`,
+`version.json` must be byte-for-byte the document Sirius writes for that version.
+`indented_root` commits record only the region, so they cannot distinguish two environments
+that share a branch; configure one remote branch per deployment. Older commits are never
+consulted once a `Sirius Master` subject is found. The `Sirius-Content-SHA256` trailer is
+never consulted either: it comes from the remote and proves nothing.
+
+| Local and remote | Result |
+|---|---|
+| Local branch missing, or an ancestor of the remote | The local branch is fast-forwarded to the remote head; `adopted: true` |
+| Local equal to or ahead of the remote | Nothing changes; `adopted: false`; the next publication pushes as usual |
+| Diverged | `RemoteChanged`; nothing changes |
+| Remote branch absent, no recognizable publication, or another region, scope or layout | `NotAdoptable`; nothing changes |
+
+The command prints a JSON receipt with `commit` (local branch after the call), `previous`,
+`adopted`, `publication` (the recognized Sirius commit) and `version`, never a path or URL. It
+never pushes, force-updates or rewrites a commit, and does not read Master data; the local
+reference moves with a compare-and-swap update. The next publication is parented on the adopted
+head. Its tree is generated from the installed snapshot as always, so files added manually to
+the remote leave the next published tree (history keeps them). If the content is identical to
+the adopted Sirius commit and no other commits were added, publication reuses it and only
+verifies the remote.
+
+To recover from divergence, move the old state directory aside and adopt into a new one. After a
+layout change on the same branch, adopt with the previous layout first. The background worker
+never adopts and has no switch for it. The command takes the state directory lock for each
+operation; while the service is running, it may report `Locked` during a worker cycle, and the
+worker continues from the adopted commit on its next cycle.
+
 ### Background Git publication
 
 JP, HK, EN and KR profiles may enable `master_git` with a separate `state_directory` and
@@ -410,8 +590,12 @@ directories and shared remotes. Git tokens must be distinct per region.
 leave the feature disabled. See the commented single-profile example configuration.
 
 The worker reconciles CURRENT at startup, after successful in-process Master installations,
-and every `interval_seconds` (default 300; range 10–86400). Polling also discovers CLI imports
-and retries failed publication. Git and consumer notifications use independent wake signals.
+and every `interval_seconds` (default 300; range 10–86400), measured after each attempt ends, so
+cycles never overlap. `timeout_seconds` (default 120; range 10–600) bounds the Git commands of
+each attempt; a larger budget holds the state lock and the `running` status longer when the
+remote stalls, while shutdown still cancels at once. A small budget can make a large first push
+or a slow signer fail every cycle; the failure is safe and the next cycle reconciles. Polling
+also discovers CLI imports and retries failed publication. Git and consumer notifications use independent wake signals.
 Intermediate installations may coalesce into the latest snapshot. Keep the managed state
 across restarts: Git refs are durable, while displayed last-success status is rebuilt at startup.
 
@@ -419,7 +603,11 @@ across restarts: Git refs are durable, while displayed last-success status is re
 internal bearer. It reports pending/running/ready/failed/stopped/disabled, the last successful
 receipt and a static error code; it does not expose paths, remote URLs or credentials. Failure
 never rolls back installed Master data. Shutdown cancels active network work and releases the
-state lock; the next startup reconciles an ambiguous previous push against remote refs.
+state lock; the next startup reconciles an ambiguous previous push against remote refs. A
+persistent `remote_history` error means the remote branch has history the local state does not
+contain; inspect it and, if appropriate, run [`master-git-adopt`](#adopting-remote-history).
+The worker holds the state lock only during each cycle, so the command can run while the
+service is up.
 
 Service remote configuration uses `url`, optional `authorization_env`, and explicit `allow_file`
 or `allow_http` opt-ins (both default false). Prefer HTTPS. Authorization must be a dedicated
@@ -449,8 +637,9 @@ reserialize: object key order, duplicate keys, number spellings (`1.0`, `1e3`, `
 escapes and non-ASCII text are copied exactly; only insignificant whitespace changes. Empty
 objects and arrays are written `{}` and `[]`. Content hashes and sizes in manifests still refer
 to the original bytes; Git holds the formatted form. Tables removed upstream disappear from the
-next tree, and identical content reuses the existing commit. Commit messages keep
-`Sirius Master <region> <version>`.
+next tree, and identical content reuses the existing commit. The commit subject stays
+`Sirius Master <region> <version>`, followed since 1.3.0 by the
+[content trailer paragraph](#local-master-git-commits).
 
 If the pinned snapshot has no recorded asset version, `indented_root` publication fails with
 error code `asset_version_unavailable` before any Git command runs, leaving refs untouched. It
@@ -464,7 +653,9 @@ and `HEAD` is rejected. Changing the branch or layout of an existing state direc
 continues that branch in the same managed repository; other branches are left untouched. The
 remote safety rules are unchanged: a remote branch that is ahead or diverged, including an
 initialized repository whose `main` already has a README commit, is refused. Publish to an
-empty repository or to a branch that Sirius owns.
+empty repository or to a branch that Sirius owns. A README-only repository cannot be adopted
+either, because [adoption](#adopting-remote-history) requires a recognizable Sirius
+publication; a README added on top of an existing Sirius publication can be adopted.
 
 ```yaml
 master_git:
@@ -499,7 +690,11 @@ master_git:
 
 Omit `committer` to reuse `author`. Omit `signing` for explicitly unsigned new commits.
 SSH signing requires an absolute key path; use an agent-backed public key path or an
-unattended private key as appropriate for your deployment. OpenPGP uses `format: openpgp`
+unattended private key as appropriate for your deployment. The official image includes
+`ssh-keygen` since 1.2.4 (earlier images could not sign); mount the key read-only, for example
+as a Docker secret at `/run/secrets/master-signing-key` readable by the `sirius` user, or pass
+`SSH_AUTH_SOCK` with a public key path. OpenPGP signing needs `gpg`, which the image does not
+include: build a derived image that adds it. OpenPGP uses `format: openpgp`
 (`gpg` is also accepted) and a hexadecimal key fingerprint in `key`, referencing the service
 account's keyring. Keys and passphrases must not be embedded in YAML. An optional `program`
 selects one absolute executable path containing only ASCII letters/digits, `/`, `.`, `_`, `-`;
@@ -509,6 +704,7 @@ default. Configure any required agent/keyring for unattended operation before st
 Signers run inside the existing publication deadline and owned process group. Signing failures
 return a static error and do not advance the branch or alter installed Master data. The next
 retry can publish after the signer is repaired. No raw signer diagnostics are returned over HTTP.
+Signatures cover the full commit message, including the `Sirius-Content-SHA256` trailer.
 
 Identity/signing changes apply to newly created commits. Identical content still reuses the
 existing commit, including an older unsigned commit: enabling signing does not retroactively

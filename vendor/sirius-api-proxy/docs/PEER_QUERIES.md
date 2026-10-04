@@ -27,7 +27,7 @@ A request contains a UUID `request_id`, an exact `identity` and a typed `operati
     "region": "jp",
     "environment": "release",
     "platform": "iOS",
-    "client_version": "1.0.3",
+    "client_version": "1.0.4",
     "protocol_sha256": "<configured bundle's semantic fingerprint>"
   },
   "operation": { "type": "version" }
@@ -60,18 +60,53 @@ mutation field. Unknown fields/operations fail validation. Request bodies are li
 Each accepted query executes on this node's local GameClient, under its normal admission,
 timeout, account serialization and response-cache policies. It never invokes another node.
 The schema hash is rechecked after acquiring admission and the protocol read barrier, preventing
-a reload from changing a queued request's contract before execution.
+a reload from changing a queued request's contract before execution. Since 1.3.0 a query whose
+schema hash equals the executor's current one may be answered from the executor's response cache
+before admission ([hits before admission](RESPONSE_CACHE.md#hits-before-admission)), including a
+retained entry inside the stale window while every local account is quarantined, where it would
+otherwise get `unavailable_before_dispatch`. A different hash never reads the cache and still gets
+`identity_mismatch`. Identical concurrent
+queries with the same identity share one local execution like local public reads
+([shared in-flight reads](REQUEST_POLICY.md#shared-in-flight-reads)); each still receives its own
+reply with its own `request_id`, and the wire format is unchanged.
 
 HTTP 200 contains the request identity/id and a typed outcome: `status: success` with `data`,
 or `status: failure` with `kind`. The reply also carries the executor's sanitized `observation`. Failure types are `identity_mismatch`, `unsupported_operation`,
-`account_unavailable`, `unavailable_before_dispatch`, `timeout`, `transport`, `protocol`, or `game` with `grpc_status`.
+`account_unavailable`, `unavailable_before_dispatch` (no local account, or since 1.3.0 an
+[open upstream path](REQUEST_POLICY.md#upstream-path-health); nothing reached the game), `timeout`, `transport`, `protocol`, `not_found`
+(a looked-up player does not exist, Global since 1.2.2, JP `profile` since 1.3.0; terminal, no
+failover or node cooldown), or
+`game` with `grpc_status`. A pre-1.2.2 caller cannot parse `not_found` and records a protocol
+fault for that node, so upgrade routing callers before or together with their executors.
 The echoed identity binds the response to the request; an identity failure does not claim
-that identity was accepted. Malformed input and failed authorization use HTTP errors.
+that identity was accepted. Malformed input and failed authorization use HTTP errors (below).
 Raw upstream diagnostics and credentials are never serialized. Account-relative `myRank` and
 `myScore` are removed from music/challenge ranking results, as on the public API.
 
 A timeout/transport failure is not proof that the game query was never sent. This endpoint
 alone does not authorize an automatic replay of authenticated queries.
+
+### Pre-dispatch HTTP statuses
+
+The executor answers a non-200 status only before it dispatches a game call. Error bodies are
+the usual `{error, code}` JSON and never echo the input.
+
+| Status | Cause |
+| --- | --- |
+| 401 | Missing, duplicated or wrong Bearer token (checked before the body is read) |
+| 404, 405 | Route not served (peer token unset, region not configured, single versus regional path, a 1.1.x node without this route) or a method other than POST |
+| 413 | Request body over 16 KiB |
+| 415 | Missing or non-JSON `Content-Type` |
+| 400 | Malformed JSON or unreadable body, a non-canonical `request_id`, or operation parameters outside the table above |
+| 422 | Unknown fields or operation types, or wrong value types |
+
+From 1.2.0 on, once a query is dispatched every outcome, including timeouts and transport
+failures, is HTTP 200 with a typed `failure`; no layer on the peer route can answer after the
+handler starts. Since 1.3.0 node routing relies on this: these seven statuses prove that the
+query did not execute, so authenticated reads may fail over to the next node. Any other
+status (3xx, 403, 408, 409, 429, 5xx) proves nothing, since an intermediary may produce it after
+forwarding. Intermediaries between nodes must emit the seven statuses only while receiving a
+request.
 
 ## Restoration status
 
@@ -99,9 +134,13 @@ a fresh overall timeout budget. Both declared and chunked response sizes are enf
 
 `Config`, `NotSent` (already expired) and `Connect` errors prove this transport did not submit
 the request. `Timeout`, `Transport`, `Protocol` and HTTP status errors do **not** prove that;
-an executing node may have completed the game query before its response was lost. Typed game
+an executing node may have completed the game query before its response was lost. The one
+exception is `Status` with one of the [pre-dispatch statuses](#pre-dispatch-http-statuses)
+(`rejected_before_dispatch`): the request was submitted, but the executor provably did not run
+it. The transport never reads a non-200 body. Typed game
 outcomes are returned separately. Dropping a call does not promise remote cancellation.
-No replay or fallback occurs in the transport itself. Node routing will own that decision.
+No replay or fallback occurs in the transport itself; node routing owns that decision and, since
+1.3.0, fails authenticated reads over on the pre-dispatch statuses.
 
 Tests cover a real HTTP peer executing local gRPC, single/multi-region path selection, token
 scope, exact response identity, unknown fields, int64 strings, fixed/chunked oversized bodies,

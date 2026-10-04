@@ -13,8 +13,10 @@ mod rijndael;
 mod tests;
 
 mod native;
+mod path_health;
 mod proto_source;
 mod routes;
+mod single_flight;
 
 pub mod region;
 
@@ -24,6 +26,7 @@ pub mod accounts;
 
 pub mod global_account;
 pub mod global_sdk;
+mod sdk_session;
 
 pub mod response_cache;
 
@@ -32,6 +35,8 @@ mod transport;
 pub mod server;
 
 pub mod access_log;
+
+pub mod http_compression;
 
 pub mod application_log;
 
@@ -69,5 +74,7 @@ mod file_lock;
 pub mod registry_service;
 
 mod master_bundle;
+
+mod master_admission;
 
 pub mod registry_owner;

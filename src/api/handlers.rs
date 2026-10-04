@@ -43,7 +43,7 @@ pub async fn health(State(state): State<SharedState>) -> Json<Value> {
 
 pub async fn version() -> Json<Value> {
     Json(
-        json!({"name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION"), "stage": "online", "protocol_implementation":"sirius-api-proxy", "protocol_revision":"c2df04b7979cadc89fd25fa120cb8c406aa4ef86"}),
+        json!({"name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION"), "stage": "online", "protocol_implementation":"sirius-api-proxy", "protocol_version":"1.3.3", "protocol_revision":"cd19e2fe1d7f6c9a69304e6718e95fbc61817561"}),
     )
 }
 
@@ -251,6 +251,8 @@ pub const USER_RESOURCES: &[(&str, &str)] = &[
     ("items", "items"),
     ("stamps", "stamps"),
     ("characters", "characterRank"),
+    ("character-costumes", "characterCurrentCostumes"),
+    ("unlocked-costumes", "characterUnlockedCostumes"),
     ("music-scores", "liveScore"),
     ("music", "liveMusic"),
     ("missions", "playerMissionData"),

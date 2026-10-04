@@ -60,7 +60,11 @@ impl SiriusClient {
         let execution = self.core.public_query(Operation::Version {}).await;
         let available = match execution.result {
             Ok(_) => true,
-            Err(sirius_api_proxy::error::AppError::Grpc(_)) => false,
+            Err(
+                sirius_api_proxy::error::AppError::Grpc(_)
+                | sirius_api_proxy::error::AppError::Maintenance(_)
+                | sirius_api_proxy::error::AppError::UpstreamUnavailable,
+            ) => false,
             Err(error) => return Err(map_error(error)),
         };
         Ok(
@@ -288,15 +292,25 @@ pub fn map_error(error: sirius_api_proxy::error::AppError) -> AppError {
         | Upstream::Grpc(7 | 16) => AppError::UpstreamAuthenticationUnavailable,
         Upstream::Grpc(8) => AppError::UpstreamRateLimited,
         Upstream::Grpc(5) | Upstream::NotFound => AppError::NotFound,
-        Upstream::Grpc(14) | Upstream::Transport | Upstream::Proxy | Upstream::NodeUnavailable => {
-            AppError::UpstreamUnavailable
-        }
+        Upstream::Maintenance(_) => AppError::UpstreamMaintenance,
+        Upstream::Grpc(14)
+        | Upstream::Transport
+        | Upstream::Proxy
+        | Upstream::NodeUnavailable
+        | Upstream::UpstreamUnavailable
+        | Upstream::SnapshotUnavailable
+        | Upstream::AuthUnavailable => AppError::UpstreamUnavailable,
         Upstream::Grpc(status) => AppError::UpstreamGameError(status),
         Upstream::Timeout => AppError::UpstreamTimeout,
         Upstream::UnsupportedRegionOperation => AppError::ProtocolPending,
         Upstream::InvalidRequest => AppError::InvalidQuery,
         Upstream::MasterUnavailable => AppError::MasterDataUnavailable,
-        _ => AppError::UpstreamInvalidResponse,
+        Upstream::PeerIdentityMismatch
+        | Upstream::ProtocolDefinition
+        | Upstream::Config(_)
+        | Upstream::Unauthorized
+        | Upstream::Forbidden
+        | Upstream::Protocol => AppError::UpstreamInvalidResponse,
     }
 }
 

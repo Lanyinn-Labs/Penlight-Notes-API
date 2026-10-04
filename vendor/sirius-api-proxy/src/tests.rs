@@ -44,6 +44,7 @@ fn config() -> Config {
         listen: Some("127.0.0.1:0".parse().unwrap()),
         tls: None,
         access_log: None,
+        http_compression: None,
         environment: "release".into(),
         endpoint: "https://api.bang-dream-on.jp".into(),
         client_version: "1.0.3".into(),
@@ -58,6 +59,7 @@ fn config() -> Config {
         player_id_env: None,
         player_credential_env: None,
         master_directory: None,
+        master_retention: None,
         master_update: None,
         resource_snapshot: None,
         default_cdn_root: "https://static.bang-dream-on.jp".into(),
@@ -412,6 +414,25 @@ async fn http_auth_scope_validation_and_rpc_allowlist_block_before_upstream() {
             "{path}"
         );
     }
+    let health = app
+        .clone()
+        .oneshot(
+            Request::get("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let health: Value =
+        serde_json::from_slice(&health.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["service"], "sirius-api-proxy");
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert!(health["uptime_secs"].is_u64());
+    // Liveness only: no readiness, account, Master or upstream data joins the body.
+    let mut keys: Vec<_> = health.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["service", "status", "uptime_secs", "version"]);
     assert!(matches!(
         c.call("/app.player.PlayerService/Register", json!({}))
             .await,
@@ -840,7 +861,13 @@ async fn master_http_serves_imported_raw_json_with_version_without_game_calls() 
         assert_eq!(response.status().as_u16(), status);
         if status == 200 {
             assert_eq!(response.headers()["x-master-version"], "fixture-v1");
+            assert_eq!(response.headers()["cache-control"], "private, no-cache");
+            let etag = response.headers()["etag"].to_str().unwrap().to_owned();
             let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                etag,
+                format!("\"{}\"", crate::master_registry::digest(&bytes))
+            );
             if path.ends_with("MasterFixture") {
                 assert_eq!(
                     bytes.as_ref(),
@@ -1000,6 +1027,8 @@ async fn remote_master_flow_downloads_verifies_publishes_and_skips_unchanged_ver
         );
         assert!(!headers.contains_key("x-player-credential"));
         assert!(!headers.contains_key("x-player-id"));
+        // Server-side compression must not turn on reqwest decoding (CDN fingerprint).
+        assert!(!headers.contains_key("accept-encoding"));
     }
     assert_eq!(game.received.lock().unwrap().len(), 3);
 }
@@ -1266,7 +1295,11 @@ fn copy_protocol_bundle() -> tempfile::TempDir {
         &crate::config::default_protocol_directory().join("proto"),
         &temp.path().join("proto"),
     );
-    std::fs::write(temp.path().join("bundle.json"), r#"{"version":"1.0.3"}"#).unwrap();
+    std::fs::copy(
+        crate::config::default_protocol_directory().join("bundle.json"),
+        temp.path().join("bundle.json"),
+    )
+    .unwrap();
     temp
 }
 fn edit_version_proto(bundle: &std::path::Path, old: &str, new: &str) {
@@ -1282,7 +1315,7 @@ fn proto_sources_compile_against_independent_proxy_descriptor_baseline() {
         crate::protocol::ProtocolBundle::load(&crate::config::default_protocol_directory())
             .unwrap();
     let original = pool();
-    assert_eq!(loaded.pool.files().len(), 46);
+    assert_eq!(loaded.pool.files().len(), 47);
     assert_eq!(loaded.pool.services().len(), 6);
     assert_eq!(
         loaded.pool.all_messages().len(),
@@ -1576,6 +1609,39 @@ fn native_codecs_match_independent_wire_and_dynamic_json_for_all_exposed_routes(
     }
 }
 
+#[test]
+fn jp_1_0_4_fields_decode_natively_and_dynamically() {
+    let loaded =
+        crate::protocol::ProtocolBundle::load(&crate::config::default_protocol_directory())
+            .unwrap();
+    assert_eq!(loaded.status.version, "1.0.4");
+    assert_eq!(loaded.status.codec, "native");
+    let cases = [
+        (
+            crate::client::ANNOUNCEMENT,
+            "app.announcement.GetResponse",
+            json!({"announcement":{"title":"t","platform":"ANNOUNCEMENT_PLATFORM_ANDROID"}}),
+            "/announcement/platform",
+            json!("ANNOUNCEMENT_PLATFORM_ANDROID"),
+        ),
+        (
+            crate::client::PLAYER_DATA,
+            "app.player.GetPlayerDataResponse",
+            json!({"playerData":{"characterCurrentCostumes":[{"characterId":"7","costumeTarget":2,"costumeGroupId":"9"}],
+                "characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]},
+                "notification":{"characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]}}),
+            "/playerData/characterCurrentCostumes/0/costumeGroupId",
+            json!("9"),
+        ),
+    ];
+    for (route, name, value, pointer, expected) in cases {
+        let bytes = message(name, value);
+        let dynamic = loaded.decode(route, &bytes).unwrap();
+        assert_eq!(dynamic.pointer(pointer), Some(&expected), "{route}");
+        let native = crate::native::decode("jp", route, &bytes).unwrap().unwrap();
+        assert_eq!(native, dynamic, "{route}");
+    }
+}
 #[test]
 fn native_selection_uses_content_not_path_and_dynamic_startup_supports_new_fields() {
     let directory = copy_protocol_bundle();
@@ -2041,6 +2107,7 @@ fn deployment_rejects_ambiguous_region_and_token_scope() {
         logging: None,
         tls: None,
         access_log: None,
+        http_compression: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         regions: BTreeMap::new(),
     };
@@ -2089,11 +2156,31 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         region::Region,
     };
     let bundle = copy_protocol_bundle();
+    let dispatch_state = tempfile::tempdir().unwrap();
     let mut configs = BTreeMap::new();
     for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let mut c = regional_config(region);
         if region == Region::Jp {
             c.protocol_directory = bundle.path().into();
+            let token_env = format!("SIRIUS_DISPATCH_TEST_{}", uuid::Uuid::new_v4().simple());
+            std::env::set_var(&token_env, "dispatch-only-token");
+            c.asset_dispatch = Some(crate::asset_dispatch::Config {
+                state_directory: dispatch_state.path().join("jp"),
+                interval_seconds: 10,
+                request_timeout_ms: 1000,
+                history_capacity: 10,
+                targets: vec![crate::asset_dispatch::Target {
+                    user_agent: None,
+                    origin: "http://127.0.0.1:9".into(),
+                    token_env,
+                    allow_http: true,
+                    profile: "full".into(),
+                    profile_revision: "1".into(),
+                    require_full_catalog: true,
+                    require_full_export: true,
+                    require_publication: false,
+                }],
+            });
         }
         configs.insert(region.name().into(), c);
     }
@@ -2101,11 +2188,14 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         logging: None,
         tls: None,
         access_log: None,
+        http_compression: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         regions: configs,
     }));
     assert!(deployment.single().is_err());
-    let app = deployment.prepare().unwrap().router;
+    // Keep the prepared (not yet running) dispatch worker alive: its status is `pending`.
+    let prepared = deployment.prepare().unwrap();
+    let app = prepared.router.clone();
     async fn request(app: &axum::Router, path: &str, token: &str, method: &str) -> (u16, Value) {
         let response = app
             .clone()
@@ -2126,7 +2216,12 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
     }
-    assert_eq!(request(&app, "/health", "", "GET").await.0, 200);
+    let (status, health) = request(&app, "/health", "", "GET").await;
+    assert_eq!(status, 200);
+    assert_eq!(health["service"], "sirius-api-proxy");
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    let (_, again) = request(&app, "/health", "", "GET").await;
+    assert!(again["uptime_secs"].as_u64().unwrap() >= health["uptime_secs"].as_u64().unwrap());
     for region in [Region::Jp, Region::Hk, Region::En, Region::Kr] {
         let n = region.name();
         let (status, body) = request(
@@ -2227,6 +2322,22 @@ async fn regional_routes_isolate_authorization_protocol_reload_and_capabilities(
         assert_eq!(body["generation"], 1);
         assert_eq!(body["codec"], "native");
     }
+    let path = "/internal/v1/jp/asset-dispatch/status";
+    let (status, body) = request(&app, path, "internal-jp", "GET").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "pending");
+    for token in ["public-jp", "internal-hk"] {
+        assert_eq!(request(&app, path, token, "GET").await.0, 401);
+    }
+    let (status, _) = request(
+        &app,
+        "/internal/v1/hk/asset-dispatch/status",
+        "internal-hk",
+        "GET",
+    )
+    .await;
+    assert_eq!(status, 404);
+    drop(prepared);
 }
 
 fn pool_config() -> Config {
@@ -2519,6 +2630,892 @@ async fn pool_bootstrap_failure_and_caller_cancellation_do_not_poison_health() {
     gate.add_permits(1);
 }
 
+fn maintenance_reply(grpc_status: &str) -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes.clear();
+    reply
+        .trailers
+        .insert("grpc-status", grpc_status.parse().unwrap());
+    reply
+        .trailers
+        .insert("grpc-message", "secret%20must-not-leak".parse().unwrap());
+    reply
+        .trailers
+        .insert("x-sirius-error-code", "UNDER_MAINTENANCE".parse().unwrap());
+    reply
+}
+#[tokio::test]
+async fn maintenance_answers_503_with_a_code_and_never_penalizes_accounts() {
+    let f = fixture(vec![maintenance_reply("2")]).await;
+    let app = api::router(client(&f, config()), "api".into(), "internal".into());
+    let r = app
+        .oneshot(
+            Request::get("/api/v1/announcements")
+                .header("authorization", "Bearer api")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
+    let value = body(r).await;
+    assert_eq!(
+        value,
+        json!({"error":"game is under maintenance","code":"maintenance","grpc_status":2})
+    );
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+
+    // gRPC 14 with the maintenance code does not count toward the cooldown threshold.
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    cfg.account_pool.failure_threshold = 1;
+    cfg.account_pool.cooldown_seconds = 60;
+    let f = fixture(vec![
+        Reply::version(),
+        maintenance_reply("14"),
+        empty_profile_reply(),
+        unavailable_reply(),
+    ])
+    .await;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Maintenance(14))
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+        .unwrap();
+    // Plain gRPC 14 still cools the account down.
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["consecutive_failures"],
+        1
+    );
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::AccountUnavailable)
+    ));
+}
+/// A trailers-only JP error with an application code and a grpc-message that must not leak.
+fn application_error_reply(grpc_status: &str, code: &str) -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes.clear();
+    reply
+        .trailers
+        .insert("grpc-status", grpc_status.parse().unwrap());
+    reply
+        .trailers
+        .insert("grpc-message", "secret%20must-not-leak".parse().unwrap());
+    if !code.is_empty() {
+        reply
+            .trailers
+            .insert("x-sirius-error-code", code.parse().unwrap());
+    }
+    reply
+}
+fn strict_single_account_config() -> Config {
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    cfg.account_pool.failure_threshold = 1;
+    cfg.account_pool.cooldown_seconds = 60;
+    cfg
+}
+#[tokio::test]
+async fn jp_looked_up_player_not_found_answers_404_and_keeps_the_account() {
+    // Static evidence (iOS 1.0.3): FindByProfileID expects PLAYER_NOT_FOUND about the target,
+    // and the client reads application codes only on gRPC 2 or 7.
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+        application_error_reply("7", "PLAYER_NOT_FOUND"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, strict_single_account_config());
+    c.call(VERSION, json!({})).await.unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+                .await,
+            Err(AppError::NotFound)
+        ));
+        let status = c.account_status().unwrap();
+        assert_eq!(status["accounts"][0]["disabled"], false);
+        assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    }
+    // gRPC 7 with the code did not disable the account.
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+        .unwrap();
+
+    // Over HTTP: the plain 404 body, without the gRPC status or the upstream message.
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+    ])
+    .await;
+    let app = api::router(
+        client(&f, strict_single_account_config()),
+        "api".into(),
+        "internal".into(),
+    );
+    let r = app
+        .oneshot(
+            Request::get("/api/v1/players/by-profile-id/1")
+                .header("authorization", "Bearer api")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    assert!(!format!("{:?}", r.headers()).contains("must-not-leak"));
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&bytes).contains("must-not-leak"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"error":"not found","code":"not_found"})
+    );
+
+    // A JP peer executor answers the typed, terminal not_found kind.
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+    ])
+    .await;
+    let c = client(&f, strict_single_account_config());
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(
+        c.peer_identity().unwrap(),
+        json!({"type":"profile","profile_id":1}),
+    );
+    let response = peer_send(app, "peer", request).await;
+    assert_eq!(response.status(), 200);
+    let reply = body(response).await;
+    assert_eq!(
+        reply["outcome"],
+        json!({"status":"failure","kind":{"type":"not_found"}})
+    );
+    assert!(!reply.to_string().contains("must-not-leak"));
+}
+#[tokio::test]
+async fn jp_player_not_found_outside_the_proven_case_is_unchanged() {
+    let f = fixture(vec![
+        Reply::version(),
+        application_error_reply("5", "PLAYER_NOT_FOUND"),
+        application_error_reply("2", "PLAYER_NOT_EXISTS"),
+        application_error_reply("2", ""),
+        application_error_reply("2", "PLAYER_NOT_FOUND"),
+        application_error_reply("13", "PLAYER_NOT_FOUND"),
+    ])
+    .await;
+    let c = client(&f, strict_single_account_config());
+    c.call(VERSION, json!({})).await.unwrap();
+    let profile = || c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}));
+    assert!(matches!(profile().await, Err(AppError::Grpc(5))));
+    assert!(matches!(profile().await, Err(AppError::Grpc(2))));
+    assert!(matches!(profile().await, Err(AppError::Grpc(2))));
+    // JP event_deck: the client expects no application code there, so it stays 502.
+    assert!(matches!(
+        c.call(
+            crate::client::EVENT_DECK,
+            json!({"eventId":"1","playerId":"player-42"})
+        )
+        .await,
+        Err(AppError::Grpc(2))
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["disabled"], false);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    // Other statuses keep today's account handling.
+    assert!(matches!(profile().await, Err(AppError::Grpc(13))));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["consecutive_failures"],
+        1
+    );
+}
+#[test]
+fn target_not_found_is_region_route_status_and_code_specific() {
+    use crate::client::{target_not_found, EVENT_DECK, PLAYER_DATA, PROFILE, WHOAMI};
+    let grpc = |status| Err(AppError::Grpc(status));
+    let code = Some("PLAYER_NOT_FOUND");
+    for route in [PROFILE, EVENT_DECK] {
+        for status in [2, 5, 7] {
+            assert!(target_not_found(true, route, &grpc(status), code));
+        }
+    }
+    assert!(target_not_found(false, PROFILE, &grpc(2), code));
+    assert!(target_not_found(false, PROFILE, &grpc(7), code));
+    for status in [3, 5, 13, 14, 16] {
+        assert!(!target_not_found(false, PROFILE, &grpc(status), code));
+    }
+    assert!(!target_not_found(false, EVENT_DECK, &grpc(2), code));
+    for global in [true, false] {
+        for route in [PROFILE, EVENT_DECK, WHOAMI, PLAYER_DATA] {
+            for response in [
+                Err(AppError::Maintenance(2)),
+                Err(AppError::Timeout),
+                Ok(json!({})),
+            ] {
+                assert!(!target_not_found(global, route, &response, code));
+            }
+            for other in [None, Some("PLAYER_NOT_EXISTS")] {
+                assert!(!target_not_found(global, route, &grpc(2), other));
+            }
+        }
+        for route in [WHOAMI, PLAYER_DATA] {
+            assert!(!target_not_found(global, route, &grpc(2), code));
+        }
+    }
+}
+#[test]
+fn every_error_has_a_stable_code_and_json_body() {
+    use axum::response::IntoResponse;
+    let cases = [
+        (AppError::NotFound, 404, "not_found"),
+        (AppError::InvalidRequest, 400, "invalid_request"),
+        (AppError::AccountUnavailable, 503, "account_unavailable"),
+        (AppError::UpstreamUnavailable, 503, "upstream_unavailable"),
+        (AppError::Maintenance(2), 503, "maintenance"),
+        (AppError::Grpc(2), 502, "upstream_grpc"),
+        (AppError::Grpc(14), 503, "upstream_grpc"),
+        (AppError::Timeout, 504, "upstream_timeout"),
+        (AppError::Config("x"), 502, "invalid_configuration"),
+    ];
+    for (error, status, code) in cases {
+        let response = error.into_response();
+        assert_eq!(response.status(), status);
+        let bytes = futures::executor::block_on(response.into_body().collect())
+            .unwrap()
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["code"], code);
+        assert!(value["error"].is_string());
+        assert_eq!(
+            value.get("grpc_status").is_some(),
+            code.starts_with("upstream_grpc") || code == "maintenance"
+        );
+    }
+}
+#[test]
+fn peer_maintenance_round_trips_through_the_observation() {
+    let failure: crate::peer::Failure = AppError::Maintenance(2).into();
+    assert!(matches!(
+        failure,
+        crate::peer::Failure::Game { grpc_status: 2 }
+    ));
+    assert!(matches!(
+        crate::node_routing::failure_error(crate::peer::Failure::Game { grpc_status: 2 }, true),
+        AppError::Maintenance(2)
+    ));
+    assert!(matches!(
+        crate::node_routing::failure_error(crate::peer::Failure::Game { grpc_status: 2 }, false),
+        AppError::Grpc(2)
+    ));
+}
+#[test]
+fn node_health_reports_each_transition_once() {
+    let config = crate::node_routing::Config {
+        failure_threshold: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        crate::node_routing::test_transitions(&config, &[true, true, true, false, true, false]),
+        [
+            "None",
+            "CooldownStarted",
+            "ProbeFailed",
+            "Recovered",
+            "None",
+            "None"
+        ]
+    );
+}
+#[test]
+fn path_health_attributes_streaks_and_admits_one_probe_at_a_time() {
+    use crate::{
+        accounts::Charge,
+        path_health::{Outcome, PathHealth, Transition},
+    };
+    let policy = crate::accounts::PoolPolicy {
+        failure_threshold: 2,
+        cooldown_seconds: 60,
+    };
+    let fault = Outcome::Fault("upstream_timeout");
+    let path = PathHealth::new(&policy, true);
+    assert_eq!(path.interval(), Duration::from_secs(5));
+    // Faults seen by one account alone stay that account's.
+    for _ in 0..3 {
+        let change = path.record(Some("a"), fault);
+        assert_eq!(change.transition, Transition::None);
+        assert!(change.attributed.is_none());
+    }
+    assert_eq!(path.charge(), Charge::Account { streak: Some(1) });
+    assert_eq!(path.status()["state"], "closed");
+    assert!(path.admit().is_some());
+    // A second account attributes the streak to the path, which opens at the threshold.
+    let change = path.record(Some("b"), fault);
+    assert_eq!(change.transition, Transition::Opened);
+    assert_eq!(change.attributed, Some(1));
+    assert!(path.attributed(1));
+    assert_eq!(path.charge(), Charge::Path);
+    assert_eq!(path.status()["state"], "open");
+    assert!(path.status()["cooldown_remaining_ms"].as_u64().unwrap() > 4000);
+    assert!(path.admit().is_none());
+    // Exactly one probe once the interval has passed; its failure restarts the interval.
+    path.expire_for_test();
+    let probe = path.admit().expect("probe");
+    assert!(path.admit().is_none());
+    assert_eq!(path.status()["state"], "probing");
+    assert_eq!(path.record(None, fault).transition, Transition::ProbeFailed);
+    drop(probe);
+    assert!(path.admit().is_none());
+    // A probe dropped without an outcome releases its slot.
+    path.expire_for_test();
+    drop(path.admit().expect("probe"));
+    let probe = path.admit().expect("probe after release");
+    assert_eq!(
+        path.record(Some("a"), Outcome::Healthy).transition,
+        Transition::Recovered
+    );
+    drop(probe);
+    assert_eq!(
+        path.status(),
+        json!({"state":"closed","failures":0,"attributed":false,"cooldown_remaining_ms":0})
+    );
+    assert_eq!(path.charge(), Charge::Account { streak: None });
+    // The next streak has a new number; an anonymous fault attributes it at once.
+    let change = path.record(None, fault);
+    assert_eq!(change.transition, Transition::None);
+    assert_eq!(change.attributed, Some(2));
+    assert!(!path.attributed(1) && path.attributed(2));
+    assert_eq!(path.record(Some("a"), fault).transition, Transition::Opened);
+    // A fault while open without a probe only extends the interval.
+    assert_eq!(path.record(Some("a"), fault).transition, Transition::None);
+    // The SDK path attributes every fault, whatever its source.
+    let sdk = PathHealth::new(
+        &crate::accounts::PoolPolicy {
+            failure_threshold: 2,
+            cooldown_seconds: 1,
+        },
+        false,
+    );
+    assert_eq!(sdk.interval(), Duration::from_secs(1));
+    assert_eq!(sdk.record(Some("a"), fault).attributed, Some(1));
+    assert_eq!(sdk.record(Some("a"), fault).transition, Transition::Opened);
+}
+#[test]
+fn account_path_charges_are_withdrawn_only_for_their_streak() {
+    use crate::accounts::{Charge, PoolPolicy};
+    let policy = PoolPolicy {
+        failure_threshold: 2,
+        cooldown_seconds: 60,
+    };
+    let mut pool = crate::accounts::Pool::load(&pool_config(), 1).unwrap();
+    let lease = pool.select(Some("one"), false).unwrap();
+    let report = |error: AppError, charge: Charge| {
+        lease.report(&Err(error), None, &policy, None, charge);
+    };
+    let one = |pool: &crate::accounts::Pool| {
+        let status = serde_json::to_value(pool.status()).unwrap()[0].clone();
+        (
+            status["consecutive_failures"].as_u64().unwrap(),
+            status["cooldown_remaining_seconds"].as_u64().unwrap() > 0,
+            status["disabled"].as_bool().unwrap(),
+        )
+    };
+    // gRPC 13 is always the account's; the timeout belongs to path streak 1.
+    report(AppError::Grpc(13), Charge::Account { streak: Some(1) });
+    report(AppError::Timeout, Charge::Account { streak: Some(1) });
+    assert_eq!(one(&pool), (2, true, false));
+    pool.revoke_path_failures(2, &policy);
+    assert_eq!(one(&pool), (2, true, false));
+    pool.revoke_path_failures(1, &policy);
+    assert_eq!(one(&pool), (1, false, false));
+    assert!(lease.account.available());
+    // Nothing is charged while the path pays; charges outside a streak are never withdrawn.
+    report(AppError::Transport, Charge::Path);
+    assert_eq!(one(&pool), (1, false, false));
+    report(AppError::Protocol, Charge::Account { streak: None });
+    pool.revoke_path_failures(1, &policy);
+    assert_eq!(one(&pool), (2, true, false));
+    // Signal cooldowns and disabling are never lifted.
+    lease.report(&Ok(json!({})), None, &policy, None, Charge::Path);
+    assert_eq!(one(&pool), (0, false, false));
+    lease
+        .account
+        .cool_down(std::time::Instant::now() + Duration::from_secs(60));
+    report(AppError::Grpc(14), Charge::Account { streak: Some(3) });
+    pool.revoke_path_failures(3, &policy);
+    assert_eq!(one(&pool), (0, true, false));
+    report(AppError::Grpc(16), Charge::Account { streak: Some(3) });
+    report(AppError::Timeout, Charge::Account { streak: Some(3) });
+    pool.revoke_path_failures(3, &policy);
+    assert_eq!(one(&pool), (1, true, true));
+}
+/// An application log file subscriber made the thread default for the returned guard.
+fn capture_application_log(
+    path: &std::path::Path,
+) -> (
+    tracing::subscriber::DefaultGuard,
+    tracing_appender::non_blocking::WorkerGuard,
+    tracing::Dispatch,
+) {
+    let config = crate::application_log::Config {
+        level: crate::application_log::Level::Info,
+        format: crate::access_log::Format::Json,
+        output: crate::access_log::Output::File {
+            path: path.to_path_buf(),
+            rotation: crate::access_log::Rotation::Never,
+            max_files: 1,
+        },
+        queue_capacity: 128,
+    };
+    let (subscriber, guard) = config.subscriber().unwrap();
+    // A second live dispatcher keeps callsite interest from being cached by parallel tests.
+    let second = tracing::Dispatch::new(tracing_subscriber::registry());
+    (tracing::subscriber::set_default(subscriber), guard, second)
+}
+#[tokio::test]
+async fn path_faults_from_two_accounts_open_the_path_and_leave_accounts_healthy() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("application.log");
+    let (default, guard, second) = capture_application_log(&log);
+    let mut cfg = pool_config();
+    cfg.account_pool.failure_threshold = 2;
+    cfg.account_pool.cooldown_seconds = 1;
+    let mut slow = empty_profile_reply();
+    slow.delay = Duration::from_millis(500);
+    let f = fixture(vec![
+        Reply::version(),
+        slow.clone(),
+        slow,
+        empty_profile_reply(),
+    ])
+    .await;
+    let mut c = client(&f, cfg);
+    GameClient::set_test_timeout(&mut c, Duration::from_millis(100));
+    c.call(VERSION, json!({})).await.unwrap();
+    let profile = || c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}));
+    assert!(matches!(profile().await, Err(AppError::Timeout)));
+    // A single account's timeout is still charged to it.
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 1);
+    assert_eq!(status["path"]["state"], "closed");
+    assert_eq!(status["path"]["attributed"], false);
+    assert!(matches!(profile().await, Err(AppError::Timeout)));
+    // The second account's timeout makes it the path's: both accounts stay healthy.
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["consecutive_failures"], 0);
+        assert_eq!(account["cooldown_remaining_seconds"], 0);
+    }
+    assert_eq!(status["path"]["state"], "open");
+    assert_eq!(status["path"]["failures"], 2);
+    assert_eq!(status["path"]["attributed"], true);
+    assert!(status.get("sdk_path").is_none());
+    // New calls are refused before any upstream contact.
+    assert!(matches!(
+        profile().await,
+        Err(AppError::UpstreamUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    let app = api::router(c.clone(), "api".into(), "internal".into());
+    let get = |path: &'static str, token: &'static str| {
+        app.clone().oneshot(
+            Request::get(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+    };
+    let response = get("/api/v1/system", "api").await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        body(response).await,
+        json!({"error":"game upstream is temporarily unreachable","code":"upstream_unavailable"})
+    );
+    let response = get("/internal/v1/accounts", "internal").await.unwrap();
+    assert_eq!(response.status(), 200);
+    let accounts = body(response).await;
+    let path = accounts["path"].as_object().unwrap();
+    assert_eq!(
+        path.keys().collect::<Vec<_>>(),
+        ["attributed", "cooldown_remaining_ms", "failures", "state"]
+    );
+    assert!(!accounts.to_string().contains("player-"));
+    assert!(!accounts.to_string().contains("secret-"));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    // After the probe interval one call goes out; its answer closes the path.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    profile().await.unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "closed");
+    drop((default, second));
+    drop(guard);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let opened = rows
+        .iter()
+        .find(|row| row["fields"]["event"] == "upstream_path_opened")
+        .expect("opened event");
+    assert_eq!(opened["level"], "WARN");
+    assert_eq!(opened["fields"]["region"], "jp");
+    assert_eq!(opened["fields"]["error_code"], "upstream_timeout");
+    assert_eq!(opened["fields"]["cooldown_ms"], 1000);
+    assert!(rows
+        .iter()
+        .any(|row| row["fields"]["event"] == "upstream_path_recovered"));
+    assert!(!text.contains("\"one\"") && !text.contains("\"two\""));
+    assert!(!text.contains("player-") && !text.contains("secret-"));
+}
+fn grpc_reply(status: &str) -> Reply {
+    let mut reply = empty_profile_reply();
+    reply
+        .trailers
+        .insert("grpc-status", status.parse().unwrap());
+    reply
+}
+fn protocol_failure_reply() -> Reply {
+    let mut reply = Reply::version();
+    reply.http_status = 502;
+    reply
+}
+#[tokio::test]
+async fn single_account_path_faults_cool_only_that_account() {
+    let mut cfg = pool_config();
+    cfg.account_pool.cooldown_seconds = 60;
+    let f = fixture(vec![
+        Reply::version(),
+        grpc_reply("14"),
+        empty_profile_reply(),
+        grpc_reply("14"),
+    ])
+    .await;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    for expected in [Err(AppError::Grpc(14)), Ok(()), Err(AppError::Grpc(14))] {
+        let result = c
+            .call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await
+            .map(|_| ());
+        assert_eq!(format!("{result:?}"), format!("{expected:?}"));
+    }
+    let status = c.account_status().unwrap();
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen[1].1["x-player-id"], "player-one");
+    assert_eq!(seen[2].1["x-player-id"], "player-two");
+    assert_eq!(seen[3].1["x-player-id"], "player-one");
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 2);
+    assert!(
+        status["accounts"][0]["cooldown_remaining_seconds"]
+            .as_u64()
+            .unwrap()
+            > 50
+    );
+    assert_eq!(status["accounts"][1]["consecutive_failures"], 0);
+    assert_eq!(status["path"]["state"], "closed");
+    assert_eq!(status["path"]["failures"], 1);
+}
+#[tokio::test]
+async fn grpc_8_and_13_stay_account_faults_and_never_open_the_path() {
+    let mut cfg = pool_config();
+    cfg.account_pool.failure_threshold = 1;
+    let f = fixture(vec![Reply::version(), grpc_reply("13"), grpc_reply("8")]).await;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    for status in [13, 8] {
+        let result = c
+            .call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await;
+        assert!(matches!(result, Err(AppError::Grpc(s)) if s == status));
+    }
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["consecutive_failures"], 1);
+        assert!(account["cooldown_remaining_seconds"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(status["path"]["state"], "closed");
+    assert_eq!(status["path"]["failures"], 0);
+}
+#[tokio::test]
+async fn anonymous_path_faults_open_the_path_without_touching_accounts() {
+    let f = fixture(vec![protocol_failure_reply(), protocol_failure_reply()]).await;
+    let c = client(&f, pool_config());
+    for _ in 0..2 {
+        assert!(matches!(
+            c.call(VERSION, json!({})).await,
+            Err(AppError::Protocol)
+        ));
+    }
+    let status = c.account_status().unwrap();
+    assert_eq!(status["path"]["state"], "open");
+    // The bootstrap Version of an authenticated call is refused before contact.
+    assert!(matches!(
+        c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await,
+        Err(AppError::UpstreamUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["consecutive_failures"], 0);
+        assert_eq!(account["active_calls"], 0);
+    }
+}
+#[tokio::test]
+async fn application_codes_on_grpc_14_are_answers_not_path_faults() {
+    let f = fixture(vec![
+        unavailable_reply(),
+        unavailable_reply().header("x-sirius-error-code", "AEGIS_SERVER_FULL"),
+        unavailable_reply(),
+        maintenance_reply("14"),
+    ])
+    .await;
+    let c = client(&f, config());
+    let path = || c.account_status().unwrap()["path"].clone();
+    assert!(c.call(VERSION, json!({})).await.is_err());
+    assert_eq!(path()["failures"], 1);
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(path()["failures"], 0);
+    assert!(c.call(VERSION, json!({})).await.is_err());
+    assert_eq!(path()["failures"], 1);
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Maintenance(14))
+    ));
+    assert_eq!(path()["failures"], 0);
+    assert_eq!(path()["state"], "closed");
+}
+#[tokio::test]
+async fn cancelled_calls_and_queue_timeouts_record_no_path_fault() {
+    // A probe cancelled before its deadline records nothing and releases the probe slot.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = Reply::version();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![
+        protocol_failure_reply(),
+        protocol_failure_reply(),
+        blocked,
+        Reply::version(),
+    ])
+    .await;
+    let c = client(&f, config());
+    for _ in 0..2 {
+        assert!(c.call(VERSION, json!({})).await.is_err());
+    }
+    c.test_path(false).expire_for_test();
+    let a = c.clone();
+    let probe = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+    wait_for_requests(&f, 3).await;
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "probing");
+    probe.abort();
+    assert!(probe.await.unwrap_err().is_cancelled());
+    let path = c.account_status().unwrap()["path"].clone();
+    assert_eq!(
+        (path["state"].as_str(), path["failures"].as_u64()),
+        (Some("open"), Some(2))
+    );
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "closed");
+    gate.add_permits(1);
+
+    // A call that waits for the account's session lock until its (routed) deadline never
+    // reached the upstream: it is not a path fault.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![Reply::version(), blocked]).await;
+    let mut cfg = account_config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        timeout_ms: 200,
+        ..Default::default()
+    });
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    let a = c.clone();
+    let first = tokio::spawn(async move {
+        a.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+            .await
+    });
+    wait_for_requests(&f, 2).await;
+    assert!(matches!(
+        c.public_call(crate::peer::Operation::Profile { profile_id: 2 })
+            .await,
+        Err(AppError::Timeout)
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["path"]["failures"], 0);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    gate.add_permits(1);
+    first.await.unwrap().unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn cache_hits_are_served_while_the_path_is_open() {
+    let f = fixture(vec![
+        announcements_reply(),
+        protocol_failure_reply(),
+        protocol_failure_reply(),
+    ])
+    .await;
+    let mut cfg = config();
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    let cached = c
+        .call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(c.call(VERSION, json!({})).await.is_err());
+    }
+    assert_eq!(c.account_status().unwrap()["path"]["state"], "open");
+    assert_eq!(
+        c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+            .await
+            .unwrap(),
+        cached
+    );
+    assert!(matches!(
+        c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":1}))
+            .await,
+        Err(AppError::UpstreamUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+#[tokio::test]
+async fn open_path_answers_peers_unavailable_before_dispatch_and_routing_fails_over() {
+    assert!(matches!(
+        crate::peer::Failure::from(AppError::UpstreamUnavailable),
+        crate::peer::Failure::UnavailableBeforeDispatch {}
+    ));
+    let f = fixture(vec![protocol_failure_reply(), protocol_failure_reply()]).await;
+    let c = client(&f, config());
+    for _ in 0..2 {
+        assert!(c.call(VERSION, json!({})).await.is_err());
+    }
+    let sha = c.protocol_status().unwrap().sha256;
+    assert!(matches!(
+        c.call_peer(VERSION, json!({}), &sha).await,
+        Err(AppError::PeerAccountUnavailable)
+    ));
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(c.peer_identity().unwrap(), json!({"type":"version"}));
+    let reply = body(peer_send(app, "peer", request).await).await;
+    assert_eq!(
+        reply["outcome"],
+        json!({"status":"failure","kind":{"type":"unavailable_before_dispatch"}})
+    );
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+
+    // A router whose local path is open fails an authenticated read over to the remote.
+    let upstream = fixture(vec![Reply::version(), empty_profile_reply()]).await;
+    let remote = client(&upstream, account_config());
+    let (url, server) = peer_http_server(crate::peer::router(
+        remote,
+        "/internal/v1/peer",
+        "node-secret".into(),
+    ))
+    .await;
+    let local = fixture(vec![protocol_failure_reply(), protocol_failure_reply()]).await;
+    let mut cfg = account_config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        targets: vec![routing_target("remote", url, 10)],
+        ..Default::default()
+    });
+    let front = client(&local, cfg);
+    for _ in 0..2 {
+        assert!(front.call(VERSION, json!({})).await.is_err());
+    }
+    assert!(front
+        .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+        .await
+        .is_ok());
+    assert_eq!(local.received.lock().unwrap().len(), 2);
+    assert_eq!(upstream.received.lock().unwrap().len(), 2);
+    assert_eq!(
+        front.account_status().unwrap()["accounts"][0]["consecutive_failures"],
+        0
+    );
+    server.abort();
+}
+#[tokio::test]
+async fn framework_client_errors_are_json_without_echoing_input() {
+    let f = fixture(vec![]).await;
+    let app = crate::error::json_client_errors(api::router(
+        client(&f, config()),
+        "api".into(),
+        "internal".into(),
+    ));
+    let send = |request: Request<axum::body::Body>| app.clone().oneshot(request);
+    let r = send(
+        Request::get("/api/v1/no-such-route")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 404);
+    assert_eq!(
+        body(r).await,
+        json!({"error":"not found","code":"not_found"})
+    );
+    let r = send(
+        Request::post("/api/v1/system")
+            .header("authorization", "Bearer api")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 405);
+    assert!(r.headers().contains_key("allow"));
+    assert_eq!(body(r).await["code"], "method_not_allowed");
+    let r = send(
+        Request::get("/api/v1/announcements?tab=secret-echo")
+            .header("authorization", "Bearer api")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 400);
+    let value = body(r).await;
+    assert_eq!(
+        value,
+        json!({"error":"invalid request","code":"invalid_request"})
+    );
+    // Handler errors are already JSON and pass through unchanged.
+    let r = send(
+        Request::get("/api/v1/system")
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 401);
+    assert_eq!(body(r).await["code"], "unauthorized");
+}
+fn announcements_reply() -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes = framed(message("app.announcement.GetListResponse", json!({})));
+    reply
+}
 fn unavailable_reply() -> Reply {
     let mut reply = Reply::version();
     reply.trailers.insert("grpc-status", "14".parse().unwrap());
@@ -2589,7 +3586,7 @@ async fn retry_policy_never_replays_maintenance_or_authenticated_calls() {
     cfg.upstream.anonymous_attempts = 5;
     assert!(matches!(
         client(&f, cfg).call(VERSION, json!({})).await,
-        Err(AppError::Grpc(14))
+        Err(AppError::Maintenance(14))
     ));
     assert_eq!(f.received.lock().unwrap().len(), 1);
     let f = fixture(vec![Reply::version(), unavailable_reply()]).await;
@@ -2609,7 +3606,8 @@ async fn inflight_limit_queues_calls_inside_their_deadline_and_returns_permits()
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let mut first_reply = Reply::version();
     first_reply.gate = Some(gate.clone());
-    let mut slow = Reply::version();
+    // A different key: identical concurrent Version calls would share one execution instead.
+    let mut slow = announcements_reply();
     slow.delay = Duration::from_millis(400);
     let f = fixture(vec![first_reply, slow, Reply::version()]).await;
     let mut cfg = config();
@@ -2621,7 +3619,10 @@ async fn inflight_limit_queues_calls_inside_their_deadline_and_returns_permits()
     let first = tokio::spawn(async move { a.call(VERSION, json!({})).await });
     wait_for_requests(&f, 1).await;
     let a = c.clone();
-    let second = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+    let second = tokio::spawn(async move {
+        a.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+            .await
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(f.received.lock().unwrap().len(), 1);
     gate.add_permits(1);
@@ -2637,6 +3638,328 @@ async fn inflight_limit_queues_calls_inside_their_deadline_and_returns_permits()
     assert!(budget < 250); // queue time was not reset before sending
     c.call(VERSION, json!({})).await.unwrap();
     assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn single_flight_shares_one_execution_and_its_errors() {
+    use crate::single_flight::SingleFlight;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for outcome in [Ok(7), Err(AppError::Grpc(14))] {
+        let flight = Arc::new(SingleFlight::<Result<u32, AppError>>::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let tasks = (0..20)
+            .map(|_| {
+                let (flight, runs, gate) = (flight.clone(), runs.clone(), gate.clone());
+                let outcome = outcome.clone();
+                tokio::spawn(async move {
+                    flight
+                        .run([1; 32], deadline, Err(AppError::Timeout), || async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            gate.acquire().await.unwrap().forget();
+                            outcome
+                        })
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(flight.len(), 1);
+        gate.add_permits(1);
+        for task in tasks {
+            match (task.await.unwrap(), &outcome) {
+                (Ok(value), Ok(expected)) => assert_eq!(value, *expected),
+                (Err(AppError::Grpc(14)), Err(_)) => {}
+                (other, _) => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(flight.len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn single_flight_hands_over_on_cancellation_and_bounds_joined_waits() {
+    use crate::single_flight::SingleFlight;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let flight = Arc::new(SingleFlight::<Result<u32, AppError>>::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let spawn = |gate: Option<Arc<tokio::sync::Semaphore>>, value: u32| {
+        let (flight, runs) = (flight.clone(), runs.clone());
+        tokio::spawn(async move {
+            flight
+                .run([2; 32], deadline, Err(AppError::Timeout), || async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    if let Some(gate) = gate {
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    Ok(value)
+                })
+                .await
+        })
+    };
+    let wait_runs = |count: usize| {
+        let runs = runs.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while runs.load(Ordering::SeqCst) < count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let never = Arc::new(tokio::sync::Semaphore::new(0));
+    let leader = spawn(Some(never.clone()), 1);
+    wait_runs(1).await;
+    let follower_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let follower = spawn(Some(follower_gate.clone()), 2);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
+    // One joined caller runs its own call; it is not registered, so a newcomer starts afresh.
+    wait_runs(2).await;
+    assert_eq!(flight.len(), 0);
+    assert_eq!(spawn(None, 3).await.unwrap().unwrap(), 3);
+    follower_gate.add_permits(1);
+    assert_eq!(follower.await.unwrap().unwrap(), 2);
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    assert_eq!(flight.len(), 0);
+
+    // A joined caller stops at its own deadline; the running call still completes.
+    let flight = SingleFlight::<Result<u32, AppError>>::new();
+    let leader = flight.run(
+        [3; 32],
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Err(AppError::Timeout),
+        || async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(1)
+        },
+    );
+    let started = tokio::time::Instant::now();
+    let follower = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        flight
+            .run(
+                [3; 32],
+                started + Duration::from_millis(60),
+                Err(AppError::Timeout),
+                || async { Ok(2) },
+            )
+            .await
+    };
+    let (leader, follower) = tokio::join!(leader, follower);
+    assert_eq!(leader.unwrap(), 1);
+    assert!(matches!(follower, Err(AppError::Timeout)));
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(flight.len(), 0);
+    // A completed outcome is never handed to a later caller.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let fetch = |value| move || async move { Ok(value) };
+    assert_eq!(
+        flight
+            .run([3; 32], deadline, Err(AppError::Timeout), fetch(4))
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        flight
+            .run([3; 32], deadline, Err(AppError::Timeout), fetch(5))
+            .await
+            .unwrap(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn identical_anonymous_reads_share_one_rpc_without_response_cache() {
+    // Success and failure are both shared; the cache is disabled (the default).
+    for failed in [false, true] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut reply = if failed {
+            unavailable_reply()
+        } else {
+            Reply::version()
+        };
+        reply.gate = Some(gate.clone());
+        let f = fixture(vec![reply]).await;
+        let cfg = config();
+        assert!(matches!(
+            cfg.response_cache,
+            crate::response_cache::Config::Disabled
+        ));
+        let c = client(&f, cfg);
+        let calls = (0..20)
+            .map(|n| {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    if n % 2 == 0 {
+                        c.call(VERSION, json!({})).await
+                    } else {
+                        c.public_call(crate::peer::Operation::Version {}).await
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        wait_for_requests(&f, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.add_permits(1);
+        for call in calls {
+            match call.await.unwrap() {
+                Ok(value) if !failed => assert_eq!(value["version"], "master-fixture"),
+                Err(AppError::Grpc(14)) if failed => {}
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!(f.received.lock().unwrap().len(), 1);
+        let observation = c.observation().await;
+        assert_eq!(observation.grpc_status, Some(if failed { 14 } else { 0 }));
+    }
+}
+
+#[tokio::test]
+async fn ranking_coalescing_is_opt_in_and_private_routes_never_coalesce() {
+    use crate::client::{MUSIC_RANKING, PROFILE, WHOAMI};
+    for coalesce in [false, true] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut replies = vec![Reply::version()];
+        for _ in 0..2 {
+            let mut reply = ranking_reply(1);
+            reply.gate = Some(gate.clone());
+            replies.push(reply);
+        }
+        let f = fixture(replies).await;
+        let mut cfg = account_config();
+        cfg.session_lock = false;
+        cfg.upstream.coalesce_public_reads = coalesce;
+        let c = client(&f, cfg);
+        c.call(VERSION, json!({})).await.unwrap();
+        let calls = (0..2)
+            .map(|_| {
+                let c = c.clone();
+                tokio::spawn(async move { c.call(MUSIC_RANKING, json!({"musicId":"1"})).await })
+            })
+            .collect::<Vec<_>>();
+        wait_for_requests(&f, if coalesce { 2 } else { 3 }).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            f.received.lock().unwrap().len(),
+            if coalesce { 2 } else { 3 }
+        );
+        gate.add_permits(2);
+        for call in calls {
+            let value = call.await.unwrap().unwrap();
+            assert_eq!(value["players"][0]["score"], 1);
+            // A shared ranking never carries the account-relative fields.
+            assert_eq!(value.get("myRank").is_none(), coalesce);
+        }
+    }
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut replies = vec![Reply::version()];
+    for _ in 0..2 {
+        let mut reply = empty_profile_reply();
+        reply.gate = Some(gate.clone());
+        replies.push(reply);
+    }
+    for _ in 0..2 {
+        let mut reply = whoami_reply("ranking-account");
+        reply.gate = Some(gate.clone());
+        replies.push(reply);
+    }
+    let f = fixture(replies).await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.coalesce_public_reads = true;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        let a = c.clone();
+        calls.push(tokio::spawn(async move {
+            a.call(PROFILE, json!({"playerProfileId":"1"})).await
+        }));
+    }
+    wait_for_requests(&f, 3).await;
+    for _ in 0..2 {
+        let a = c.clone();
+        calls.push(tokio::spawn(async move {
+            a.call_account("default", WHOAMI).await
+        }));
+    }
+    wait_for_requests(&f, 5).await;
+    gate.add_permits(4);
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    assert_eq!(f.received.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn anonymous_slots_let_a_slow_version_overlap_other_anonymous_reads() {
+    use crate::client::ANNOUNCEMENTS;
+    for (session_lock, slots, overlaps) in [
+        (true, None, true),
+        (true, Some(1), false),
+        // Without session_lock only max_inflight bounds anonymous calls, as before.
+        (false, Some(1), true),
+    ] {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut version = Reply::version();
+        version.gate = Some(gate.clone());
+        let f = fixture(vec![version, announcements_reply()]).await;
+        let mut cfg = config();
+        cfg.session_lock = session_lock;
+        cfg.upstream.anonymous_max_inflight = slots;
+        let c = client(&f, cfg);
+        let a = c.clone();
+        let slow = tokio::spawn(async move { a.call(VERSION, json!({})).await });
+        wait_for_requests(&f, 1).await;
+        let a = c.clone();
+        let list =
+            tokio::spawn(async move { a.call(ANNOUNCEMENTS, json!({"selectedTab":0})).await });
+        if overlaps {
+            tokio::time::timeout(Duration::from_secs(2), list)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!slow.is_finished());
+            gate.add_permits(1);
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(f.received.lock().unwrap().len(), 1);
+            gate.add_permits(1);
+            list.await.unwrap().unwrap();
+        }
+        slow.await.unwrap().unwrap();
+        assert_eq!(f.received.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn flight_key_covers_protocol_generation_and_asserted_protocol() {
+    let directory = copy_protocol_bundle();
+    let mut cfg = config();
+    cfg.protocol_directory = directory.path().into();
+    let c = GameClient::for_test(cfg);
+    let sha = c.protocol_status().unwrap().sha256;
+    let before = c.test_flight_key(VERSION, None);
+    assert_eq!(before, c.test_flight_key(VERSION, None));
+    assert_ne!(before, c.test_flight_key(VERSION, Some(&sha)));
+    assert_ne!(before, c.test_flight_key(ANNOUNCEMENT, None));
+    edit_version_proto(
+        directory.path(),
+        "string version = 1;",
+        "string version = 1;\n  string extra = 2;",
+    );
+    assert_eq!(c.reload_protocol().await.unwrap().generation, 2);
+    assert_ne!(before, c.test_flight_key(VERSION, None));
 }
 
 #[tokio::test]
@@ -2674,12 +3997,75 @@ fn upstream_policy_defaults_and_bounds_are_validated() {
         "max_inflight",
         "anonymous_attempts",
         "retry_delay_ms",
+        "anonymous_max_inflight",
+        "http2_keepalive_timeout_ms",
     ] {
         let input = format!("{field}: 0");
         let policy: crate::config::UpstreamConfig = yaml_serde::from_str(&input).unwrap();
         assert!(policy.validate().is_err(), "{field}");
     }
     assert!(yaml_serde::from_str::<crate::config::UpstreamConfig>("ignored_option: true").is_err());
+    assert_eq!(c.upstream.anonymous_max_inflight, None);
+    assert!(!c.upstream.coalesce_public_reads);
+    assert_eq!(c.upstream.anonymous_slots(), 4);
+    let parse = |input: &str| yaml_serde::from_str::<crate::config::UpstreamConfig>(input).unwrap();
+    for rejected in [
+        "anonymous_max_inflight: 65",
+        "anonymous_max_inflight: 65\nmax_inflight: 128",
+        "anonymous_max_inflight: 3\nmax_inflight: 2",
+    ] {
+        assert!(parse(rejected).validate().is_err(), "{rejected}");
+    }
+    // Omitted, the slot count follows a smaller max_inflight instead of failing validation.
+    let small = parse("max_inflight: 1");
+    assert!(small.validate().is_ok());
+    assert_eq!(small.anonymous_slots(), 1);
+    let serialized = parse("anonymous_max_inflight: 1\ncoalesce_public_reads: true");
+    assert!(serialized.validate().is_ok());
+    assert_eq!(serialized.anonymous_slots(), 1);
+    assert!(serialized.coalesce_public_reads);
+    assert_eq!(parse("anonymous_max_inflight: 64").anonymous_slots(), 64);
+    // HTTP/2 keepalive: derived from timeout_ms, off below a 1 s acknowledgement unless set.
+    let seconds = |a: u64, b: u64| Some((Duration::from_secs(a), Duration::from_secs(b)));
+    assert_eq!(c.upstream.http2_keepalive(), seconds(10, 5));
+    assert_eq!(c.upstream.http2_keepalive_interval_ms, None);
+    assert_eq!(c.upstream.http2_keepalive_timeout_ms, None);
+    let tight = parse("timeout_ms: 3000");
+    assert!(tight.validate().is_ok());
+    assert_eq!(tight.http2_keepalive(), None);
+    assert_eq!(parse("timeout_ms: 8000").http2_keepalive(), seconds(4, 2));
+    assert_eq!(
+        parse("timeout_ms: 300000").http2_keepalive(),
+        seconds(10, 5)
+    );
+    for rejected in [
+        "http2_keepalive_interval_ms: 999",
+        "http2_keepalive_interval_ms: 300001",
+        "http2_keepalive_timeout_ms: 999",
+        "http2_keepalive_timeout_ms: 60001",
+        "http2_keepalive_interval_ms: 10000\ntimeout_ms: 12000",
+        "http2_keepalive_timeout_ms: 1000\ntimeout_ms: 2000",
+        "http2_keepalive_interval_ms: 0\nhttp2_keepalive_timeout_ms: 2000",
+        "http2_keepalive_interval_ms: 300000\ntimeout_ms: 300000",
+    ] {
+        assert!(parse(rejected).validate().is_err(), "{rejected}");
+    }
+    for (accepted, expected) in [
+        ("http2_keepalive_interval_ms: 0", None),
+        ("http2_keepalive_interval_ms: 0\ntimeout_ms: 100", None),
+        (
+            "http2_keepalive_interval_ms: 5000\nhttp2_keepalive_timeout_ms: 2000",
+            seconds(5, 2),
+        ),
+        (
+            "http2_keepalive_interval_ms: 1000\nhttp2_keepalive_timeout_ms: 1000\ntimeout_ms: 2001",
+            seconds(1, 1),
+        ),
+    ] {
+        let policy = parse(accepted);
+        assert!(policy.validate().is_ok(), "{accepted}");
+        assert_eq!(policy.http2_keepalive(), expected, "{accepted}");
+    }
 }
 
 fn memory_cache(ttl_ms: u64) -> crate::response_cache::Config {
@@ -2887,6 +4273,18 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
         .await
         .unwrap();
     assert!(c.get("oversized").await.is_none());
+    // Probing several scopes skips the oversized value and spans more than one pipeline.
+    c.put("any-last".into(), &json!({"value":44})).await;
+    let keys = ["oversized", "any-1", "any-2", "any-3", "any-4", "any-last"].map(String::from);
+    let found = c.get_any_with_state(&keys).await.unwrap();
+    assert_eq!(found.value["value"], 44);
+    assert!(!found.stale);
+    let pair = ["oversized".to_string(), "any-last".to_string()];
+    assert_eq!(
+        c.get_any_with_state(&pair).await.unwrap().value["value"],
+        44
+    );
+    assert!(c.get_any_with_state(&keys[..5]).await.is_none());
     tokio::time::sleep(Duration::from_millis(120)).await;
     assert!(c.get("safe").await.is_none());
     assert_eq!(c.get("override").await.unwrap()["value"], 43);
@@ -2963,6 +4361,7 @@ async fn redis_response_cache_bounds_reads_expires_and_fails_open_on_outage() {
     server.0.wait().unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         assert!(c.get("outage").await.is_none());
+        assert!(c.get_any_with_state(&keys).await.is_none());
         c.put("outage".into(), &json!({"value":1})).await;
     })
     .await
@@ -3077,6 +4476,365 @@ async fn concurrent_cache_misses_coalesce_and_cancelled_fill_releases_waiters() 
 }
 
 #[test]
+fn pool_peek_matches_select_without_rotating_or_counting() {
+    let mut pool = crate::accounts::Pool::load(&pool_config(), 1).unwrap();
+    let names = |accounts: Vec<Arc<crate::accounts::Account>>| {
+        accounts.iter().map(|a| a.name.clone()).collect::<Vec<_>>()
+    };
+    let active = |pool: &crate::accounts::Pool| {
+        serde_json::to_value(pool.status()).unwrap()[0]["active_calls"]
+            .as_u64()
+            .unwrap()
+    };
+    for _ in 0..2 {
+        assert_eq!(pool.peek_public().unwrap().name, "one");
+    }
+    assert_eq!(active(&pool), 0);
+    assert_eq!(names(pool.rotation()), ["one", "two"]);
+    let first = pool.select(None, false).unwrap();
+    assert_eq!(first.account.name, "one");
+    assert_eq!(active(&pool), 1);
+    // The next lease rotates to the idle account; peek agrees and still leases nothing.
+    assert_eq!(pool.peek_public().unwrap().name, "two");
+    assert_eq!(names(pool.rotation()), ["two", "one"]);
+    let second = pool.select(None, false).unwrap();
+    assert_eq!(second.account.name, "two");
+    drop(second);
+    // Fewest active calls wins over rotation order.
+    assert_eq!(pool.peek_public().unwrap().name, "two");
+    assert_eq!(pool.select(None, false).unwrap().account.name, "two");
+    drop(first);
+    pool.find("two")
+        .unwrap()
+        .cool_down(std::time::Instant::now() + Duration::from_secs(60));
+    assert_eq!(pool.peek_public().unwrap().name, "one");
+    pool.cool_down_all_for_test(Duration::from_secs(60));
+    assert!(pool.peek_public().is_none());
+    assert!(matches!(
+        pool.select(None, false),
+        Err(AppError::AccountUnavailable)
+    ));
+    // Retained entries do not depend on health: the rotation still lists every account.
+    assert_eq!(names(pool.rotation()).len(), 2);
+    let empty = crate::accounts::Pool::load(&config(), 1).unwrap();
+    assert!(empty.peek_public().is_none());
+    assert!(empty.rotation().is_empty());
+}
+
+#[tokio::test]
+async fn cache_hits_skip_admission_and_account_lease() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        announcements_reply(),
+        blocked,
+        ranking_reply(2),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.max_inflight = 1;
+    cfg.upstream.timeout_ms = 5000;
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    // The ranking bootstraps the Master version first, which anonymous keys include too.
+    let route = crate::client::MUSIC_RANKING;
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    let announcements = c
+        .call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+        .await
+        .unwrap();
+    let a = c.clone();
+    let held = tokio::spawn(async move { profile_call(&a).await });
+    wait_for_requests(&f, 4).await;
+    // The only permit is held: hits are answered without waiting for it.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        assert_eq!(
+            c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+                .await
+                .unwrap(),
+            announcements
+        );
+        let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+        assert_eq!(value["players"][0]["score"], 1);
+        assert!(value.get("myRank").is_none());
+    })
+    .await
+    .expect("cache hits must not wait for admission");
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["active_calls"],
+        1
+    );
+    // A miss is still admitted and queues behind the held permit.
+    let a = c.clone();
+    let miss = tokio::spawn(async move { a.call(route, json!({"musicId":"2"})).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!miss.is_finished());
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+    gate.add_permits(1);
+    held.await.unwrap().unwrap();
+    assert_eq!(miss.await.unwrap().unwrap()["players"][0]["score"], 2);
+    assert_eq!(f.received.lock().unwrap().len(), 5);
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["active_calls"],
+        0
+    );
+}
+
+fn stale_cache(ttl_ms: u64, stale_ms: u64) -> crate::response_cache::Config {
+    let mut cache = memory_cache(ttl_ms);
+    if let crate::response_cache::Config::Memory {
+        stale_while_revalidate_ms,
+        ..
+    } = &mut cache
+    {
+        *stale_while_revalidate_ms = stale_ms;
+    }
+    cache
+}
+#[tokio::test]
+async fn quarantined_accounts_serve_retained_entries_only_within_stale_window() {
+    let f = fixture(vec![
+        Reply::version(),
+        empty_profile_reply(),
+        ranking_reply(1),
+    ])
+    .await;
+    let mut cfg = pool_config();
+    cfg.response_cache = stale_cache(50, 400);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    // The first account serves the profile, so the second one fills the ranking entry.
+    profile_call(&c).await.unwrap();
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    c.cool_down_accounts_for_test(Duration::from_secs(60));
+    let before = c.account_status().unwrap()["accounts"].clone();
+    let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+    assert_eq!(value["players"][0]["score"], 1);
+    assert!(value.get("myRank").is_none());
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Stale inside the window: still answered, without a refresh.
+    let sha = c.peer_identity().unwrap().protocol_sha256;
+    assert_eq!(
+        c.call_peer(route, json!({"musicId":"1"}), &sha)
+            .await
+            .unwrap()["players"][0]["score"],
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    // A hit never re-enables or charges an account.
+    assert_eq!(c.account_status().unwrap()["accounts"], before);
+    assert!(matches!(
+        c.call(route, json!({"musicId":"2"})).await,
+        Err(AppError::AccountUnavailable)
+    ));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(matches!(
+        c.call(route, json!({"musicId":"1"})).await,
+        Err(AppError::AccountUnavailable)
+    ));
+    assert!(matches!(
+        c.call_peer(route, json!({"musicId":"1"}), &sha).await,
+        Err(AppError::PeerAccountUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+
+    // Without a stale window a fresh entry does not outlive the quarantine.
+    let f = fixture(vec![Reply::version(), ranking_reply(1)]).await;
+    let mut cfg = single_account_config();
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    assert_eq!(
+        c.call(route, json!({"musicId":"1"})).await.unwrap()["players"][0]["score"],
+        1
+    );
+    c.cool_down_accounts_for_test(Duration::from_secs(60));
+    assert!(matches!(
+        c.call(route, json!({"musicId":"1"})).await,
+        Err(AppError::AccountUnavailable)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn maintenance_bypasses_pre_admission_hits() {
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        maintenance_reply("14"),
+        maintenance_reply("2"),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.response_cache = stale_cache(60_000, 60_000);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    assert!(matches!(
+        profile_call(&c).await,
+        Err(AppError::Maintenance(14))
+    ));
+    assert!(matches!(
+        c.call(route, json!({"musicId":"1"})).await,
+        Err(AppError::Maintenance(2))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn peer_cache_hit_requires_matching_schema() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![Reply::version(), ranking_reply(1), blocked]).await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.max_inflight = 1;
+    cfg.upstream.timeout_ms = 5000;
+    cfg.response_cache = memory_cache(60_000);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    let sha = c.peer_identity().unwrap().protocol_sha256;
+    c.call_peer(route, json!({"musicId":"1"}), &sha)
+        .await
+        .unwrap();
+    let a = c.clone();
+    let held = tokio::spawn(async move { profile_call(&a).await });
+    wait_for_requests(&f, 3).await;
+    let value = tokio::time::timeout(
+        Duration::from_secs(1),
+        c.call_peer(route, json!({"musicId":"1"}), &sha),
+    )
+    .await
+    .expect("a matching schema is answered before admission")
+    .unwrap();
+    assert_eq!(value["players"][0]["score"], 1);
+    assert!(value.get("myRank").is_none());
+    // Another schema never reads the entry: it is admitted and refused there.
+    let a = c.clone();
+    let mismatch = tokio::spawn(async move {
+        a.call_peer(route, json!({"musicId":"1"}), &"0".repeat(64))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!mismatch.is_finished());
+    gate.add_permits(1);
+    held.await.unwrap().unwrap();
+    assert!(matches!(
+        mismatch.await.unwrap(),
+        Err(AppError::PeerIdentityMismatch)
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn stale_hit_before_admission_spawns_one_pinned_refresh() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut blocked = empty_profile_reply();
+    blocked.gate = Some(gate.clone());
+    let f = fixture(vec![
+        Reply::version(),
+        ranking_reply(1),
+        blocked,
+        ranking_reply(2),
+    ])
+    .await;
+    let mut cfg = account_config();
+    cfg.session_lock = false;
+    cfg.upstream.max_inflight = 1;
+    cfg.upstream.timeout_ms = 5000;
+    cfg.response_cache = stale_cache(100, 5000);
+    let c = client(&f, cfg);
+    let route = crate::client::MUSIC_RANKING;
+    c.call(route, json!({"musicId":"1"})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let a = c.clone();
+    let held = tokio::spawn(async move { profile_call(&a).await });
+    wait_for_requests(&f, 3).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for _ in 0..12 {
+            let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+            assert_eq!(value["players"][0]["score"], 1);
+            assert!(value.get("myRank").is_none());
+        }
+    })
+    .await
+    .expect("stale callers must not wait for admission");
+    // The single background refresh is admitted like any call: it waits for the permit.
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    gate.add_permits(1);
+    held.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let value = c.call(route, json!({"musicId":"1"})).await.unwrap();
+            if value["players"][0]["score"] == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.received.lock().unwrap().len(), 4);
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["active_calls"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn get_any_with_state_returns_first_retained_entry_in_order() {
+    use crate::response_cache::{Cache, Config, Route};
+    let cache = Cache::new(Config::Memory {
+        stale_while_revalidate_ms: 200,
+        route_ttl_ms: BTreeMap::from([(Route::Announcement, 20)]),
+        ttl_ms: 5000,
+        max_entries: 10,
+        max_bytes: 8192,
+        max_entry_bytes: 4096,
+    })
+    .unwrap();
+    let keys = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    cache
+        .put_route(ANNOUNCEMENT, "expired".into(), &json!({"value":1}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    cache
+        .put_route(ANNOUNCEMENT, "stale".into(), &json!({"value":2}))
+        .await;
+    cache.put("fresh".into(), &json!({"value":3})).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let first = cache
+        .get_any_with_state(&keys(&["missing", "expired", "stale", "fresh"]))
+        .await
+        .unwrap();
+    assert!(first.stale);
+    assert_eq!(first.value["value"], 2);
+    let first = cache
+        .get_any_with_state(&keys(&["missing", "expired", "fresh", "stale"]))
+        .await
+        .unwrap();
+    assert!(!first.stale);
+    assert_eq!(first.value["value"], 3);
+    assert!(cache
+        .get_any_with_state(&keys(&["missing", "expired"]))
+        .await
+        .is_none());
+    assert!(cache.get_any_with_state(&[]).await.is_none());
+    // The hard-expired entry was dropped; the key fills again normally.
+    assert!(cache.get_with_state("expired").await.is_none());
+    cache
+        .put_route(ANNOUNCEMENT, "expired".into(), &json!({"value":4}))
+        .await;
+    assert_eq!(cache.get("expired").await.unwrap()["value"], 4);
+}
+
+#[test]
 fn cache_route_policy_rejects_unknown_or_private_routes_and_excessive_ttls() {
     let prefix = "backend: memory\nttl_ms: 1000\nmax_entries: 4\nmax_bytes: 4096\nmax_entry_bytes: 1024\nroute_ttl_ms:\n";
     for route in ["profile", "player_data", "arbitrary_rpc"] {
@@ -3141,6 +4899,200 @@ async fn tunnel_proxy(response: Vec<u8>, forward: bool, delay: Duration) -> Tunn
         }
     });
     TunnelProxy { url, seen, task }
+}
+/// A plain TCP relay whose open connections can be blackholed: `freeze` makes every connection
+/// open at that moment drop bytes both ways without closing; later connections forward normally.
+struct BlackholeRelay {
+    url: String,
+    accepts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Client-to-server bytes read, forwarded or not.
+    sent: Arc<std::sync::atomic::AtomicUsize>,
+    open: Arc<Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for BlackholeRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl BlackholeRelay {
+    fn freeze(&self) {
+        for frozen in self.open.lock().unwrap().iter() {
+            frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn accepts(&self) -> usize {
+        self.accepts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn sent(&self) -> usize {
+        self.sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+async fn blackhole_relay(target: &str) -> BlackholeRelay {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    async fn pump(
+        mut from: impl AsyncRead + Unpin,
+        mut to: impl AsyncWrite + Unpin,
+        frozen: Arc<AtomicBool>,
+        count: Option<Arc<AtomicUsize>>,
+    ) {
+        let mut buffer = vec![0; 16384];
+        while let Ok(n @ 1..) = from.read(&mut buffer).await {
+            if let Some(count) = &count {
+                count.fetch_add(n, Ordering::SeqCst);
+            }
+            if !frozen.load(Ordering::SeqCst) && to.write_all(&buffer[..n]).await.is_err() {
+                return;
+            }
+        }
+    }
+    let target: std::net::SocketAddr = target.strip_prefix("http://").unwrap().parse().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let open = Arc::new(Mutex::new(Vec::new()));
+    let (accepted, counted, registered) = (accepts.clone(), sent.clone(), open.clone());
+    let task = tokio::spawn(async move {
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let frozen = Arc::new(AtomicBool::new(false));
+            registered.lock().unwrap().push(frozen.clone());
+            let upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+            let (client_read, client_write) = client.into_split();
+            let (upstream_read, upstream_write) = upstream.into_split();
+            tokio::spawn(pump(
+                client_read,
+                upstream_write,
+                frozen.clone(),
+                Some(counted.clone()),
+            ));
+            tokio::spawn(pump(upstream_read, client_write, frozen, None));
+        }
+    });
+    BlackholeRelay {
+        url,
+        accepts,
+        sent,
+        open,
+        task,
+    }
+}
+fn keepalive_config(target: &BlackholeRelay, interval_ms: u64, timeout_ms: u64) -> Config {
+    let mut cfg = config();
+    cfg.endpoint = target.url.clone();
+    cfg.upstream.timeout_ms = timeout_ms;
+    cfg.upstream.http2_keepalive_interval_ms = Some(interval_ms);
+    if interval_ms != 0 {
+        cfg.upstream.http2_keepalive_timeout_ms = Some(1_000);
+    }
+    cfg.upstream.validate().unwrap();
+    cfg
+}
+#[tokio::test]
+async fn upstream_http2_keepalive_detects_blackholed_connection_before_deadline() {
+    let f = fixture(vec![Reply::version(), Reply::version(), Reply::version()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let c = GameClient::for_test(keepalive_config(&relay, 1_000, 10_000));
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 1);
+    relay.freeze();
+    let started = std::time::Instant::now();
+    // A missed PING acknowledgement closes the connection: a transport failure (502), not the
+    // deadline's 504.
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Transport)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(3_500));
+    // The dead connection left the pool; the next call reconnects.
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 2);
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+}
+#[tokio::test]
+async fn keepalive_failure_retries_only_verified_anonymous_reads() {
+    let f = fixture(vec![Reply::version(), Reply::version()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let mut cfg = keepalive_config(&relay, 1_000, 10_000);
+    cfg.upstream.anonymous_attempts = 2;
+    cfg.upstream.retry_delay_ms = 1;
+    let c = GameClient::for_test(cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    relay.freeze();
+    // The retry runs on a fresh connection inside the same logical call.
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 2);
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+
+    let f = fixture(vec![Reply::version(), empty_profile_reply()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let mut cfg = account_config();
+    cfg.endpoint = relay.url.clone();
+    cfg.upstream = keepalive_config(&relay, 1_000, 10_000).upstream;
+    cfg.upstream.anonymous_attempts = 2;
+    let c = GameClient::for_test(cfg);
+    let profile = || c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}));
+    profile().await.unwrap();
+    relay.freeze();
+    assert!(matches!(profile().await, Err(AppError::Transport)));
+    // Authenticated calls are never replayed.
+    assert_eq!(relay.accepts(), 1);
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 1);
+    assert_eq!(status["accounts"][0]["disabled"], false);
+}
+#[tokio::test]
+async fn keepalive_does_not_ping_idle_connections_or_kill_slow_live_replies() {
+    let mut slow = Reply::version();
+    slow.delay = Duration::from_millis(2_500);
+    let f = fixture(vec![Reply::version(), slow]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let c = GameClient::for_test(keepalive_config(&relay, 1_000, 10_000));
+    c.call(VERSION, json!({})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sent = relay.sent();
+    // Longer than interval + acknowledgement timeout: an idle connection is left alone.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert_eq!(relay.sent(), sent);
+    // A live connection acknowledges PINGs, so a slow reply is not cut off.
+    c.call(VERSION, json!({})).await.unwrap();
+    assert_eq!(relay.accepts(), 1);
+    assert!(relay.sent() > sent);
+}
+#[tokio::test]
+async fn keepalive_disabled_keeps_previous_behaviour() {
+    let f = fixture(vec![Reply::version()]).await;
+    let relay = blackhole_relay(&f.url).await;
+    let cfg = keepalive_config(&relay, 0, 1_500);
+    assert!(cfg.upstream.http2_keepalive().is_none());
+    let c = GameClient::for_test(cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    relay.freeze();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        c.call(VERSION, json!({})).await,
+        Err(AppError::Timeout)
+    ));
+    assert!(started.elapsed() >= Duration::from_millis(1_400));
+}
+#[tokio::test]
+async fn default_keepalive_client_completes_calls() {
+    // Guards the mandatory hyper timer: keepalive without one panics on the first connection.
+    let cfg = config();
+    assert_eq!(
+        cfg.upstream.http2_keepalive(),
+        Some((Duration::from_secs(10), Duration::from_secs(5)))
+    );
+    let f = fixture(vec![Reply::version()]).await;
+    let c = client(&f, cfg);
+    assert_eq!(
+        c.call(VERSION, json!({})).await.unwrap()["version"],
+        "master-fixture"
+    );
 }
 fn proxy_policy(url: &str) -> crate::config::UpstreamConfig {
     let name = format!("TEST_PROXY_{}", uuid::Uuid::new_v4().simple());
@@ -3666,6 +5618,7 @@ fn deployment_tls_is_top_level_and_invalid_material_fails_preparation() {
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
+        http_compression: None,
         regions: BTreeMap::from([("jp".into(), region)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(deployment.clone()))
@@ -4053,9 +6006,39 @@ fn master_network_configuration_is_bounded_and_old_yaml_keeps_defaults() {
         "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60",
     )
     .unwrap();
-    assert_eq!(old.network.attempts, 1);
+    // Master downloads retry by default (3 attempts), also when the block is partly written.
+    assert_eq!(old.network.attempts, 3);
+    assert_eq!(old.network.retry_delay_ms, 250);
     assert_eq!(old.network.update_timeout_seconds, 600);
     assert!(old.network.proxy_url_env.is_none());
+    let partial: crate::config::MasterUpdateConfig = yaml_serde::from_str(
+        "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60\nnetwork:\n  request_timeout_ms: 5000",
+    )
+    .unwrap();
+    assert_eq!(partial.network.attempts, 3);
+    assert_eq!(partial.network.request_timeout_ms, 5_000);
+    let single: crate::config::MasterUpdateConfig = yaml_serde::from_str(
+        "username_env: U\nkey_hex_env: K\niv_hex_env: I\ninterval_seconds: 60\nnetwork:\n  attempts: 1",
+    )
+    .unwrap();
+    assert_eq!(single.network.attempts, 1);
+    // A 1.2.3 block that only lowers the retry cap stays valid.
+    let capped: crate::master_update::Network =
+        yaml_serde::from_str("max_retry_delay_ms: 500").unwrap();
+    assert!(capped.validate().is_ok());
+    // A written but empty value is an error, not the default.
+    for yaml in ["attempts: ~", "request_timeout_ms:"] {
+        assert!(
+            yaml_serde::from_str::<crate::master_update::Network>(yaml).is_err(),
+            "{yaml}"
+        );
+    }
+    // Other network blocks (the resource snapshot `.hash` request) keep one attempt.
+    let snapshot: crate::config::ResourceSnapshotConfig =
+        yaml_serde::from_str("network:\n  request_timeout_ms: 5000").unwrap();
+    assert_eq!(snapshot.network.attempts, 1);
+    let snapshot: crate::config::ResourceSnapshotConfig = yaml_serde::from_str("{}").unwrap();
+    assert_eq!(snapshot.network.attempts, 1);
     for yaml in [
         "attempts: 0",
         "attempts: 9",
@@ -4313,6 +6296,7 @@ async fn asset_job_transport_validates_identity_auth_and_bounded_responses() {
                     assert_eq!(headers["authorization"], "Bearer fixture-updater-only");
                     assert_eq!(headers["user-agent"], "SiriusClient/test");
                     assert!(!headers.contains_key("proxy-authorization"));
+                    assert!(!headers.contains_key("accept-encoding"));
                     if method == axum::http::Method::POST {
                         assert_eq!(headers["idempotency-key"], "key-1");
                         assert_eq!(
@@ -4576,6 +6560,596 @@ fn asset_outbox_failed_writes_and_corrupt_state_never_acknowledge_dispatch() {
     assert!(matches!(invalid.key(), Err(Error::Invalid)));
 }
 
+/// Runs `rounds` reconciliations against an updater whose POSTs answer `statuses` in order
+/// (202 accepts). Returns the entry's final state, the POST count and the distinct keys sent.
+async fn dispatch_submissions(statuses: Vec<u16>, rounds: usize) -> (Value, usize, usize) {
+    use crate::asset_dispatch::{Config as DispatchConfig, Target, Worker};
+    use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::any, Router};
+    use sha2::{Digest, Sha256};
+    type Script = Arc<std::sync::Mutex<(std::collections::VecDeque<u16>, Vec<String>)>>;
+    let script: Script = Arc::new(std::sync::Mutex::new((statuses.into(), Vec::new())));
+    let app = Router::new()
+        .route(
+            "/{*path}",
+            any(
+                |State(script): State<Script>, headers: HeaderMap, body: axum::body::Bytes| async move {
+                    let mut script = script.lock().unwrap();
+                    let key = headers["idempotency-key"].to_str().unwrap().to_owned();
+                    script.1.push(key.clone());
+                    let status = script.0.pop_front().unwrap_or(500);
+                    if status != 202 {
+                        let code = axum::http::StatusCode::from_u16(status).unwrap();
+                        return (code, "updater detail must-not-leak").into_response();
+                    }
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let job = json!({"id":uuid::Uuid::new_v4().to_string(),"request":request,
+                        "status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(key.as_bytes()))});
+                    (axum::http::StatusCode::ACCEPTED, axum::Json(job)).into_response()
+                },
+            ),
+        )
+        .with_state(script.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let game = fixture(vec![]).await;
+    let mut cfg = config();
+    let token = format!("SIRIUS_DISPATCH_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token, "dispatch-only-token");
+    cfg.asset_dispatch = Some(DispatchConfig {
+        state_directory: directory.path().join("outbox"),
+        interval_seconds: 10,
+        request_timeout_ms: 1000,
+        history_capacity: 100,
+        targets: vec![Target {
+            user_agent: None,
+            origin,
+            token_env: token,
+            allow_http: true,
+            profile: "full".into(),
+            profile_revision: "1".into(),
+            require_full_catalog: true,
+            require_full_export: true,
+            require_publication: false,
+        }],
+    });
+    let mut worker = Worker::new(&cfg, client(&game, cfg.clone())).unwrap();
+    worker
+        .observe(&crate::resources::ResourceSnapshot {
+            schema_version: 2,
+            region: crate::region::Region::Jp,
+            environment: "release".into(),
+            platform: "iOS",
+            client_version: "1.0.3".into(),
+            protocol_version: "1.0.3".into(),
+            master_version: None,
+            resource_version: "r1".into(),
+            platform_hash: "hash1".into(),
+            effective_cdn_root: String::new(),
+            credential_ref: String::new(),
+            observed_at: chrono::Utc::now(),
+            source: "remote",
+            catalog_layout: None,
+            catalog_url: None,
+            bundle_base_url: None,
+            cdn_authorization: None,
+        })
+        .unwrap();
+    for _ in 0..rounds {
+        worker.reconcile().await.unwrap();
+    }
+    drop(worker);
+    server.abort();
+    let ledger: Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("outbox/outbox.json")).unwrap(),
+    )
+    .unwrap();
+    let state = ledger["entries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()["state"]
+        .clone();
+    if state["state"] == "failed" {
+        let key = ledger["entries"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let mut outbox =
+            crate::asset_outbox::Outbox::open(&directory.path().join("outbox"), 100).unwrap();
+        let adoptable = outbox
+            .adopt(&key, &uuid::Uuid::new_v4().to_string())
+            .is_ok();
+        assert_eq!(adoptable, state["code"] == "submission_ambiguous");
+    }
+    let script = script.lock().unwrap();
+    let keys: std::collections::HashSet<_> = script.1.iter().collect();
+    (state, script.1.len(), keys.len())
+}
+#[tokio::test]
+async fn asset_dispatch_resubmits_busy_refusals_and_fails_definite_rejections() {
+    // Busy answers are resubmitted with the same Idempotency-Key until accepted.
+    let (state, posts, keys) = dispatch_submissions(vec![429, 503, 202], 3).await;
+    assert_eq!(state["state"], "submitted");
+    assert_eq!((posts, keys), (3, 1));
+    // ... but only a bounded number of times.
+    let (state, posts, _) = dispatch_submissions(vec![503; 12], 12).await;
+    assert_eq!(
+        state,
+        json!({"state":"failed","job_id":null,"code":"submission_refused"})
+    );
+    assert_eq!(posts, 10);
+    // A definite rejection is terminal after one POST and is not adoptable.
+    for (status, code) in [
+        (400, "submission_rejected"),
+        (422, "submission_rejected"),
+        (401, "submission_unauthorized"),
+        (403, "submission_unauthorized"),
+        (409, "idempotency_conflict"),
+    ] {
+        let (state, posts, _) = dispatch_submissions(vec![status], 2).await;
+        assert_eq!(state["code"], code, "{status}");
+        assert_eq!(posts, 1, "{status}");
+    }
+    // Other failures may have been accepted: never replayed, left for the operator.
+    let (state, posts, _) = dispatch_submissions(vec![502], 2).await;
+    assert_eq!(state["code"], "submission_ambiguous");
+    assert_eq!(posts, 1);
+}
+/// A dispatch updater stub plus the configured values the status route must never echo.
+struct DispatchStatusHarness {
+    cfg: Config,
+    directory: tempfile::TempDir,
+    secrets: Vec<String>,
+    server: tokio::task::JoinHandle<()>,
+}
+impl Drop for DispatchStatusHarness {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+async fn dispatch_status_harness(updater: axum::Router, capacity: usize) -> DispatchStatusHarness {
+    use crate::asset_dispatch::{Config as DispatchConfig, Target};
+    use sha2::{Digest, Sha256};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let origin = format!("http://{address}");
+    let server = tokio::spawn(async move { axum::serve(listener, updater).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let token_env = format!("SIRIUS_DISPATCH_STATUS_{}", uuid::Uuid::new_v4().simple());
+    let token = format!("status-secret-{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&token_env, &token);
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(url::Url::parse(&origin).unwrap().as_str().as_bytes())
+    );
+    let mut cfg = config();
+    cfg.asset_dispatch = Some(DispatchConfig {
+        state_directory: directory.path().join("outbox"),
+        interval_seconds: 10,
+        request_timeout_ms: 5000,
+        history_capacity: capacity,
+        targets: vec![Target {
+            user_agent: None,
+            origin: origin.clone(),
+            token_env: token_env.clone(),
+            allow_http: true,
+            profile: "full".into(),
+            profile_revision: "1".into(),
+            require_full_catalog: true,
+            require_full_export: true,
+            require_publication: false,
+        }],
+    });
+    DispatchStatusHarness {
+        cfg,
+        directory,
+        secrets: vec![
+            origin,
+            address,
+            token,
+            token_env,
+            digest[..12].to_owned(),
+            digest,
+            "must-not-leak".into(),
+        ],
+        server,
+    }
+}
+fn dispatch_status_admin(worker: &crate::asset_dispatch::Worker) -> axum::Router {
+    crate::asset_dispatch_admin::router(
+        worker.control(),
+        "/internal/v1/asset-dispatch",
+        "admin".into(),
+    )
+}
+fn dispatch_status_snapshot(resource_version: &str) -> crate::resources::ResourceSnapshot {
+    crate::resources::ResourceSnapshot {
+        schema_version: 2,
+        region: crate::region::Region::Jp,
+        environment: "release".into(),
+        platform: "iOS",
+        client_version: "1.0.3".into(),
+        protocol_version: "1.0.3".into(),
+        master_version: None,
+        resource_version: resource_version.into(),
+        platform_hash: "hash1".into(),
+        effective_cdn_root: String::new(),
+        credential_ref: String::new(),
+        observed_at: chrono::Utc::now(),
+        source: "remote",
+        catalog_layout: None,
+        catalog_url: None,
+        bundle_base_url: None,
+        cdn_authorization: None,
+    }
+}
+/// Reads the status with the internal bearer: always 200 and never echoing `secrets`.
+async fn dispatch_status(app: &axum::Router, secrets: &[String]) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/internal/v1/asset-dispatch/status")
+                .header("authorization", "Bearer admin")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let raw = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&raw).unwrap();
+    for secret in secrets {
+        assert!(!text.contains(secret.as_str()), "status echoed a secret");
+    }
+    serde_json::from_str(text).unwrap()
+}
+async fn dispatch_status_until(
+    app: &axum::Router,
+    secrets: &[String],
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = dispatch_status(app, secrets).await;
+            if done(&status) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("asset dispatch status did not settle")
+}
+fn dispatch_status_counts(status: &Value, expected: Value) {
+    let mut counts = json!({"total":0,"capacity":0,"pending":0,"sending":0,"submitted":0,
+        "completed":0,"failed":0,"busy_retrying":0});
+    for (key, value) in expected.as_object().unwrap() {
+        counts[key] = value.clone();
+    }
+    assert_eq!(status["entries"], counts);
+}
+#[tokio::test]
+async fn asset_dispatch_status_reports_pending_idle_and_stop_reasons() {
+    use crate::asset_dispatch::Worker;
+    let h = dispatch_status_harness(axum::Router::new(), 7).await;
+    let game = fixture(vec![]).await;
+    let gc = client(&game, h.cfg.clone());
+    let worker = Worker::new(&h.cfg, gc.clone()).unwrap();
+    let app = dispatch_status_admin(&worker);
+    let status = dispatch_status(&app, &h.secrets).await;
+    assert_eq!(status["status"], "pending");
+    for key in [
+        "stop_reason",
+        "cycle_started_at",
+        "last_cycle_at",
+        "next_cycle_at",
+        "last_observation",
+        "last_reconcile",
+    ] {
+        assert!(status[key].is_null(), "{key}");
+    }
+    dispatch_status_counts(&status, json!({"capacity":7}));
+    assert_eq!(status["failed_by_code"], json!({}));
+    for authorization in [None, Some("Bearer wrong"), Some("admin")] {
+        let mut request = Request::get("/internal/v1/asset-dispatch/status");
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "idle").await;
+    assert_eq!(
+        status["last_observation"]["result"], "unavailable",
+        "{status}"
+    );
+    assert!(status["last_observation"]["resource_version"].is_null());
+    assert_eq!(status["last_reconcile"]["result"], "completed");
+    assert_eq!(status["last_reconcile"]["batch"], 0);
+    assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+    assert!(status["cycle_started_at"].is_null());
+    let at = |key: &str| {
+        status[key]
+            .as_str()
+            .unwrap()
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    };
+    assert_eq!(
+        at("next_cycle_at") - at("last_cycle_at"),
+        chrono::TimeDelta::seconds(10)
+    );
+    // A stop during the pause still records the final status.
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    let status = dispatch_status(&app, &h.secrets).await;
+    assert_eq!(status["status"], "stopped");
+    assert_eq!(status["stop_reason"], "shutdown");
+    assert!(status["next_cycle_at"].is_null());
+    assert_eq!(status["last_reconcile"]["result"], "completed");
+    // A worker dropped without a final status (never run, or its task died) reads as exited.
+    let worker = Worker::new(&h.cfg, gc).unwrap();
+    let app = dispatch_status_admin(&worker);
+    assert_eq!(dispatch_status(&app, &h.secrets).await["status"], "pending");
+    drop(worker);
+    let status = dispatch_status(&app, &h.secrets).await;
+    assert_eq!(status["status"], "stopped");
+    assert_eq!(status["stop_reason"], "exited");
+}
+#[tokio::test]
+async fn asset_dispatch_status_answers_while_reconciling() {
+    use crate::asset_dispatch::Worker;
+    use axum::{http::HeaderMap, response::IntoResponse, routing::any};
+    use sha2::{Digest, Sha256};
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = release.clone();
+    let updater = axum::Router::new().route(
+        "/{*path}",
+        any(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let held = held.clone();
+            async move {
+                held.notified().await;
+                let key = headers["idempotency-key"].to_str().unwrap().to_owned();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let job = json!({"id":uuid::Uuid::new_v4().to_string(),"request":request,
+                    "status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(key.as_bytes()))});
+                (axum::http::StatusCode::ACCEPTED, axum::Json(job)).into_response()
+            }
+        }),
+    );
+    let h = dispatch_status_harness(updater, 10).await;
+    let game = fixture(vec![Reply::version()
+        .header("x-asset-version", r#"{"version":"r1","iOS":"hash1"}"#)
+        .header("x-sirius-cred", "fixture-cdn-secret")])
+    .await;
+    let worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+    let app = dispatch_status_admin(&worker);
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["entries"]["sending"] == 1).await;
+    assert_eq!(status["status"], "reconciling");
+    assert!(status["cycle_started_at"].is_string());
+    assert_eq!(status["last_observation"]["result"], "recorded");
+    assert_eq!(status["last_observation"]["resource_version"], "r1");
+    // The held POST occupies the worker; the status route does not wait on its queue.
+    let status = tokio::time::timeout(Duration::from_secs(1), dispatch_status(&app, &h.secrets))
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "reconciling");
+    release.notify_one();
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "idle").await;
+    dispatch_status_counts(&status, json!({"total":1,"capacity":10,"submitted":1}));
+    assert_eq!(status["last_reconcile"]["batch"], 1);
+    assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+#[tokio::test]
+async fn asset_dispatch_status_readable_after_storage_stop() {
+    use crate::asset_dispatch::Worker;
+    let h = dispatch_status_harness(axum::Router::new(), 10).await;
+    let game = fixture(vec![]).await;
+    let mut worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+    worker.observe(&dispatch_status_snapshot("r1")).unwrap();
+    let app = dispatch_status_admin(&worker);
+    // A non-empty directory in place of the ledger fails the next commit on every platform.
+    let path = h.directory.path().join("outbox/outbox.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("occupied"), b"x").unwrap();
+    let (_stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "stopped").await;
+    task.await.unwrap();
+    assert_eq!(status["stop_reason"], "asset_outbox_storage");
+    assert_eq!(status["last_reconcile"]["result"], "storage_failed");
+    assert_eq!(status["last_reconcile"]["batch"], 0);
+    dispatch_status_counts(&status, json!({"total":1,"capacity":10,"pending":1}));
+    assert_eq!(dispatch_status(&app, &h.secrets).await["status"], "stopped");
+    let response = app
+        .oneshot(
+            Request::get("/internal/v1/asset-dispatch/entries")
+                .header("authorization", "Bearer admin")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+}
+#[tokio::test]
+async fn asset_dispatch_status_counts_capacity_and_bucketed_failure_codes() {
+    use crate::asset_dispatch::Worker;
+    let h = dispatch_status_harness(axum::Router::new(), 2).await;
+    {
+        let mut store =
+            crate::asset_outbox::Outbox::open(&h.directory.path().join("outbox"), 2).unwrap();
+        for (version, code) in [("v1", "job_failed"), ("v2", "future_unknown_code")] {
+            let key = store
+                .observe(crate::asset_outbox::Identity {
+                    destination_sha256: "a".repeat(64),
+                    request: crate::asset_jobs::Request {
+                        region: crate::region::Region::Jp,
+                        profile: "full".into(),
+                        operation: crate::asset_jobs::Operation::Update,
+                    },
+                    profile_revision: "1".into(),
+                    environment: "release".into(),
+                    platform: "iOS".into(),
+                    resource_version: version.into(),
+                    platform_hash: "hash1".into(),
+                    require_full_catalog: true,
+                    require_full_export: true,
+                    require_publication: false,
+                })
+                .unwrap();
+            store.fail(&key, code).unwrap();
+        }
+    }
+    let game = fixture(vec![Reply::version()
+        .header("x-asset-version", r#"{"version":"r1","iOS":"hash1"}"#)
+        .header("x-sirius-cred", "fixture-cdn-secret")])
+    .await;
+    let worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+    let app = dispatch_status_admin(&worker);
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(worker.run(rx));
+    let status = dispatch_status_until(&app, &h.secrets, |s| s["status"] == "idle").await;
+    assert_eq!(status["last_observation"]["result"], "capacity_exhausted");
+    assert!(status["last_observation"]["resource_version"].is_null());
+    dispatch_status_counts(&status, json!({"total":2,"capacity":2,"failed":2}));
+    assert_eq!(status["failed_by_code"], json!({"job_failed":1,"other":1}));
+    assert!(!status.to_string().contains("future_unknown_code"));
+    stop.send(true).unwrap();
+    task.await.unwrap();
+}
+#[tokio::test]
+async fn asset_dispatch_status_counts_busy_retries_and_transport_errors() {
+    use crate::asset_dispatch::Worker;
+    use axum::{http::HeaderMap, response::IntoResponse, routing::any};
+    use sha2::{Digest, Sha256};
+    for (script, after) in [
+        (
+            vec![429, 202],
+            json!({"total":1,"capacity":10,"submitted":1}),
+        ),
+        (vec![429, 500], json!({"total":1,"capacity":10,"sending":1})),
+    ] {
+        let script = Arc::new(Mutex::new(std::collections::VecDeque::from(script)));
+        let updater = axum::Router::new().route(
+            "/{*path}",
+            any(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let status = script.lock().unwrap().pop_front().unwrap_or(500);
+                async move {
+                    if status != 202 {
+                        let code = axum::http::StatusCode::from_u16(status).unwrap();
+                        return (code, "updater detail must-not-leak").into_response();
+                    }
+                    let key = headers["idempotency-key"].to_str().unwrap().to_owned();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let job = json!({"id":uuid::Uuid::new_v4().to_string(),"request":request,
+                        "status":"queued","idempotency_sha256":format!("{:x}",Sha256::digest(key.as_bytes()))});
+                    (axum::http::StatusCode::ACCEPTED, axum::Json(job)).into_response()
+                }
+            }),
+        );
+        let h = dispatch_status_harness(updater, 10).await;
+        let game = fixture(vec![]).await;
+        let mut worker = Worker::new(&h.cfg, client(&game, h.cfg.clone())).unwrap();
+        let app = dispatch_status_admin(&worker);
+        worker.observe(&dispatch_status_snapshot("r1")).unwrap();
+        worker.reconcile().await.unwrap();
+        let status = dispatch_status(&app, &h.secrets).await;
+        dispatch_status_counts(
+            &status,
+            json!({"total":1,"capacity":10,"pending":1,"busy_retrying":1}),
+        );
+        assert_eq!(status["last_reconcile"]["batch"], 1);
+        assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+        worker.reconcile().await.unwrap();
+        let status = dispatch_status(&app, &h.secrets).await;
+        dispatch_status_counts(&status, after.clone());
+        let transport_errors = usize::from(after["sending"] == 1);
+        assert_eq!(
+            status["last_reconcile"]["transport_errors"],
+            transport_errors
+        );
+        if transport_errors == 1 {
+            // The ambiguous POST is failed, not replayed, and the counter resets per pass.
+            worker.reconcile().await.unwrap();
+            let status = dispatch_status(&app, &h.secrets).await;
+            dispatch_status_counts(&status, json!({"total":1,"capacity":10,"failed":1}));
+            assert_eq!(status["failed_by_code"], json!({"submission_ambiguous":1}));
+            assert_eq!(status["last_reconcile"]["transport_errors"], 0);
+        }
+    }
+}
+#[test]
+fn asset_dispatch_failure_codes_cover_worker() {
+    let checkout = include_str!("asset_dispatch.rs");
+    let known = crate::asset_dispatch::FAILURE_CODES;
+    let unique: std::collections::HashSet<_> = known.iter().collect();
+    assert_eq!(unique.len(), known.len());
+    assert!(!known.contains(&"other"));
+    // Windows checkouts are CRLF: check both line endings whatever this checkout uses.
+    let crlf = lf(checkout).replace('\n', "\r\n");
+    for source in [checkout, crlf.as_str()] {
+        let source = &lf(source);
+        let mut used = std::collections::HashSet::new();
+        let compact: String = source.split_whitespace().collect();
+        for literal in compact.split("self.fail(&key,&entry,\"").skip(1) {
+            used.insert(literal.split('"').next().unwrap());
+        }
+        let start = source.find("fn rejected_submission").unwrap();
+        let end = start + source[start..].find("\n}\n").unwrap();
+        for literal in source[start..end].split("Some(\"").skip(1) {
+            used.insert(literal.split('"').next().unwrap());
+        }
+        // Every persisted literal is known, and no known code is stale.
+        assert_eq!(used, known.iter().copied().collect());
+    }
+}
+#[test]
+fn outbox_refusal_returns_only_sending_entries_to_pending() {
+    use crate::asset_outbox::{Outbox, State};
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = Outbox::open(directory.path(), 4).unwrap();
+    let identity = crate::asset_outbox::Identity {
+        destination_sha256: "a".repeat(64),
+        request: crate::asset_jobs::Request {
+            region: crate::region::Region::Jp,
+            profile: "full".into(),
+            operation: crate::asset_jobs::Operation::Update,
+        },
+        profile_revision: "1".into(),
+        environment: "production".into(),
+        platform: "iOS".into(),
+        resource_version: "version-1".into(),
+        platform_hash: "hash-1".into(),
+        require_full_catalog: true,
+        require_full_export: true,
+        require_publication: false,
+    };
+    let key = store.observe(identity).unwrap();
+    assert!(store.refused(&key).is_err());
+    store.begin_send(&key).unwrap();
+    store.refused(&key).unwrap();
+    assert_eq!(store.entries()[&key].state, State::Pending);
+    store.fail(&key, "submission_refused").unwrap();
+    assert!(store.refused(&key).is_err());
+}
 #[tokio::test]
 async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
     type RemoteState = Arc<std::sync::Mutex<(Option<Value>, usize, bool)>>;
@@ -4591,6 +7165,7 @@ async fn automatic_asset_dispatch_submits_once_and_reconciles_after_restart() {
     let app=Router::new().route("/{*path}",any(|State(state):State<RemoteState>,method:axum::http::Method,headers:HeaderMap,body:axum::body::Bytes|async move{
         assert_eq!(headers["authorization"],"Bearer dispatch-only-token");
         assert_eq!(headers["user-agent"], "SiriusClient/dispatch");
+        assert!(!headers.contains_key("accept-encoding"));
         let mut state=state.lock().unwrap();
         if method==axum::http::Method::POST {
             state.1+=1;
@@ -5223,6 +7798,7 @@ async fn peer_deployment_is_opt_in_and_has_independent_region_credentials() {
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
+        http_compression: None,
         regions: BTreeMap::from([("jp".into(), cfg), ("hk".into(), hk)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(multi)).prepare().is_err());
@@ -5253,6 +7829,302 @@ async fn peer_global_regions_share_schema_but_never_identity_or_capabilities() {
         "unavailable_before_dispatch"
     );
     assert!(f.received.lock().unwrap().is_empty());
+}
+
+#[test]
+fn peer_transport_pre_dispatch_statuses_are_exactly_the_executor_rejections() {
+    use crate::peer_transport::{Error, PRE_DISPATCH_STATUSES};
+    for status in 100..=599 {
+        assert_eq!(
+            Error::Status(status).rejected_before_dispatch(),
+            PRE_DISPATCH_STATUSES.contains(&status)
+        );
+        // The request was submitted; only the executor's answer proves non-execution.
+        assert!(!Error::Status(status).definitely_not_sent());
+    }
+    for status in [200, 204, 307, 403, 408, 409, 429, 500, 502, 503, 504] {
+        assert!(!Error::Status(status).rejected_before_dispatch());
+    }
+    for error in [Error::Timeout, Error::Transport, Error::Protocol] {
+        assert!(!error.rejected_before_dispatch());
+    }
+}
+/// The peer executor as `server::serve` exposes it: access log inside, `json_client_errors`
+/// outside.
+fn peer_executor_app(c: Arc<GameClient>, directory: &std::path::Path) -> axum::Router {
+    let log =
+        crate::access_log::AccessLog::new(access_log_config(directory.join("access.log"))).unwrap();
+    crate::error::json_client_errors(log.wrap(crate::peer::router(
+        c,
+        "/internal/v1/peer",
+        "peer".into(),
+    )))
+}
+/// Sends every request shape a single-region executor rejects before dispatch and returns the
+/// statuses it answered.
+async fn peer_rejection_statuses(
+    app: axum::Router,
+    token: &str,
+    identity: crate::peer::Identity,
+) -> std::collections::BTreeSet<u16> {
+    let path = "/internal/v1/peer/query";
+    let bearer = format!("Bearer {token}");
+    let valid = peer_request(identity.clone(), json!({"type":"version"}));
+    let with = |key: &str, value: Value| {
+        let mut request = valid.clone();
+        request[key] = value;
+        serde_json::to_vec(&request).unwrap()
+    };
+    let operation =
+        |operation: Value| serde_json::to_vec(&peer_request(identity.clone(), operation)).unwrap();
+    let json_bytes = serde_json::to_vec(&valid).unwrap();
+    let mut oversized = valid.clone();
+    oversized["operation"]["padding"] = json!("X".repeat(17000));
+    let auth = Some(bearer.as_str());
+    let cases = vec![
+        ("POST", path, None, true, json_bytes.clone(), 401),
+        (
+            "POST",
+            path,
+            Some("Bearer wrong"),
+            true,
+            json_bytes.clone(),
+            401,
+        ),
+        ("GET", path, auth, false, vec![], 405),
+        (
+            "POST",
+            "/internal/v1/jp/peer/query",
+            auth,
+            true,
+            json_bytes.clone(),
+            404,
+        ),
+        (
+            "POST",
+            "/internal/v1/peer/other",
+            auth,
+            true,
+            json_bytes.clone(),
+            404,
+        ),
+        ("POST", path, auth, false, json_bytes.clone(), 415),
+        ("POST", path, auth, true, b"{\"request_id\":".to_vec(), 400),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            with("request_id", json!("not-a-uuid")),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            with(
+                "request_id",
+                json!(uuid::Uuid::new_v4().simple().to_string()),
+            ),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"profile","profile_id":0})),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"announcements","tab":3})),
+            400,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            with("extra", json!("SECRET-INPUT")),
+            422,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"rpc","path":VERSION})),
+            422,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            operation(json!({"type":"profile","profile_id":"SECRET-INPUT"})),
+            422,
+        ),
+        (
+            "POST",
+            path,
+            auth,
+            true,
+            serde_json::to_vec(&oversized).unwrap(),
+            413,
+        ),
+    ];
+    let mut statuses = std::collections::BTreeSet::new();
+    for (method, uri, authorization, json_type, bytes, expected) in cases {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(authorization) = authorization {
+            request = request.header("authorization", authorization);
+        }
+        if json_type {
+            request = request.header("content-type", "application/json");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::from(bytes)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{method} {uri}");
+        let value = body(response).await;
+        assert!(value["code"].is_string());
+        assert!(!value.to_string().contains("SECRET"));
+        statuses.insert(expected);
+    }
+    statuses
+}
+#[tokio::test]
+async fn peer_executor_non_200_statuses_occur_only_before_dispatch() {
+    use crate::{
+        deployment::DeploymentConfig, peer_transport::PRE_DISPATCH_STATUSES, region::Region,
+    };
+    let expected = PRE_DISPATCH_STATUSES
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let directory = tempfile::tempdir().unwrap();
+    let f = fixture(vec![]).await;
+    let c = client(&f, config());
+    let observed = peer_rejection_statuses(
+        peer_executor_app(c.clone(), directory.path()),
+        "peer",
+        c.peer_identity().unwrap(),
+    )
+    .await;
+    // The constant and the executor cannot drift apart.
+    assert_eq!(observed, expected);
+    assert!(f.received.lock().unwrap().is_empty());
+
+    // The deployed router, with the access log and compression enabled, answers the same.
+    let mut cfg = regional_config(Region::Jp);
+    let name = format!("SIRIUS_TEST_PEER_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&name, "dedicated-peer");
+    cfg.peer_token_env = Some(name);
+    cfg.access_log = Some(access_log_config(directory.path().join("deployed.log")));
+    cfg.http_compression = Some(crate::http_compression::Config { enabled: true });
+    let identity = GameClient::new(cfg.clone())
+        .unwrap()
+        .peer_identity()
+        .unwrap();
+    let app = crate::error::json_client_errors(
+        DeploymentConfig::Single(Box::new(cfg))
+            .prepare()
+            .unwrap()
+            .router,
+    );
+    assert_eq!(
+        peer_rejection_statuses(app, "dedicated-peer", identity).await,
+        expected
+    );
+}
+#[tokio::test]
+async fn peer_executor_answers_200_for_every_dispatched_outcome() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut game = Reply::version();
+    game.trailers.insert("grpc-status", "14".parse().unwrap());
+    game.trailers
+        .insert("grpc-message", "SECRET_MUST_NOT_ESCAPE".parse().unwrap());
+    let mut unavailable = Reply::version();
+    unavailable.http_status = 503;
+    let mut slow = Reply::version();
+    slow.delay = Duration::from_millis(300);
+    let cases = vec![
+        (
+            vec![Reply::version()],
+            config(),
+            json!({"type":"version"}),
+            json!({"status":"success"}),
+        ),
+        (
+            vec![game],
+            config(),
+            json!({"type":"version"}),
+            json!({"type":"game","grpc_status":14}),
+        ),
+        (
+            vec![maintenance_reply("2")],
+            config(),
+            json!({"type":"announcements","tab":0}),
+            json!({"type":"game","grpc_status":2}),
+        ),
+        (
+            vec![unavailable],
+            config(),
+            json!({"type":"version"}),
+            json!({"type":"protocol"}),
+        ),
+        (
+            vec![slow],
+            config(),
+            json!({"type":"version"}),
+            json!({"type":"timeout"}),
+        ),
+        (
+            vec![
+                Reply::version(),
+                application_error_reply("2", "PLAYER_NOT_FOUND"),
+            ],
+            strict_single_account_config(),
+            json!({"type":"profile","profile_id":1}),
+            json!({"type":"not_found"}),
+        ),
+    ];
+    for (replies, cfg, operation, expected) in cases {
+        let f = fixture(replies).await;
+        let mut c = client(&f, cfg);
+        GameClient::set_test_timeout(&mut c, Duration::from_millis(100));
+        let request = peer_request(c.peer_identity().unwrap(), operation);
+        let response = peer_send(peer_executor_app(c, directory.path()), "peer", request).await;
+        assert_eq!(response.status(), 200, "{expected}");
+        let reply = body(response).await;
+        if expected["status"] == "success" {
+            assert_eq!(reply["outcome"]["status"], "success");
+        } else {
+            assert_eq!(reply["outcome"]["kind"], expected);
+        }
+        assert!(!reply.to_string().contains("SECRET"));
+        assert!(!reply.to_string().contains("must-not-leak"));
+        assert!(!f.received.lock().unwrap().is_empty());
+    } // A game endpoint that refuses the connection after dispatch began.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config();
+    cfg.endpoint = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let c = GameClient::for_test(cfg);
+    let request = peer_request(c.peer_identity().unwrap(), json!({"type":"version"}));
+    let response = peer_send(peer_executor_app(c, directory.path()), "peer", request).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        body(response).await["outcome"]["kind"],
+        json!({"type":"transport"})
+    );
 }
 
 async fn peer_http_server(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -5351,6 +8223,7 @@ async fn peer_transport_rejects_unbound_malformed_and_oversized_replies_without_
                 counter.fetch_add(1, Ordering::Relaxed);
                 assert_eq!(headers["authorization"], "Bearer fixture-peer-only");
                 assert_eq!(headers["content-type"], "application/json");
+                assert!(!headers.contains_key("accept-encoding"));
                 let mut reply = json!({"request_id":request["request_id"],"identity":request["identity"],"observation":crate::client::Observation::default(),"outcome":{"status":"success","data":{"largeId":"9223372036854775807"}}});
                 let mut mime = "application/json";
                 match case {
@@ -5738,11 +8611,46 @@ async fn routing_mock(
                 1=>json!({"status":"failure","kind":{"type":"transport"}}),
                 2=>json!({"status":"failure","kind":{"type":"game","grpc_status":14}}),
                 3=>json!({"status":"failure","kind":{"type":"identity_mismatch"}}),
+                5=>json!({"status":"failure","kind":{"type":"not_found"}}),
                 _=>json!({"status":"success","data":{"node":name,"myRank":99,"myScore":88}}),
             };
             axum::Json(json!({"request_id":request["request_id"],"identity":request["identity"],"observation":crate::client::Observation::default(),"outcome":outcome}))
         }
     }))).await
+}
+#[tokio::test]
+async fn node_routing_not_found_is_terminal_without_failover_or_cooldown() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let first_seen = Arc::new(AtomicUsize::new(0));
+    let second_seen = Arc::new(AtomicUsize::new(0));
+    let (first, a) = routing_mock("first", Arc::new(AtomicUsize::new(5)), first_seen.clone()).await;
+    let (second, b) =
+        routing_mock("second", Arc::new(AtomicUsize::new(0)), second_seen.clone()).await;
+    let mut cfg = config();
+    cfg.node_routing = Some(crate::node_routing::Config {
+        local_priority: None,
+        targets: vec![
+            routing_target("second", second, 20),
+            routing_target("first", first, 10),
+        ],
+        failure_threshold: 1,
+        cooldown_ms: 60000,
+        ..Default::default()
+    });
+    let front = GameClient::new(cfg).unwrap();
+    for n in 1..=2 {
+        assert!(matches!(
+            front
+                .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+                .await,
+            Err(AppError::NotFound)
+        ));
+        // A missing player is an answer, not a node fault: no failover, no cooldown.
+        assert_eq!(first_seen.load(Ordering::Relaxed), n);
+        assert_eq!(second_seen.load(Ordering::Relaxed), 0);
+    }
+    a.abort();
+    b.abort();
 }
 #[tokio::test]
 async fn node_routing_priorities_cooldown_single_probe_and_terminal_game_errors() {
@@ -5790,10 +8698,11 @@ async fn node_routing_priorities_cooldown_single_probe_and_terminal_game_errors(
     })
     .await
     .unwrap();
+    // Another key: identical Version calls would join the probe's execution instead.
     for _ in 0..5 {
         assert_eq!(
             front
-                .public_call(crate::peer::Operation::Version {})
+                .public_call(crate::peer::Operation::Announcements { tab: 0 })
                 .await
                 .unwrap()["node"],
             "second"
@@ -5849,6 +8758,141 @@ async fn node_routing_does_not_replay_ambiguous_authenticated_query_but_can_skip
     );
     a.abort();
     b.abort();
+}
+/// A peer that answers `status` with a body that must never be read or forwarded.
+async fn status_mock(
+    status: u16,
+    seen: Arc<std::sync::atomic::AtomicUsize>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    peer_http_server(axum::Router::new().route(
+        "/internal/v1/peer/query",
+        axum::routing::post(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(json!({"secret":"never-forward"})),
+                )
+            }
+        }),
+    ))
+    .await
+}
+#[tokio::test]
+async fn node_routing_authenticated_read_fails_over_after_pre_dispatch_peer_status() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for &status in crate::peer_transport::PRE_DISPATCH_STATUSES {
+        let first_seen = Arc::new(AtomicUsize::new(0));
+        let (first, a) = status_mock(status, first_seen.clone()).await;
+        let (second, b) = routing_mock(
+            "second",
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        let mut cfg = config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            targets: vec![
+                routing_target("first", first, 0),
+                routing_target("second", second, 10),
+            ],
+            failure_threshold: 1,
+            cooldown_ms: 60000,
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        let result = front
+            .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+            .await
+            .unwrap();
+        assert_eq!(result["node"], "second", "{status}");
+        assert_eq!(first_seen.load(Ordering::Relaxed), 1);
+        let nodes = front.node_status();
+        assert!(!result.to_string().contains("never-forward"));
+        assert!(!nodes.to_string().contains("never-forward"));
+        // Still a target fault: the node counts it and cools down.
+        assert_eq!(nodes["targets"][0]["name"], "first");
+        assert_eq!(nodes["targets"][0]["failures"], 1);
+        assert!(
+            nodes["targets"][0]["cooldown_remaining_ms"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        a.abort();
+        b.abort();
+    }
+}
+#[tokio::test]
+async fn node_routing_ambiguous_peer_statuses_stay_terminal_for_authenticated_reads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for status in [307, 403, 408, 409, 429, 500, 502, 503, 504] {
+        let second_seen = Arc::new(AtomicUsize::new(0));
+        let (first, a) = status_mock(status, Arc::new(AtomicUsize::new(0))).await;
+        let (second, b) =
+            routing_mock("second", Arc::new(AtomicUsize::new(0)), second_seen.clone()).await;
+        let mut cfg = config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            targets: vec![
+                routing_target("first", first, 0),
+                routing_target("second", second, 10),
+            ],
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        assert!(
+            matches!(
+                front
+                    .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+                    .await,
+                Err(AppError::Transport)
+            ),
+            "{status}"
+        );
+        assert_eq!(second_seen.load(Ordering::Relaxed), 0);
+        // Anonymous reads already fail over on any target fault.
+        assert_eq!(
+            front
+                .public_call(crate::peer::Operation::Version {})
+                .await
+                .unwrap()["node"],
+            "second"
+        );
+        a.abort();
+        b.abort();
+    }
+}
+#[tokio::test]
+async fn node_routing_real_executor_token_or_path_mismatch_fails_over_to_local() {
+    // 401: another credential; 404: the executor serves regional paths only.
+    for (prefix, token) in [
+        ("/internal/v1/peer", "other-node-secret"),
+        ("/internal/v1/jp/peer", "node-secret"),
+    ] {
+        let upstream = fixture(vec![]).await;
+        let remote = client(&upstream, account_config());
+        let (url, server) =
+            peer_http_server(crate::peer::router(remote, prefix, token.into())).await;
+        let local = fixture(vec![Reply::version(), empty_profile_reply()]).await;
+        let mut cfg = account_config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: Some(10),
+            targets: vec![routing_target("remote", url, 0)],
+            ..Default::default()
+        });
+        let front = client(&local, cfg);
+        assert!(front
+            .public_call(crate::peer::Operation::Profile { profile_id: 1 })
+            .await
+            .is_ok());
+        assert!(upstream.received.lock().unwrap().is_empty());
+        assert_eq!(local.received.lock().unwrap().len(), 2);
+        assert_eq!(front.node_status()["targets"][0]["failures"], 1);
+        server.abort();
+    }
 }
 #[tokio::test]
 async fn node_routing_total_deadline_stops_before_next_target_and_recovers_admission() {
@@ -5933,6 +8977,7 @@ async fn node_routing_configuration_and_admin_scope_are_enforced_at_deployment()
         listen: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         access_log: None,
+        http_compression: None,
         regions: BTreeMap::from([("jp".into(), cfg.clone()), ("hk".into(), hk)]),
     };
     assert!(DeploymentConfig::Multi(Box::new(deployment))
@@ -5984,46 +9029,97 @@ async fn node_routing_local_priority_tie_and_incoming_peer_never_forward() {
 
 #[tokio::test]
 async fn node_routing_cancelled_request_releases_bounded_admission() {
+    use crate::peer::Operation;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let mode = Arc::new(AtomicUsize::new(4));
-    let seen = Arc::new(AtomicUsize::new(0));
-    let (url, server) = routing_mock("remote", mode.clone(), seen.clone()).await;
-    let mut cfg = config();
-    cfg.node_routing = Some(crate::node_routing::Config {
-        local_priority: None,
-        max_inflight: 1,
-        targets: vec![routing_target("remote", url, 0)],
-        ..Default::default()
-    });
-    let front = GameClient::new(cfg).unwrap();
-    let copy = front.clone();
-    let first =
-        tokio::spawn(async move { copy.public_call(crate::peer::Operation::Version {}).await });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while seen.load(Ordering::Relaxed) < 1 {
-            tokio::task::yield_now().await;
+    // Announcements waits for the single admission permit; an identical Version joins the
+    // first execution and takes it over when that caller goes away.
+    let operations: [fn() -> Operation; 2] = [
+        || Operation::Announcements { tab: 0 },
+        || Operation::Version {},
+    ];
+    for second_operation in operations {
+        let mode = Arc::new(AtomicUsize::new(4));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (url, server) = routing_mock("remote", mode.clone(), seen.clone()).await;
+        let mut cfg = config();
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            max_inflight: 1,
+            targets: vec![routing_target("remote", url, 0)],
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        let copy = front.clone();
+        let first = tokio::spawn(async move { copy.public_call(Operation::Version {}).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let copy = front.clone();
+        let second = tokio::spawn(async move { copy.public_call(second_operation()).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        mode.store(0, Ordering::Relaxed);
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()["node"],
+            "remote"
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn node_routing_coalesces_identical_public_reads_into_one_post() {
+    use crate::peer::Operation;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for ranking in [false, true] {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (url, server) =
+            routing_mock("remote", Arc::new(AtomicUsize::new(4)), seen.clone()).await;
+        let mut cfg = config();
+        cfg.upstream.coalesce_public_reads = ranking;
+        // One admission permit and a short deadline: joined callers must not queue for it.
+        cfg.node_routing = Some(crate::node_routing::Config {
+            local_priority: None,
+            max_inflight: 1,
+            timeout_ms: 1000,
+            targets: vec![routing_target("remote", url, 0)],
+            ..Default::default()
+        });
+        let front = GameClient::new(cfg).unwrap();
+        let calls = (0..10)
+            .map(|_| {
+                let front = front.clone();
+                tokio::spawn(async move {
+                    front
+                        .public_call(if ranking {
+                            Operation::MusicRanking { music_id: 1 }
+                        } else {
+                            Operation::Version {}
+                        })
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        for call in calls {
+            let value = call.await.unwrap().unwrap();
+            assert_eq!(value["node"], "remote");
+            assert_eq!(value.get("myRank").is_none(), ranking);
+            assert_eq!(value.get("myScore").is_none(), ranking);
         }
-    })
-    .await
-    .unwrap();
-    let copy = front.clone();
-    let second =
-        tokio::spawn(async move { copy.public_call(crate::peer::Operation::Version {}).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(seen.load(Ordering::Relaxed), 1);
-    mode.store(0, Ordering::Relaxed);
-    first.abort();
-    assert!(first.await.unwrap_err().is_cancelled());
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), second)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()["node"],
-        "remote"
-    );
-    assert_eq!(seen.load(Ordering::Relaxed), 2);
-    server.abort();
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -6199,6 +9295,12 @@ fn master_registry_corruption_and_legacy_snapshots_have_explicit_integrity_behav
     .is_ok());
     std::fs::write(path.join("MasterFixture.json"), b"invalid JSON").unwrap();
     assert!(registry::manifest(&output, None, registry_scope()).is_err());
+    // The legacy inventory also validates UTF-8 inside strings, not just JSON structure.
+    std::fs::write(path.join("MasterFixture.json"), b"{\"items\":\"\xff\"}").unwrap();
+    assert!(matches!(
+        registry::manifest(&output, None, registry_scope()),
+        Err(master::MasterError::Format)
+    ));
 }
 #[cfg(unix)]
 #[test]
@@ -6311,6 +9413,569 @@ async fn master_registry_http_auth_conditional_reads_and_pinned_bytes_work_witho
         503
     );
     assert!(f.received.lock().unwrap().is_empty());
+}
+
+/// GET with an optional If-None-Match; answers (status, headers, body bytes).
+async fn conditional_get(
+    app: &axum::Router,
+    path: &str,
+    token: &str,
+    if_none_match: Option<&str>,
+) -> (u16, axum::http::HeaderMap, Vec<u8>) {
+    let mut request = Request::get(path).header("authorization", format!("Bearer {token}"));
+    if let Some(value) = if_none_match {
+        request = request.header("if-none-match", value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+#[tokio::test]
+async fn master_current_reads_revalidate_with_content_etag() {
+    let (_root, _input, output, _) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let (status, _, manifest) =
+        conditional_get(&app, "/api/v1/master-data/manifest", "api", None).await;
+    assert_eq!(status, 200);
+    let manifest: Value = serde_json::from_slice(&manifest).unwrap();
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let (status, headers, bytes) = conditional_get(&app, table, "api", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        bytes,
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    // The current table ETag equals the pinned table ETag for the same content.
+    assert_eq!(
+        headers["etag"],
+        format!("\"{}\"", manifest["files"][0]["sha256"].as_str().unwrap())
+    );
+    for path in [table, "/api/v1/master-data"] {
+        let (status, headers, bytes) = conditional_get(&app, path, "api", None).await;
+        assert_eq!(status, 200);
+        let etag = headers["etag"].to_str().unwrap().to_owned();
+        assert_eq!(
+            etag,
+            format!("\"{}\"", crate::master_registry::digest(&bytes))
+        );
+        for condition in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"x\", W/{etag}"),
+            "*".into(),
+        ] {
+            let (status, headers, bytes) =
+                conditional_get(&app, path, "api", Some(&condition)).await;
+            assert_eq!(status, 304, "{path} {condition}");
+            assert!(bytes.is_empty());
+            assert_eq!(headers["etag"], etag.as_str());
+            assert_eq!(headers["x-master-version"], "fixture-v1");
+            assert_eq!(headers["cache-control"], "private, no-cache");
+            assert_eq!(headers["content-type"], "application/json");
+        }
+        let (status, _, full) = conditional_get(&app, path, "api", Some("\"0000\"")).await;
+        assert_eq!(status, 200);
+        assert_eq!(full, bytes);
+    }
+    // Table lookup and authorization run before any conditional evaluation.
+    let missing = "/api/v1/master-data/tables/MasterMissing";
+    assert_eq!(
+        conditional_get(&app, missing, "api", Some("*")).await.0,
+        404
+    );
+    assert_eq!(
+        conditional_get(&app, table, "internal", Some("*")).await.0,
+        401
+    );
+    assert!(f.received.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn master_current_conditional_read_never_hides_corruption() {
+    use crate::master;
+    let (_root, _input, output, receipt) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let status_path = "/api/v1/master-data";
+    let (_, headers, _) = conditional_get(&app, table, "api", None).await;
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    let (_, headers, _) = conditional_get(&app, status_path, "api", None).await;
+    let status_etag = headers["etag"].to_str().unwrap().to_owned();
+    std::fs::write(
+        output.join(&receipt.snapshot).join("MasterFixture.json"),
+        b"[]",
+    )
+    .unwrap();
+    assert!(matches!(
+        master::read_current(&output, Some("MasterFixture")),
+        Err(master::MasterError::Integrity)
+    ));
+    for condition in [etag.as_str(), "*"] {
+        let (status, headers, bytes) = conditional_get(&app, table, "api", Some(condition)).await;
+        assert_eq!(status, 503, "{condition}");
+        assert!(headers.get("etag").is_none());
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["code"], "master_unavailable");
+    }
+    // The status document reads no table and still revalidates normally.
+    assert_eq!(
+        conditional_get(&app, status_path, "api", Some(&status_etag))
+            .await
+            .0,
+        304
+    );
+    assert_eq!(conditional_get(&app, status_path, "api", None).await.0, 200);
+}
+#[tokio::test]
+async fn master_current_etag_on_legacy_snapshot() {
+    let (_root, _input, output, receipt) = registry_fixture();
+    let snapshot = output.join(&receipt.snapshot);
+    std::fs::remove_file(snapshot.join("tables.json")).unwrap();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let (status, headers, bytes) = conditional_get(&app, table, "api", None).await;
+    assert_eq!(status, 200);
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    assert_eq!(
+        etag,
+        format!("\"{}\"", crate::master_registry::digest(&bytes))
+    );
+    assert_eq!(
+        conditional_get(&app, table, "api", Some(&etag)).await.0,
+        304
+    );
+    // Without an index the ETag follows whatever bytes are read.
+    std::fs::write(snapshot.join("MasterFixture.json"), b"[{\"id\":2}]").unwrap();
+    let (status, headers, bytes) = conditional_get(&app, table, "api", Some(&etag)).await;
+    assert_eq!(status, 200);
+    assert_eq!(bytes, b"[{\"id\":2}]");
+    assert_eq!(
+        headers["etag"],
+        format!("\"{}\"", crate::master_registry::digest(b"[{\"id\":2}]"))
+    );
+    assert_ne!(headers["etag"], etag.as_str());
+    assert!(!snapshot.join("tables.json").exists());
+}
+#[tokio::test]
+async fn master_current_etag_follows_current_switch() {
+    let (_root, input, output, first) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let table = "/api/v1/master-data/tables/MasterFixture";
+    let status_path = "/api/v1/master-data";
+    let (_, headers, _) = conditional_get(&app, table, "api", None).await;
+    let table_etag = headers["etag"].to_str().unwrap().to_owned();
+    let (_, headers, _) = conditional_get(&app, status_path, "api", None).await;
+    let status_etag = headers["etag"].to_str().unwrap().to_owned();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "fixture-v2".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let second = crate::master::import_directory(&input, &output, &decoder).unwrap();
+    assert_ne!(first.snapshot, second.snapshot);
+    // Identical table bytes stay valid, and the 304 carries the new version.
+    let (status, headers, _) = conditional_get(&app, table, "api", Some(&table_etag)).await;
+    assert_eq!(status, 304);
+    assert_eq!(headers["x-master-version"], "fixture-v2");
+    assert_eq!(headers["etag"], table_etag.as_str());
+    // The status document names the snapshot, so its validator changes.
+    let (status, headers, bytes) =
+        conditional_get(&app, status_path, "api", Some(&status_etag)).await;
+    assert_eq!(status, 200);
+    assert_ne!(headers["etag"], status_etag.as_str());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["version"],
+        "fixture-v2"
+    );
+    // A cross-region snapshot or an invalid pointer is unavailable, never unchanged.
+    let receipt_path = output.join(&second.snapshot).join("receipt.json");
+    let mut receipt: Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["region"] = json!("hk");
+    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    for path in [table, status_path] {
+        for condition in [table_etag.as_str(), status_etag.as_str(), "*"] {
+            assert_eq!(
+                conditional_get(&app, path, "api", Some(condition)).await.0,
+                503,
+                "{path} {condition}"
+            );
+        }
+    }
+    std::fs::write(output.join("CURRENT"), "../escape").unwrap();
+    for path in [table, status_path] {
+        assert_eq!(
+            conditional_get(&app, path, "api", Some("*")).await.0,
+            503,
+            "{path}"
+        );
+    }
+}
+#[test]
+fn master_current_digest_matches_bytes_and_index_verification() {
+    use crate::{master, master_registry as registry};
+    let (_root, _input, output, receipt) = registry_fixture();
+    for table in [None, Some("MasterFixture")] {
+        let document = master::read_current(&output, table).unwrap();
+        assert_eq!(document.sha256, registry::digest(&document.bytes));
+    }
+    let directory = output.join(&receipt.snapshot);
+    let manifest =
+        master::Manifest::parse(&std::fs::read(directory.join("MasterManifest.json")).unwrap())
+            .unwrap();
+    let bytes = include_bytes!("../tests/fixtures/master-synthetic.json");
+    let size = bytes.len() as u64;
+    let hash = registry::digest(bytes);
+    let verify = |size: u64, hash: &str| {
+        registry::verify_indexed_digest(&directory, &manifest, "MasterFixture", size, hash)
+    };
+    assert!(verify(size, &hash).is_ok());
+    assert!(matches!(
+        verify(size + 1, &hash),
+        Err(master::MasterError::Integrity)
+    ));
+    assert!(matches!(
+        verify(size, &"0".repeat(64)),
+        Err(master::MasterError::Integrity)
+    ));
+    std::fs::remove_file(directory.join("tables.json")).unwrap();
+    assert!(verify(size + 1, &"0".repeat(64)).is_ok());
+}
+fn json_nested_arrays(depth: usize) -> Vec<u8> {
+    ["[".repeat(depth), "]".repeat(depth)].concat().into_bytes()
+}
+fn json_nested_objects(depth: usize) -> Vec<u8> {
+    ["{\"a\":".repeat(depth), "1".into(), "}".repeat(depth)]
+        .concat()
+        .into_bytes()
+}
+#[test]
+fn master_json_validator_matches_value_parser() {
+    use crate::master::validate_json;
+    let agree = |bytes: &[u8]| {
+        assert_eq!(
+            validate_json(bytes).is_ok(),
+            serde_json::from_slice::<serde_json::Value>(bytes).is_ok(),
+            "{}",
+            String::from_utf8_lossy(bytes)
+        );
+    };
+    let mut corpus: Vec<Vec<u8>> = [
+        &b"\"\xff\""[..],
+        b"{\"\xff\":1}",
+        b"\"\\ud800\"",
+        b"{\"\\udc00\":1}",
+        b"\"\\ud83d\\ude00\"",
+        b"1e400",
+        b"[-1e400]",
+        b"1.7976931348623157e308",
+        b"18446744073709551615",
+        b"18446744073709551616",
+        b"-9223372036854775809",
+        b"123456789012345678901234567890",
+        b"-0",
+        b"{\"a\":1,\"a\":2}",
+        b"\"a\x01b\"",
+        b"\"\\x\"",
+        b"\"\\u12\"",
+        b"01",
+        b"-",
+        b"1.",
+        b".5",
+        b"NaN",
+        b"\xef\xbb\xbf{}",
+        b"",
+        b" \n\t ",
+        b"{} \n",
+        b"{} x",
+        b"[1,]",
+        b"{\"a\":1,}",
+        b"{\"a\" 1}",
+        b"{1:2}",
+        b"[true,false,null]",
+        b"tru",
+    ]
+    .iter()
+    .map(|bytes| bytes.to_vec())
+    .collect();
+    for depth in [127, 128, 129, 200_000] {
+        corpus.push(json_nested_arrays(depth));
+        corpus.push(json_nested_objects(depth));
+    }
+    for bytes in &corpus {
+        agree(bytes);
+    }
+    assert!(validate_json(&json_nested_arrays(127)).is_ok());
+    assert!(validate_json(&json_nested_objects(127)).is_ok());
+    for depth in [128, 200_000] {
+        assert!(validate_json(&json_nested_arrays(depth)).is_err());
+        assert!(validate_json(&json_nested_objects(depth)).is_err());
+    }
+    for invalid in [&b"1e400"[..], b"\"\xff\"", b"{\"\xff\":1}", b"\"\\ud800\""] {
+        assert!(validate_json(invalid).is_err());
+    }
+    assert!(validate_json(b"{\"a\":1,\"a\":2}").is_ok());
+    // IgnoredAny skips these unchecked; the differential above would catch a regression to it.
+    for skipped in [&b"1e400"[..], b"\"\xff\"", b"\"\\ud800\""] {
+        assert!(serde_json::from_slice::<serde::de::IgnoredAny>(skipped).is_ok());
+    }
+    assert!(serde_json::from_slice::<serde::de::IgnoredAny>(&json_nested_arrays(200)).is_ok());
+    let inline = br#"{"a":[[1,-2,3.5,-0.0,1e10,2E-3,1.5e+2,0,true,false,null],[]],"s":"x\u00e9\ud83d\ude00\n\"\\\/","o":{"k":{},"l":[{}]},"n":18446744073709551615,"m":-9223372036854775808,"f":1.7976931348623157e308}"#;
+    let substitutions = [
+        b'"', b'\\', b'{', b'}', b'[', b']', b',', b':', b'0', b'e', b'-', b' ', 0x00, 0xff,
+    ];
+    for document in [
+        &include_bytes!("../tests/fixtures/master-synthetic.json")[..],
+        &inline[..],
+    ] {
+        assert!(validate_json(document).is_ok());
+        for end in 0..=document.len() {
+            agree(&document[..end]);
+        }
+        let mut mutated = document.to_vec();
+        for position in 0..document.len() {
+            for byte in substitutions {
+                mutated[position] = byte;
+                agree(&mutated);
+            }
+            mutated[position] = document[position];
+        }
+    }
+}
+/// Rewrites MasterFixture.json with `bytes` and makes tables.json list their length and digest.
+fn rewrite_indexed_fixture(snapshot: &std::path::Path, bytes: &[u8]) {
+    use crate::master_registry as registry;
+    std::fs::write(snapshot.join("MasterFixture.json"), bytes).unwrap();
+    let mut index: registry::Inventory =
+        serde_json::from_slice(&std::fs::read(snapshot.join("tables.json")).unwrap()).unwrap();
+    index.files = vec![registry::file("MasterFixture.json".into(), bytes)];
+    std::fs::write(
+        snapshot.join("tables.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+}
+#[test]
+fn master_registry_table_intact_trusts_index_only_for_unchanged_polls() {
+    use crate::{master::MasterError, master_registry as registry, region::Region};
+    let (_root, _input, output, receipt) = registry_fixture();
+    let snapshot = output.join(&receipt.snapshot);
+    let hash = registry::digest(include_bytes!("../tests/fixtures/master-synthetic.json"));
+    let read = |hash: &str| {
+        registry::table(
+            &output,
+            Region::Jp,
+            &receipt.snapshot,
+            "MasterFixture",
+            hash,
+        )
+    };
+    let intact = |hash: &str| {
+        registry::table_intact(
+            &output,
+            Region::Jp,
+            &receipt.snapshot,
+            "MasterFixture",
+            hash,
+        )
+    };
+    assert!(read(&hash).is_ok());
+    assert!(intact(&hash));
+    // Invalid UTF-8 inside a string, with an index that matches it.
+    let invalid = b"{\"items\":\"\xff\"}";
+    rewrite_indexed_fixture(&snapshot, invalid);
+    let invalid_hash = registry::digest(invalid);
+    assert!(matches!(read(&invalid_hash), Err(MasterError::Format)));
+    assert!(intact(&invalid_hash));
+    assert!(!intact(&hash));
+    // Bytes that no longer match the index are rejected by both.
+    std::fs::write(snapshot.join("MasterFixture.json"), b"{\"items\":[]}").unwrap();
+    let other = registry::digest(b"{\"items\":[]}");
+    assert!(matches!(read(&other), Err(MasterError::Integrity)));
+    assert!(!intact(&other));
+    std::fs::write(snapshot.join("MasterFixture.json"), invalid).unwrap();
+    // Legacy unindexed snapshots are parsed again.
+    std::fs::remove_file(snapshot.join("tables.json")).unwrap();
+    assert!(!intact(&invalid_hash));
+    assert!(matches!(read(&invalid_hash), Err(MasterError::Format)));
+}
+#[test]
+fn master_current_table_intact_mirrors_registry() {
+    use crate::{
+        master::{self, MasterError},
+        region::Region,
+    };
+    let (_root, _input, output, receipt) = registry_fixture();
+    let snapshot = output.join(&receipt.snapshot);
+    let intact = |table: &str, region: Region, version: &str| {
+        master::current_table_intact(&output, table, region, version)
+    };
+    assert!(intact("MasterFixture", Region::Jp, &receipt.version));
+    assert!(!intact("MasterFixture", Region::Jp, "other-version"));
+    assert!(!intact("MasterFixture", Region::Hk, &receipt.version));
+    assert!(!intact("Unlisted", Region::Jp, &receipt.version));
+    let invalid = b"{\"items\":\"\xff\"}";
+    rewrite_indexed_fixture(&snapshot, invalid);
+    // The v1 current read already trusts the index; unchanged polls extend the same trust.
+    assert!(master::read_current(&output, Some("MasterFixture")).is_ok());
+    assert!(intact("MasterFixture", Region::Jp, &receipt.version));
+    assert!(!intact("MasterFixture", Region::Jp, "other-version"));
+    std::fs::write(snapshot.join("MasterFixture.json"), b"{\"items\":[]}").unwrap();
+    assert!(matches!(
+        master::read_current(&output, Some("MasterFixture")),
+        Err(MasterError::Integrity)
+    ));
+    assert!(!intact("MasterFixture", Region::Jp, &receipt.version));
+    std::fs::write(snapshot.join("MasterFixture.json"), invalid).unwrap();
+    std::fs::remove_file(snapshot.join("tables.json")).unwrap();
+    assert!(!intact("MasterFixture", Region::Jp, &receipt.version));
+    std::fs::write(
+        snapshot.join("MasterFixture.json"),
+        include_bytes!("../tests/fixtures/master-synthetic.json"),
+    )
+    .unwrap();
+    assert!(intact("MasterFixture", Region::Jp, &receipt.version));
+}
+/// Builds an encrypted Master file whose decrypted, gunzipped body is `body`. The first
+/// plaintext block is the skipped header, so CBC can be built backwards from decryption.
+fn encrypted_master_body(body: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(body).unwrap();
+    let mut plaintext = vec![0u8; 32];
+    plaintext.extend(gzip.finish().unwrap());
+    let padding = 32 - plaintext.len() % 32;
+    plaintext.extend(std::iter::repeat_n(padding as u8, padding));
+    let cipher = crate::rijndael::Rijndael256::new(&std::array::from_fn(|i| i as u8));
+    let blocks = plaintext.as_chunks::<32>().0;
+    let mut ciphertext = vec![[0x5a_u8; 32]; blocks.len()];
+    for i in (1..blocks.len()).rev() {
+        let decrypted = cipher.decrypt_block(&ciphertext[i]);
+        ciphertext[i - 1] = std::array::from_fn(|j| decrypted[j] ^ blocks[i][j]);
+    }
+    let mut data = vec![0u8; 32];
+    data.extend(ciphertext.concat());
+    data
+}
+#[test]
+fn master_decoder_rejects_decrypted_bodies_that_are_not_json() {
+    use crate::master::{Entry, MasterError};
+    let (_, decoder, _) = master_fixture();
+    let entry = |data: &[u8]| Entry {
+        name: "MasterFixture.bin".into(),
+        size: data.len() as u64,
+        hash: crate::master_registry::digest(data),
+    };
+    let valid = encrypted_master_body(b"{\"items\":[]}");
+    assert_eq!(
+        decoder.decode(&entry(&valid), &valid).unwrap(),
+        b"{\"items\":[]}"
+    );
+    for body in [
+        &b"{\"items\":\"\xff\"}"[..],
+        b"{\"items\":[1e400]}",
+        b"{} x",
+    ] {
+        let data = encrypted_master_body(body);
+        assert!(matches!(
+            decoder.decode(&entry(&data), &data),
+            Err(MasterError::Format)
+        ));
+    }
+}
+#[tokio::test]
+async fn master_bundle_rejects_verified_bytes_that_are_not_json() {
+    use crate::{error::AppError, master_registry as registry};
+    let (_root, _input, output, _receipt) = registry_fixture();
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&output, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let permit = || {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap()
+    };
+    let bundle = |manifest: registry::PublishedManifest, bytes: Vec<u8>| {
+        crate::master_bundle::build(
+            manifest,
+            move |_| std::future::ready(Ok::<_, AppError>(bytes.clone())),
+            permit(),
+        )
+    };
+    let valid = include_bytes!("../tests/fixtures/master-synthetic.json").to_vec();
+    assert!(bundle(manifest.clone(), valid).await.is_ok());
+    // Size and digest match the (re-hashed) manifest, but the bytes are not JSON.
+    let invalid = b"{\"items\":\"\xff\"}".to_vec();
+    let mut forged = manifest;
+    forged.files = vec![registry::file("MasterFixture.json".into(), &invalid)];
+    forged.content_sha256 = registry::content_hash(
+        &forged.scope,
+        &forged.source_manifest,
+        &registry::Inventory {
+            schema_version: 1,
+            version: forged.version.clone(),
+            files: forged.files.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        bundle(forged, invalid).await,
+        Err(AppError::MasterUnavailable)
+    ));
+}
+#[tokio::test]
+async fn master_current_conditional_read_works_on_regional_routes() {
+    use crate::{
+        deployment::{DeploymentConfig, MultiConfig},
+        region::Region,
+    };
+    let (_root, input, _, _) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let master = directory.path().join("hk");
+    crate::master::import_directory_for_region(&input, &master, &decoder, None, Region::Hk)
+        .unwrap();
+    let mut hk = regional_config(Region::Hk);
+    hk.master_directory = Some(master);
+    let deployment = DeploymentConfig::Multi(Box::new(MultiConfig {
+        logging: None,
+        tls: None,
+        access_log: None,
+        http_compression: None,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        regions: BTreeMap::from([("hk".into(), hk)]),
+    }));
+    let app = deployment.prepare().unwrap().router;
+    let path = "/api/v1/hk/master-data/tables/MasterFixture";
+    let (status, headers, _) = conditional_get(&app, path, "public-hk", None).await;
+    assert_eq!(status, 200);
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    let (status, headers, bytes) = conditional_get(&app, path, "public-hk", Some(&etag)).await;
+    assert_eq!(status, 304);
+    assert!(bytes.is_empty());
+    assert_eq!(headers["cache-control"], "private, no-cache");
 }
 
 fn master_sync_config(origin: String, output: std::path::PathBuf) -> Config {
@@ -6863,6 +10528,68 @@ async fn master_history_pages_follow_commits_across_new_publications_and_reject_
         registry::history_page(&output, registry_scope(), 1, Some(&first.snapshot)),
         Err(master::MasterError::NotFound)
     ));
+    assert!(f.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn master_history_reports_resource_version() {
+    use crate::{master, master_registry as registry};
+    use axum::body::{to_bytes, Body};
+    let (_root, input, output, first) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    let second =
+        master::import_directory_with_resource_version(&input, &output, &decoder, Some("asset-7"))
+            .unwrap();
+    let page = registry::history_page(&output, registry_scope(), 10, None).unwrap();
+    assert_eq!(page.entries[0].snapshot, second.snapshot);
+    assert_eq!(page.entries[0].resource_version.as_deref(), Some("asset-7"));
+    assert_eq!(page.entries[1].snapshot, first.snapshot);
+    assert!(page.entries[1].resource_version.is_none());
+    let check = |body: &Value| {
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["resource_version"], "asset-7");
+        // Serialized as an explicit null, like `published_at`.
+        assert!(entries[1]
+            .as_object()
+            .unwrap()
+            .get("resource_version")
+            .unwrap()
+            .is_null());
+    };
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/master-data/history")
+                .header("authorization", "Bearer api")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    check(&body(response).await);
+    let registry = standalone_registry_config(output.clone())
+        .prepare()
+        .unwrap()
+        .router;
+    let response = registry
+        .oneshot(
+            Request::get("/api/v1/master-data/history")
+                .header("authorization", "Bearer owner-read")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["backend"], "files");
+    check(&body["history"]);
     assert!(f.received.lock().unwrap().is_empty());
 }
 
@@ -7538,7 +11265,9 @@ async fn asset_dispatch_admin_pages_and_adopts_with_auth_and_durable_transitions
     let mut other = identity;
     other.resource_version = "2".into();
     let pending = store.observe(other).unwrap();
-    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let (control, mut commands, _) = crate::asset_dispatch_admin::channel(
+        crate::asset_dispatch_admin::DispatchStatus::pending(&store, 10),
+    );
     let owner = tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             crate::asset_dispatch_admin::handle(command, &mut store);
@@ -7697,7 +11426,9 @@ async fn asset_dispatch_admin_abandoned_commands_do_not_mutate_after_timeout() {
     let key = store.observe(identity).unwrap();
     store.begin_send(&key).unwrap();
     store.fail(&key, "submission_ambiguous").unwrap();
-    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let (control, mut commands, _) = crate::asset_dispatch_admin::channel(
+        crate::asset_dispatch_admin::DispatchStatus::pending(&store, 1),
+    );
     let app = crate::asset_dispatch_admin::router(control, "/dispatch", "admin".into());
     let request = Request::post(format!("/dispatch/entries/{key}/adopt"))
         .header("authorization", "Bearer admin")
@@ -8180,6 +11911,17 @@ async fn master_git_commits_verified_content_reuses_identical_imports_and_preser
         serde_json::from_slice(&git(&["show", "HEAD:sirius-publication.json"])).unwrap();
     assert!(metadata.get("snapshot").is_none());
     assert_eq!(metadata["content_sha256"], first.content_sha256);
+    // The subject is unchanged; a second paragraph is a real Git trailer.
+    assert_eq!(
+        master_git_message(&repository, &first.commit),
+        (
+            format!(
+                "Sirius Master jp {}\n\nSirius-Content-SHA256: {}\n",
+                manifest.version, first.content_sha256
+            ),
+            first.content_sha256.clone()
+        )
+    );
     let (mut manifest, decoder, _) = master_fixture();
     master::import_directory(&input, &source, &decoder).unwrap();
     let repeated = master_git::commit(&source, &state, registry_scope())
@@ -8187,6 +11929,12 @@ async fn master_git_commits_verified_content_reuses_identical_imports_and_preser
         .unwrap();
     assert!(!repeated.changed);
     assert_eq!(repeated.commit, first.commit);
+    assert_eq!(
+        String::from_utf8(git(&["rev-list", "--count", "HEAD"]))
+            .unwrap()
+            .trim(),
+        "1"
+    );
     manifest.version = "git-next".into();
     std::fs::write(
         input.join("MasterManifest.json"),
@@ -8204,6 +11952,16 @@ async fn master_git_commits_verified_content_reuses_identical_imports_and_preser
             .unwrap()
             .trim(),
         first.commit
+    );
+    assert_eq!(
+        master_git_message(&repository, &next.commit),
+        (
+            format!(
+                "Sirius Master jp git-next\n\nSirius-Content-SHA256: {}\n",
+                next.content_sha256
+            ),
+            next.content_sha256.clone()
+        )
     );
     let current = std::fs::read(source.join("CURRENT")).unwrap();
     assert_ne!(current, before);
@@ -8491,6 +12249,7 @@ async fn master_git_worker_publishes_on_start_and_update_with_independent_notifi
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 86400,
+        timeout_seconds: 120,
         remote: None,
     });
     let prepared = crate::deployment::DeploymentConfig::Single(Box::new(cfg.clone()))
@@ -8571,6 +12330,7 @@ async fn master_git_worker_periodically_retries_rejected_push_preserving_install
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
+        timeout_seconds: 120,
         remote: Some(crate::master_git::Remote {
             proxy_url_env: None,
             url: url::Url::from_directory_path(&remote).unwrap().to_string(),
@@ -8626,6 +12386,7 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
+        timeout_seconds: 120,
         remote: Some(crate::master_git::Remote {
             proxy_url_env: None,
             url: "https://git.example/repo.git".into(),
@@ -8677,6 +12438,19 @@ fn master_git_worker_rejects_credential_scope_reuse_and_invalid_configuration() 
     cfg.master_git.as_mut().unwrap().interval_seconds = 9;
     assert!(cfg.validate().is_err());
     cfg.master_git.as_mut().unwrap().interval_seconds = 10;
+    let game = GameClient::new(cfg.clone()).unwrap();
+    for (timeout, valid) in [(9, false), (10, true), (600, true), (601, false)] {
+        cfg.master_git.as_mut().unwrap().timeout_seconds = timeout;
+        assert_eq!(cfg.validate().is_ok(), valid, "{timeout}");
+        assert_eq!(GameClient::new(cfg.clone()).is_ok(), valid, "{timeout}");
+        let game = game.clone();
+        assert_eq!(
+            crate::master_git_worker::Worker::new(&cfg, game).is_ok(),
+            valid,
+            "{timeout}"
+        );
+    }
+    cfg.master_git.as_mut().unwrap().timeout_seconds = 120;
     cfg.master_directory = None;
     assert!(cfg.validate().is_err());
     std::env::remove_var(name);
@@ -8708,6 +12482,7 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 10,
+        timeout_seconds: 120,
         remote: Some(crate::master_git::Remote {
             proxy_url_env: None,
             url: format!("{origin}/repository.git"),
@@ -8741,6 +12516,258 @@ async fn master_git_worker_shutdown_cancels_stalled_remote_request() {
             .is_ok()
     );
     server.abort();
+}
+
+#[test]
+fn master_git_timeout_defaults_and_bounds() {
+    use crate::master_git;
+    assert_eq!(master_git::Options::default().timeout_seconds, 120);
+    let parsed: crate::master_git_worker::Config =
+        yaml_serde::from_str("state_directory: x").unwrap();
+    assert_eq!(parsed.timeout_seconds, 120);
+    assert_eq!(parsed.options().timeout_seconds, 120);
+    let configured: crate::master_git_worker::Config =
+        yaml_serde::from_str("state_directory: x\ntimeout_seconds: 600").unwrap();
+    assert_eq!(configured.options().timeout_seconds, 600);
+    assert!(yaml_serde::from_str::<crate::master_git_worker::Config>(
+        "state_directory: x\ntimeout: 30"
+    )
+    .is_err());
+    assert!(yaml_serde::from_str::<crate::master_git_worker::Config>(
+        "state_directory: x\ntimeout_seconds: -1"
+    )
+    .is_err());
+    for (timeout, valid) in [
+        (0, false),
+        (9, false),
+        (10, true),
+        (600, true),
+        (601, false),
+    ] {
+        let options = master_git::Options {
+            timeout_seconds: timeout,
+            ..Default::default()
+        };
+        if valid {
+            assert!(options.validate().is_ok(), "{timeout}");
+        } else {
+            assert!(
+                matches!(options.validate(), Err(master_git::Error::TimeoutConfig)),
+                "{timeout}"
+            );
+        }
+    }
+    // The branch is still checked first and keeps its own error.
+    let invalid_branch = master_git::Options {
+        branch: "a..b".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        invalid_branch.validate(),
+        Err(master_git::Error::LayoutConfig)
+    ));
+}
+
+#[test]
+fn master_git_timeout_env_override_is_strict() {
+    use crate::master_git;
+    use std::ffi::OsStr;
+    let mut options = master_git::Options::default();
+    options.apply_timeout_override(None).unwrap();
+    assert_eq!(options.timeout_seconds, 120);
+    for (value, expected) in [("10", 10), ("600", 600), ("120", 120)] {
+        options
+            .apply_timeout_override(Some(OsStr::new(value)))
+            .unwrap();
+        assert_eq!(options.timeout_seconds, expected);
+    }
+    options.timeout_seconds = 75;
+    for value in [
+        "9", "601", "0", "", " 60", "60 ", "+60", "-60", "60s", "1e2", "0600", "060", "1000",
+        "６０",
+    ] {
+        assert!(
+            matches!(
+                options.apply_timeout_override(Some(OsStr::new(value))),
+                Err(master_git::Error::TimeoutConfig)
+            ),
+            "{value:?}"
+        );
+        assert_eq!(options.timeout_seconds, 75, "{value:?}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(matches!(
+            options.apply_timeout_override(Some(OsStr::from_bytes(b"6\xff"))),
+            Err(master_git::Error::TimeoutConfig)
+        ));
+        assert_eq!(options.timeout_seconds, 75);
+    }
+}
+
+#[test]
+fn master_git_remote_options_bound_low_speed_without_credentials() {
+    let name = format!("SIRIUS_GIT_TEST_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&name, "Authorization: Bearer lowspeed-secret");
+    let remote = crate::master_git::Remote {
+        url: "https://git.example/repo.git".into(),
+        authorization_env: Some(name.clone()),
+        proxy_url_env: None,
+        allow_http: true,
+        allow_file: false,
+    };
+    assert!(remote.validate().is_ok());
+    let options: Vec<String> = remote
+        .options_for_test()
+        .into_iter()
+        .map(|o| o.into_string().unwrap())
+        .collect();
+    for setting in ["http.lowSpeedLimit=1000", "http.lowSpeedTime=30"] {
+        assert!(
+            options
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == setting),
+            "{setting}"
+        );
+    }
+    assert!(options
+        .iter()
+        .all(|o| !o.contains("lowspeed-secret") && !o.contains("Bearer")));
+    let mentions: Vec<_> = options.iter().filter(|o| o.contains(&name)).collect();
+    assert_eq!(mentions.len(), 1);
+    assert!(mentions[0].starts_with("--config-env=http."));
+    std::env::remove_var(name);
+}
+
+#[tokio::test]
+async fn master_git_invalid_timeout_fails_before_state_is_created() {
+    use crate::master_git;
+    let (root, _, source, _) = registry_fixture();
+    let state = root.path().join("git");
+    let options = master_git::Options {
+        timeout_seconds: 5,
+        ..Default::default()
+    };
+    let policy = master_git::CommitPolicy::default();
+    assert!(matches!(
+        master_git::commit_with_options(&source, &state, registry_scope(), &policy, &options).await,
+        Err(master_git::Error::TimeoutConfig)
+    ));
+    let remote = master_git::Remote {
+        url: url::Url::from_directory_path(root.path().join("remote.git"))
+            .unwrap()
+            .to_string(),
+        authorization_env: None,
+        proxy_url_env: None,
+        allow_http: false,
+        allow_file: true,
+    };
+    let options = master_git::Options {
+        timeout_seconds: 601,
+        ..Default::default()
+    };
+    assert!(matches!(
+        master_git::adopt_with_options(&state, registry_scope(), &remote, &options).await,
+        Err(master_git::Error::TimeoutConfig)
+    ));
+    assert!(!state.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_configured_budget_bounds_stalled_remote() {
+    use crate::master_git;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().fallback({
+        let hits = hits.clone();
+        move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+    });
+    let (origin, server) = peer_http_server(app).await;
+    let (root, _, source, _) = registry_fixture();
+    let before = std::fs::read(source.join("CURRENT")).unwrap();
+    let state = root.path().join("git");
+    let remote = master_git::Remote {
+        url: format!("{origin}/repository.git"),
+        authorization_env: None,
+        proxy_url_env: None,
+        allow_http: true,
+        allow_file: false,
+    };
+    let options = master_git::Options {
+        timeout_seconds: 10,
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let result = master_git::publish_with_options(
+        &source,
+        &state,
+        registry_scope(),
+        &remote,
+        &master_git::CommitPolicy::default(),
+        &options,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(matches!(result, Err(master_git::Error::Git)));
+    // The configured 10 s budget fired: not the 120 s default and not the 30 s low-speed
+    // window.
+    assert!(
+        elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(25),
+        "{elapsed:?}"
+    );
+    assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    // The remote check failed before any commit, and the state lock was released.
+    assert_eq!(adopt_local_ref(&state, "master-data"), None);
+    assert!(master_git::commit(&source, &state, registry_scope())
+        .await
+        .is_ok());
+    assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_large_budget_publishes_and_adopts_over_file_remote() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    // 600 s is the git_process ceiling for one command, and is accepted.
+    let options = master_git::Options {
+        timeout_seconds: 600,
+        ..Default::default()
+    };
+    let published = master_git::publish_with_options(
+        &source,
+        &root.path().join("git"),
+        registry_scope(),
+        &remote,
+        &master_git::CommitPolicy::default(),
+        &options,
+    )
+    .await
+    .unwrap();
+    assert!(published.changed && published.remote_verified);
+    let adoption = master_git::adopt_with_options(
+        &root.path().join("adopted"),
+        registry_scope(),
+        &remote,
+        &options,
+    )
+    .await
+    .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.commit, published.commit);
 }
 
 #[cfg(unix)]
@@ -8806,6 +12833,10 @@ async fn master_git_policy_signs_with_ssh_and_preserves_refs_when_signer_fails()
         verify.status.success(),
         "SSH signature must verify against independently supplied public key"
     );
+    // The signature covers the whole message, including the trailer.
+    let (message, trailer) = master_git_message(&repo, &first.commit);
+    assert_eq!(message.matches("\nSirius-Content-SHA256: ").count(), 1);
+    assert_eq!(trailer, first.content_sha256);
     assert!(
         !master_git::commit_with_policy(&source, &state, registry_scope(), &policy)
             .await
@@ -8989,6 +13020,10 @@ async fn master_git_openpgp_policy_signs_and_verifies_with_isolated_keyring() {
     assert!(
         verified.status.success(),
         "OpenPGP commit signature verification failed"
+    );
+    assert_eq!(
+        master_git_message(&state.join("repository.git"), &receipt.commit).1,
+        receipt.content_sha256
     );
 }
 
@@ -9290,7 +13325,9 @@ async fn dispatch_archive_admin_requires_auth_completion_and_survives_owner_rest
     store.acknowledge(&key, &job).unwrap();
     store.complete(&key, &job, &"b".repeat(64), None).unwrap();
     let pending = store.observe(archive_dispatch_identity("v2")).unwrap();
-    let (control, mut commands) = crate::asset_dispatch_admin::channel();
+    let (control, mut commands, _) = crate::asset_dispatch_admin::channel(
+        crate::asset_dispatch_admin::DispatchStatus::pending(&store, 2),
+    );
     let owner = tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             crate::asset_dispatch_admin::handle(command, &mut store);
@@ -9357,6 +13394,7 @@ fn master_database_config() -> crate::master_database::Config {
         root_certificate: None,
         plaintext_loopback: true,
         timeout_seconds: 10,
+        read_timeout_seconds: None,
         keep_snapshots: 2,
         max_read_connections: 4,
     }
@@ -9408,6 +13446,139 @@ async fn master_database_policy_rejects_unsafe_transport_and_source_before_conne
         Err(Error::Snapshot)
     ));
     assert_eq!(std::fs::read(source.join("CURRENT")).unwrap(), before);
+}
+
+#[tokio::test]
+async fn master_database_read_deadline_is_bounded_defaulted_and_separate_from_writes() {
+    use crate::master_database as db;
+    use std::time::Duration;
+    let password = format!("SIRIUS_TEST_DB_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&password, "fixture-db-secret");
+    let mut good = master_database_config();
+    good.password_env = password;
+    // The client_auth-style literal (no read deadline) keeps validating.
+    good.validate().unwrap();
+    for seconds in [1, 600] {
+        let mut c = good.clone();
+        c.read_timeout_seconds = Some(seconds);
+        c.validate().unwrap();
+    }
+    for seconds in [0, 601] {
+        let mut c = good.clone();
+        c.read_timeout_seconds = Some(seconds);
+        assert!(c.validate().is_err());
+    }
+    let yaml = "host: 127.0.0.1\ndatabase: d\nusername: u\npassword_env: P\n";
+    let parsed: db::Config =
+        yaml_serde::from_str(&format!("{yaml}read_timeout_seconds: 5\n")).unwrap();
+    assert_eq!(parsed.read_timeout_seconds, Some(5));
+    assert_eq!(
+        yaml_serde::from_str::<db::Config>(yaml)
+            .unwrap()
+            .read_timeout_seconds,
+        None
+    );
+    assert!(yaml_serde::from_str::<db::Config>(&format!("{yaml}read_timeout_ms: 5\n")).is_err());
+    let mut c = good.clone();
+    c.timeout_seconds = 120;
+    assert_eq!(c.read_timeout(), Duration::from_secs(30));
+    c.timeout_seconds = 10;
+    assert_eq!(c.read_timeout(), Duration::from_secs(10));
+    c.read_timeout_seconds = Some(45);
+    assert_eq!(c.read_timeout(), Duration::from_secs(45));
+    // Writers keep timeout_seconds for their server deadlines; readers use the read deadline.
+    c.timeout_seconds = 120;
+    c.read_timeout_seconds = None;
+    let write = c.options_named("sirius-master-database").unwrap();
+    let write = write.get_options().unwrap();
+    assert!(write.contains("statement_timeout=120000"), "{write}");
+    assert!(write.contains("lock_timeout=120000"), "{write}");
+    let read = c.read_options().unwrap();
+    let read = read.get_options().unwrap().to_owned();
+    assert!(read.contains("statement_timeout=30000"), "{read}");
+    assert!(read.contains("lock_timeout=30000"), "{read}");
+    assert!(!read.contains("fixture-db-secret"));
+    let (deadline, acquire, options) = db::Reader::new(&c).unwrap().limits().await;
+    assert_eq!(
+        (deadline, acquire, options.as_deref()),
+        (
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            Some(read.as_str())
+        )
+    );
+    c.read_timeout_seconds = Some(2);
+    let (deadline, acquire, options) = db::Reader::new(&c).unwrap().limits().await;
+    assert_eq!(
+        (deadline, acquire),
+        (Duration::from_secs(2), Duration::from_secs(2))
+    );
+    let options = options.unwrap();
+    assert!(options.contains("statement_timeout=2000"), "{options}");
+    assert!(options.contains("lock_timeout=2000"), "{options}");
+}
+
+#[tokio::test]
+async fn master_database_reads_fail_fast_on_unresponsive_server_and_retry() {
+    use crate::master_database::{self as db, Error};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let password = format!("SIRIUS_TEST_DB_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&password, "fixture-db-secret");
+    // A black-hole PostgreSQL: connections are accepted and held open, but never answered.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(stream);
+        }
+    });
+    let mut c = master_database_config();
+    c.password_env = password;
+    c.port = port;
+    c.timeout_seconds = 600;
+    c.read_timeout_seconds = Some(1);
+    let reader = db::Reader::new(&c).unwrap();
+    let scope = registry_scope();
+    let expect_fast = |started: Instant, result: Result<(), Error>| {
+        let error = result.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(matches!(error, Error::Timeout | Error::Database));
+        let text = error.to_string();
+        assert!(!text.contains("127.0.0.1") && !text.contains(&port.to_string()));
+    };
+    let started = Instant::now();
+    expect_fast(
+        started,
+        reader.document(&scope, None, None).await.map(|_| ()),
+    );
+    let started = Instant::now();
+    expect_fast(started, reader.history(&scope, 20, None).await.map(|_| ()));
+    let wait_for = |n: usize| {
+        let accepted = accepted.clone();
+        async move {
+            let started = Instant::now();
+            while accepted.load(Ordering::SeqCst) < n && started.elapsed() < Duration::from_secs(2)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            accepted.load(Ordering::SeqCst)
+        }
+    };
+    let seen = wait_for(1).await;
+    assert!(seen >= 1);
+    // No failure is latched: the next read tries the server again.
+    let started = Instant::now();
+    expect_fast(
+        started,
+        reader.document(&scope, None, None).await.map(|_| ()),
+    );
+    assert!(wait_for(seen + 1).await > seen);
+    server.abort();
 }
 
 #[tokio::test]
@@ -9537,6 +13708,26 @@ async fn master_database_postgres_atomic_history_retention_integrity_and_retry()
             .await
             .unwrap();
     assert_eq!(history, 3);
+    // Event metadata outlives payload retention.
+    let page = db::Reader::new(&cfg)
+        .unwrap()
+        .history(&scope, 20, None)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.entries[0].version.as_deref(), Some("db-third"));
+    assert_eq!(page.entries[0].file_count, Some(third.tables as u64));
+    let oldest = &page.entries[2];
+    assert!(!oldest.retained);
+    assert_eq!(oldest.content_sha256, first.content_sha256);
+    assert_eq!(oldest.version, Some(master_fixture().0.version));
+    assert!(oldest.resource_version.is_none());
+    assert_eq!(oldest.file_count, Some(first.tables as u64));
+    assert_eq!(oldest.total_size, Some(first.bytes));
+    assert!(page
+        .entries
+        .windows(2)
+        .all(|pair| pair[0].published_at >= pair[1].published_at));
     let other_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM public.sirius_master_snapshots WHERE scope=$1")
             .bind(other_key)
@@ -9571,6 +13762,135 @@ async fn master_database_postgres_atomic_history_retention_integrity_and_retry()
     tls.plaintext_loopback = false;
     assert!(db::publish(&tls, &source, scope).await.is_err());
     assert!(registry::hash_valid(&third.content_sha256));
+}
+
+fn master_database_test_config() -> crate::master_database::Config {
+    let mut cfg = master_database_config();
+    cfg.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_postgres_steady_state_publish_takes_no_history_lock() {
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master, master_database as db};
+    use sqlx::Connection;
+    let cfg = master_database_test_config();
+    let mut scope = registry_scope();
+    scope.environment = format!("steady-{}", uuid::Uuid::new_v4().simple());
+    let (_root, input, source, _) = registry_fixture();
+    // Creates or upgrades the schema; later publications must find nothing to alter.
+    db::publish(&cfg, &source, scope.clone()).await.unwrap();
+    let (mut manifest, decoder, _) = master_fixture();
+    manifest.version = "steady-second".into();
+    std::fs::write(
+        input.join("MasterManifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    master::import_directory(&input, &source, &decoder).unwrap();
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    // An open history read holds ACCESS SHARE, which any ALTER TABLE would wait behind.
+    let mut reading = conn.begin().await.unwrap();
+    sqlx::query("SELECT id FROM public.sirius_master_history LIMIT 1")
+        .fetch_optional(&mut *reading)
+        .await
+        .unwrap();
+    let mut short = cfg.clone();
+    short.timeout_seconds = 5;
+    let receipt = db::publish(&short, &source, scope.clone()).await.unwrap();
+    assert!(receipt.changed);
+    reading.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_history_reads_legacy_schema_and_upgrades() {
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::master_database as db;
+    use sqlx::Connection;
+    let cfg = master_database_test_config();
+    let mut scope = registry_scope();
+    scope.environment = format!("legacy-{}", uuid::Uuid::new_v4().simple());
+    let (_root, _input, source, _) = registry_fixture();
+    let mut schema = scope.clone();
+    schema.environment.push_str("-schema");
+    db::publish(&cfg, &source, schema).await.unwrap();
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    // Set the shared table aside (instead of dropping columns, which would leave dropped
+    // attributes behind) and recreate the exact 1.2 table for the duration of the test.
+    sqlx::raw_sql(
+        "ALTER TABLE public.sirius_master_history RENAME TO sirius_master_history_c3_saved;
+ALTER INDEX public.sirius_master_history_scope RENAME TO sirius_master_history_scope_c3_saved;
+CREATE TABLE public.sirius_master_history (
+ id BIGSERIAL PRIMARY KEY, scope TEXT NOT NULL, content_hash TEXT NOT NULL,
+ published_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX sirius_master_history_scope ON public.sirius_master_history(scope,id DESC);",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let outcome = tokio::spawn({
+        let (cfg, source) = (cfg.clone(), source.clone());
+        async move {
+            let key = serde_json::to_string(&scope).unwrap();
+            let legacy = "a".repeat(64);
+            let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO public.sirius_master_history(scope,content_hash) VALUES($1,$2)")
+                .bind(&key)
+                .bind(&legacy)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let reader = db::Reader::new(&cfg).unwrap();
+            let page = reader.history(&scope, 10, None).await.unwrap();
+            assert_eq!(page.entries.len(), 1);
+            let event = serde_json::to_value(&page.entries[0]).unwrap();
+            assert!(event["published_at"].is_string());
+            for field in ["version", "resource_version", "file_count", "total_size"] {
+                assert!(event[field].is_null(), "{field}");
+            }
+            let receipt = db::publish(&cfg, &source, scope.clone()).await.unwrap();
+            assert!(receipt.changed);
+            // A 1.2.x writer lists its columns; its events read back without metadata.
+            sqlx::query("INSERT INTO public.sirius_master_history(scope,content_hash,published_at) VALUES($1,$2,CURRENT_TIMESTAMP)")
+                .bind(&key)
+                .bind(&receipt.content_sha256)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let page = reader.history(&scope, 10, None).await.unwrap();
+            assert_eq!(page.entries.len(), 3);
+            assert!(page.entries[0].version.is_none() && page.entries[0].retained);
+            let published = &page.entries[1];
+            assert_eq!(published.version, Some(master_fixture().0.version));
+            assert!(published.resource_version.is_none());
+            assert_eq!(published.file_count, Some(receipt.tables as u64));
+            assert_eq!(published.total_size, Some(receipt.bytes));
+            assert_eq!(page.entries[2].content_sha256, legacy);
+            assert!(page.entries[2].version.is_none() && page.entries[2].file_count.is_none());
+        }
+    })
+    .await;
+    sqlx::raw_sql(
+        "DROP TABLE public.sirius_master_history;
+ALTER TABLE public.sirius_master_history_c3_saved RENAME TO sirius_master_history;
+ALTER INDEX public.sirius_master_history_scope_c3_saved RENAME TO sirius_master_history_scope;",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    outcome.unwrap();
 }
 
 #[test]
@@ -9973,11 +14293,10 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
                 .content_sha256,
         );
     }
-    let app = api::router(
-        GameClient::new(cfg.clone()).unwrap(),
-        "read".into(),
-        "admin".into(),
-    );
+    let table_gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let mut client = GameClient::new(cfg.clone()).unwrap();
+    GameClient::set_test_table_gate(&mut client, table_gate.clone());
+    let app = api::router(client, "read".into(), "admin".into());
     let request = |path: String, etag: Option<String>| {
         let app = app.clone();
         async move {
@@ -10039,6 +14358,18 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
             .0,
         304
     );
+    assert_eq!(table_gate.available(), 1);
+    // A 200 keeps the table permit until its body is taken; meanwhile table reads are refused.
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(&table_path, "read", None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    assert_eq!(table_gate.available(), 0);
+    assert_eq!(request(table_path.clone(), None).await.0, 503);
+    drop(held);
+    assert_eq!(table_gate.available(), 1);
     assert_eq!(
         request(
             format!(
@@ -10087,13 +14418,54 @@ async fn master_database_read_http_integrity_retention_history_and_scope() {
     );
     assert!(remaining.entries.iter().all(|e| !e.retained));
     assert!(remaining.next_before.is_none());
+    // A read queued behind a lock ends at the read deadline (client and server side), not at
+    // the writer budget; reads that avoid the locked table and later writes are unaffected.
+    let mut short = connection.clone();
+    short.timeout_seconds = 600;
+    short.read_timeout_seconds = Some(1);
+    let short_reader = db::Reader::new(&short).unwrap();
+    let mut locker = sqlx::PgConnection::connect_with(&connection.options().unwrap())
+        .await
+        .unwrap();
+    let mut lock = locker.begin().await.unwrap();
+    sqlx::query("LOCK TABLE public.sirius_master_history IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(short_reader.history(&scope, 20, None).await.is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(
+        short_reader
+            .document(&scope, None, None)
+            .await
+            .unwrap()
+            .version,
+        "reader-v3"
+    );
+    lock.rollback().await.unwrap();
+    assert!(!short_reader
+        .history(&scope, 20, None)
+        .await
+        .unwrap()
+        .entries
+        .is_empty());
+    assert!(
+        !db::publish(&connection, &source, scope.clone())
+            .await
+            .unwrap()
+            .changed
+    );
     let (status, _, history) =
         request("/api/v1/master-data/database/history?limit=1".into(), None).await;
     assert_eq!(status, 200);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&history).unwrap()["entries"][0]["content_sha256"],
-        fourth.content_sha256
-    );
+    let newest = &serde_json::from_slice::<Value>(&history).unwrap()["entries"][0];
+    assert_eq!(newest["content_sha256"], fourth.content_sha256);
+    assert_eq!(newest["version"], "reader-v3");
+    assert!(newest["resource_version"].is_null());
+    assert_eq!(newest["file_count"], fourth.tables);
+    assert_eq!(newest["total_size"], fourth.bytes);
+    assert!(chrono::DateTime::parse_from_rfc3339(newest["published_at"].as_str().unwrap()).is_ok());
     let mut other = scope.clone();
     other.environment.push_str("-missing");
     assert!(matches!(
@@ -10206,6 +14578,165 @@ async fn master_database_migration_verifies_committed_chain_before_connection() 
     assert_eq!(chain.entries.len(), 1);
 }
 
+/// The migration source-plan hash exactly as 1.2.x computed it: the History serialization of
+/// that release, which had no `resource_version` in its entries.
+fn legacy_migration_plan_digest(history: &crate::master_registry::History) -> String {
+    fn text<T: serde::Serialize + ?Sized>(value: &T) -> String {
+        serde_json::to_string(value).unwrap()
+    }
+    let entries = history
+        .entries
+        .iter()
+        .map(|e| {
+            format!(
+                r#"{{"snapshot":{},"version":{},"content_sha256":{},"published_at":{},"file_count":{},"total_size":{}}}"#,
+                text(&e.snapshot),
+                text(&e.version),
+                text(&e.content_sha256),
+                text(&e.published_at),
+                e.file_count,
+                e.total_size
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    crate::master_registry::digest(
+        format!(
+            r#"{{"schema_version":{},"scope":{},"head":{},"entries":[{entries}],"has_more":{},"next_before":{},"legacy_boundary":{}}}"#,
+            history.schema_version,
+            text(&history.scope),
+            text(&history.head),
+            history.has_more,
+            text(&history.next_before),
+            history.legacy_boundary
+        )
+        .as_bytes(),
+    )
+}
+
+#[test]
+fn master_database_migration_plan_digest_is_frozen() {
+    use crate::{master, master_database as db, master_registry as registry};
+    let (_root, input, source, _) = registry_fixture();
+    let (_, decoder, _) = master_fixture();
+    master::import_directory_with_resource_version(&input, &source, &decoder, Some("asset-7"))
+        .unwrap();
+    let history = registry::committed_history(&source, registry_scope()).unwrap();
+    assert_eq!(history.entries.len(), 2);
+    assert_eq!(
+        history.entries[0].resource_version.as_deref(),
+        Some("asset-7")
+    );
+    assert!(history.entries[1].resource_version.is_none());
+    let digest = db::migration_plan_digest(&history).unwrap();
+    assert_eq!(digest, legacy_migration_plan_digest(&history));
+    // The public History shape moved on; the durable receipt format did not.
+    assert_ne!(
+        digest,
+        registry::digest(&serde_json::to_vec(&history).unwrap())
+    );
+}
+
+#[test]
+fn master_database_history_rows_validate_metadata() {
+    use crate::master_database::{self as db, Error, HistoryRow};
+    let hash = "ab".repeat(32);
+    let row = || HistoryRow {
+        id: 7,
+        content_hash: hash.clone(),
+        retained: false,
+        published_at: Some("2026-10-01T02:03:04.123456Z".into()),
+        version: Some("1.2.3/0123456789abcdef0123456789abcdef".into()),
+        resource_version: Some("asset-7".into()),
+        file_count: Some(2),
+        total_size: Some(4096),
+    };
+    let entry = serde_json::to_value(db::history_entry(row()).ok().unwrap()).unwrap();
+    assert_eq!(
+        entry,
+        json!({
+            "sequence": "7",
+            "content_sha256": hash,
+            "retained": false,
+            "published_at": "2026-10-01T02:03:04.123456Z",
+            "version": "1.2.3/0123456789abcdef0123456789abcdef",
+            "resource_version": "asset-7",
+            "file_count": 2,
+            "total_size": 4096,
+        })
+    );
+    // Offsets are normalized to UTC.
+    let mut offset = row();
+    offset.published_at = Some("2026-10-01T11:03:04+09:00".into());
+    let entry = serde_json::to_value(db::history_entry(offset).ok().unwrap()).unwrap();
+    assert_eq!(entry["published_at"], "2026-10-01T02:03:04Z");
+    // Events written before 1.3.0 (or by a 1.2.x writer) carry no metadata.
+    let mut legacy = row();
+    legacy.version = None;
+    legacy.resource_version = None;
+    legacy.file_count = None;
+    legacy.total_size = None;
+    let entry = serde_json::to_value(db::history_entry(legacy).ok().unwrap()).unwrap();
+    for field in ["version", "resource_version", "file_count", "total_size"] {
+        assert!(entry[field].is_null(), "{field}");
+    }
+    assert!(entry["published_at"].is_string());
+    let mut unrecorded = row();
+    unrecorded.resource_version = None;
+    let entry = serde_json::to_value(db::history_entry(unrecorded).ok().unwrap()).unwrap();
+    assert!(entry["resource_version"].is_null() && entry["version"].is_string());
+    let max_total = crate::master_registry::MAX_TOTAL as i64;
+    type Mutation = fn(&mut HistoryRow);
+    let invalid: [(&str, Mutation); 15] = [
+        ("version without totals", |r| r.file_count = None),
+        ("totals without version", |r| {
+            r.version = None;
+            r.resource_version = None;
+        }),
+        ("asset without version", |r| {
+            r.version = None;
+            r.file_count = None;
+            r.total_size = None;
+        }),
+        ("path version", |r| {
+            r.version = Some("../secret-version".into())
+        }),
+        ("path asset", |r| {
+            r.resource_version = Some("../secret-asset".into())
+        }),
+        ("long version", |r| r.version = Some("v".repeat(257))),
+        ("no files", |r| r.file_count = Some(0)),
+        ("negative files", |r| r.file_count = Some(-1)),
+        ("negative size", |r| r.total_size = Some(-4096)),
+        ("size below count", |r| r.total_size = Some(1)),
+        ("size over bound", |r| {
+            r.total_size = Some(crate::master_registry::MAX_TOTAL as i64 + 1)
+        }),
+        ("no time", |r| r.published_at = None),
+        ("bad time", |r| {
+            r.published_at = Some("not-a-time-4455".into())
+        }),
+        ("sequence", |r| r.id = 0),
+        ("hash", |r| r.content_hash = "secret-hash".into()),
+    ];
+    for (name, mutate) in invalid {
+        let mut bad = row();
+        mutate(&mut bad);
+        match db::history_entry(bad) {
+            Err(error @ Error::Integrity) => {
+                let text = error.to_string();
+                for value in ["secret", "4455", "vvvv", "4096"] {
+                    assert!(!text.contains(value), "{name}");
+                }
+            }
+            _ => panic!("{name} accepted"),
+        }
+    }
+    let mut bound = row();
+    bound.total_size = Some(max_total);
+    assert!(db::history_entry(bound).is_ok());
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
 async fn master_database_migration_atomic_order_retention_replay_and_conflict() {
@@ -10229,10 +14760,15 @@ async fn master_database_migration_atomic_order_retention_replay_and_conflict() 
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        master::import_directory(&input, &source, &decoder).unwrap();
+        let asset = (version == "third").then_some("migration-asset-3");
+        master::import_directory_with_resource_version(&input, &source, &decoder, asset).unwrap();
     }
     let chain = registry::committed_history(&source, scope.clone()).unwrap();
     assert_eq!(chain.entries.len(), 4);
+    assert_eq!(
+        chain.entries[0].resource_version.as_deref(),
+        Some("migration-asset-3")
+    );
     let head = chain.head.clone();
     // Establish schema and a populated unrelated scope; migration must not overwrite it.
     let mut other = scope.clone();
@@ -10294,11 +14830,37 @@ async fn master_database_migration_atomic_order_retention_replay_and_conflict() 
     assert_ne!(a.changed, b.changed);
     assert_eq!(a.source_sha256, b.source_sha256);
     assert_eq!(a.publications, 4);
-    let rows = sqlx::query("SELECT content_hash,published_at::text AS at FROM public.sirius_master_history WHERE scope=$1 ORDER BY id DESC")
+    // The durable receipt keeps the 1.2 plan format, so scopes migrated by 1.2.x replay.
+    let stored: String = sqlx::query_scalar(
+        "SELECT source_hash FROM public.sirius_master_migrations WHERE scope=$1",
+    )
+    .bind(&key)
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(stored, legacy_migration_plan_digest(&chain));
+    assert_eq!(a.source_sha256, stored);
+    let rows = sqlx::query("SELECT content_hash,published_at::text AS at,version,resource_version,file_count,total_size FROM public.sirius_master_history WHERE scope=$1 ORDER BY id DESC")
         .bind(&key).fetch_all(&mut conn).await.unwrap();
     assert_eq!(rows.len(), 4);
     for (row, entry) in rows.iter().zip(&chain.entries) {
         assert_eq!(row.get::<String, _>("content_hash"), entry.content_sha256);
+        assert_eq!(
+            row.get::<Option<String>, _>("version"),
+            Some(entry.version.clone())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("resource_version"),
+            entry.resource_version
+        );
+        assert_eq!(
+            row.get::<Option<i64>, _>("file_count"),
+            Some(entry.file_count as i64)
+        );
+        assert_eq!(
+            row.get::<Option<i64>, _>("total_size"),
+            Some(entry.total_size as i64)
+        );
         let at: String = row.get("at");
         let parsed = chrono::DateTime::parse_from_str(&at, "%Y-%m-%d %H:%M:%S%.f%#z").unwrap();
         assert_eq!(
@@ -10316,6 +14878,14 @@ async fn master_database_migration_atomic_order_retention_replay_and_conflict() 
     let reader = db::Reader::new(&cfg).unwrap();
     let page = reader.history(&scope, 20, None).await.unwrap();
     assert_eq!(page.entries.iter().filter(|e| e.retained).count(), 3);
+    for (event, entry) in page.entries.iter().zip(&chain.entries) {
+        assert_eq!(event.version.as_ref(), Some(&entry.version));
+        assert_eq!(event.resource_version, entry.resource_version);
+        assert_eq!(
+            event.published_at.timestamp_micros(),
+            entry.published_at.unwrap().timestamp_micros()
+        );
+    }
     assert_eq!(registry::current_snapshot(&source).unwrap(), head);
     // A later normal publication advances CURRENT. Replaying the old migration receipt
     // must acknowledge it without rewinding that newer database state.
@@ -10374,6 +14944,7 @@ fn standalone_registry_config(directory: std::path::PathBuf) -> crate::registry_
         tls: None,
         logging: None,
         access_log: None,
+        http_compression: None,
     }
 }
 #[tokio::test]
@@ -10551,13 +15122,19 @@ async fn standalone_registry_files_auth_integrity_scope_and_real_consumer() {
             status
         );
     }
-    let health = app
-        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let health: Value =
-        serde_json::from_slice(&to_bytes(health.into_body(), 1024).await.unwrap()).unwrap();
-    assert_eq!(health["service"], "sirius-master-registry");
+    let health = |app: axum::Router| async move {
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 1024).await.unwrap())
+            .unwrap()
+    };
+    let first = health(app.clone()).await;
+    assert_eq!(first["service"], "sirius-master-registry");
+    assert_eq!(first["version"], env!("CARGO_PKG_VERSION"));
+    let second = health(app).await;
+    assert!(second["uptime_secs"].as_u64().unwrap() >= first["uptime_secs"].as_u64().unwrap());
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("invalid.yaml");
     std::fs::write(&path, vec![b' '; 65537]).unwrap();
@@ -10671,6 +15248,16 @@ async fn standalone_registry_postgres_pinned_contract_consumer_and_outage() {
     let body: Value =
         serde_json::from_slice(&to_bytes(history.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["backend"], "postgres");
+    let entry = &body["history"]["entries"][0];
+    assert_eq!(entry["content_sha256"], manifest.content_sha256);
+    assert_eq!(entry["version"], manifest.version);
+    assert!(entry["resource_version"].is_null());
+    assert_eq!(entry["file_count"], manifest.files.len());
+    assert_eq!(
+        entry["total_size"],
+        manifest.files.iter().map(|f| f.size).sum::<u64>()
+    );
+    assert!(entry["published_at"].is_string());
     server.abort();
     connection.port = 1;
     cfg.backend = service::Backend::Postgres { connection };
@@ -10878,6 +15465,434 @@ async fn master_bundle_file_http_auth_pinned_hash_conditional_and_corruption() {
     }
 }
 
+/// A proxy router over `registry_fixture()` whose table reads use `gate`.
+async fn table_admission_proxy(
+    gate: crate::master_admission::Gate,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+    axum::Router,
+    Fixture,
+) {
+    let (root, _input, output, receipt) = registry_fixture();
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let mut c = client(&f, cfg);
+    GameClient::set_test_table_gate(&mut c, gate);
+    let app = api::router(c, "api".into(), "internal".into());
+    let manifest = crate::master_registry::manifest(&output, None, registry_scope()).unwrap();
+    let manifest: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&manifest.bytes).unwrap();
+    let pinned = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{}",
+        receipt.snapshot, manifest.files[0].sha256
+    );
+    (root, output.join(receipt.snapshot), pinned, app, f)
+}
+fn table_admission_get(path: &str, token: &str, etag: Option<&str>) -> Request<axum::body::Body> {
+    let mut request = Request::get(path).header("authorization", format!("Bearer {token}"));
+    if let Some(etag) = etag {
+        request = request.header("if-none-match", etag);
+    }
+    request.body(axum::body::Body::empty()).unwrap()
+}
+const TABLE_ADMISSION_CURRENT: &str = "/api/v1/master-data/tables/MasterFixture";
+#[tokio::test]
+async fn master_table_admission_saturation_rejects_tables_but_serves_manifests() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let (_root, snapshot, pinned, app, f) = table_admission_proxy(gate.clone()).await;
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(TABLE_ADMISSION_CURRENT, "api", None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    assert_eq!(gate.available(), 0);
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let started = std::time::Instant::now();
+        let (status, headers, bytes) = conditional_get(&app, path, "api", None).await;
+        assert_eq!(status, 503, "{path}");
+        assert!(started.elapsed() >= Duration::from_millis(50), "{path}");
+        assert!(headers.get("etag").is_none());
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["code"], "master_unavailable");
+    }
+    let snapshot_manifest = format!(
+        "/api/v1/master-data/snapshots/{}/manifest",
+        snapshot.file_name().unwrap().to_str().unwrap()
+    );
+    for path in [
+        "/api/v1/master-data/manifest",
+        "/api/v1/master-data",
+        "/api/v1/master-data/history",
+        snapshot_manifest.as_str(),
+    ] {
+        assert_eq!(
+            conditional_get(&app, path, "api", None).await.0,
+            200,
+            "{path}"
+        );
+    }
+    let bytes = held.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        bytes.as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    assert_eq!(gate.available(), 1);
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        assert_eq!(conditional_get(&app, path, "api", None).await.0, 200);
+        assert_eq!(gate.available(), 1);
+    }
+    assert!(f.received.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn master_table_admission_releases_on_304_error_and_disconnect() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let (_root, snapshot, pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let (status, headers, _) = conditional_get(&app, path, "api", None).await;
+        assert_eq!(status, 200);
+        let etag = headers["etag"].to_str().unwrap().to_owned();
+        let unchanged = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", Some(&etag)))
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), 304, "{path}");
+        assert_eq!(gate.available(), 1, "{path}");
+        // A dropped 200 (client disconnect or HEAD) releases with its body.
+        let full = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", None))
+            .await
+            .unwrap();
+        assert_eq!(full.status(), 200);
+        assert_eq!(gate.available(), 0);
+        drop(full);
+        assert_eq!(gate.available(), 1);
+    }
+    let missing = app
+        .clone()
+        .oneshot(table_admission_get(
+            "/api/v1/master-data/tables/MasterMissing",
+            "api",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    assert_eq!(gate.available(), 1);
+    std::fs::write(snapshot.join("MasterFixture.json"), b"[]").unwrap();
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let corrupt = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", None))
+            .await
+            .unwrap();
+        assert_eq!(corrupt.status(), 503, "{path}");
+        assert_eq!(gate.available(), 1, "{path}");
+    }
+}
+#[tokio::test]
+async fn master_table_admission_keeps_content_length() {
+    use axum::body::HttpBody;
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let (_root, _snapshot, pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    let fixture = include_bytes!("../tests/fixtures/master-synthetic.json");
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let response = app
+            .clone()
+            .oneshot(table_admission_get(path, "api", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.body().size_hint().exact(),
+            Some(fixture.len() as u64),
+            "{path}"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), fixture);
+        assert_eq!(gate.available(), 1);
+    }
+}
+#[tokio::test]
+async fn master_table_admission_waits_fifo_before_rejecting() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_secs(2));
+    let (_root, _snapshot, _pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(TABLE_ADMISSION_CURRENT, "api", None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    let waiting = tokio::spawn(app.clone().oneshot(table_admission_get(
+        TABLE_ADMISSION_CURRENT,
+        "api",
+        None,
+    )));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished());
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(gate.available(), 0);
+    drop(response);
+    assert_eq!(gate.available(), 1);
+}
+#[tokio::test]
+async fn master_table_admission_cancelled_request_releases_permit() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_secs(2));
+    let (_root, _snapshot, pinned, app, _f) = table_admission_proxy(gate.clone()).await;
+    let released = |gate: crate::master_admission::Gate| async move {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gate.available() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    };
+    // Cancelled during the read: a still-running blocking read may hold the permit briefly.
+    for path in [TABLE_ADMISSION_CURRENT, pinned.as_str()] {
+        let task = tokio::spawn(app.clone().oneshot(table_admission_get(path, "api", None)));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        released(gate.clone()).await;
+    }
+    // Cancelled while queued: the abandoned waiter never takes a permit.
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(TABLE_ADMISSION_CURRENT, "api", None))
+        .await
+        .unwrap();
+    let task = tokio::spawn(app.clone().oneshot(table_admission_get(
+        TABLE_ADMISSION_CURRENT,
+        "api",
+        None,
+    )));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    task.abort();
+    let _ = task.await;
+    drop(held);
+    released(gate.clone()).await;
+    assert_eq!(
+        conditional_get(&app, TABLE_ADMISSION_CURRENT, "api", None)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(gate.available(), 1);
+}
+/// Through hyper, a 200 keeps its permit while a client that does not read leaves the body
+/// unsent. `oneshot` never polls the body, so it cannot see hyper drop a body at its end.
+#[tokio::test]
+async fn master_table_admission_holds_permit_until_the_connection_takes_the_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Larger than loopback socket buffers and hyper's write buffer together.
+    const SIZE: usize = 32 * 1024 * 1024;
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let admitted = gate.clone();
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::get(move || {
+            let gate = admitted.clone();
+            async move {
+                let admission = gate.admit().await.unwrap();
+                admission.attach(axum::response::Response::new(axum::body::Body::from(
+                    vec![b'x'; SIZE],
+                )))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(64 * 1024).unwrap();
+    let mut stream = socket.connect(address).await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut status = [0u8; 12];
+    stream.read_exact(&mut status).await.unwrap();
+    assert_eq!(&status, b"HTTP/1.1 200");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        gate.available(),
+        0,
+        "released while the body was still queued"
+    );
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    let head_end = rest.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8_lossy(&rest[..head_end]).to_ascii_lowercase();
+    assert!(
+        head.contains(&format!("content-length: {SIZE}\r\n")),
+        "{head}"
+    );
+    assert_eq!(rest.len() - head_end, SIZE);
+    assert!(rest[head_end..].iter().all(|b| *b == b'x'));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.available() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+/// The database table route admits before it contacts PostgreSQL: a listener that drops every
+/// connection stands in for the database, and records the free permits at each attempt.
+#[tokio::test]
+async fn master_database_table_admission_precedes_the_read() {
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(200));
+    let database = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut connection = master_database_config();
+    connection.port = database.local_addr().unwrap().port();
+    connection.password_env = format!("SIRIUS_TEST_ADMISSION_DB_{}", uuid::Uuid::new_v4().simple());
+    connection.read_timeout_seconds = Some(2);
+    std::env::set_var(&connection.password_env, "unused-password");
+    let (attempts, mut attempted) = tokio::sync::mpsc::unbounded_channel();
+    let observed = gate.clone();
+    let acceptor = tokio::spawn(async move {
+        loop {
+            let (socket, _) = database.accept().await.unwrap();
+            attempts.send(observed.available()).unwrap();
+            drop(socket);
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = regional_config(crate::region::Region::Jp);
+    cfg.master_directory = Some(directory.path().to_path_buf());
+    cfg.master_database = Some(crate::master_database_worker::Config {
+        connection,
+        interval_seconds: 86400,
+    });
+    let mut client = GameClient::new(cfg).unwrap();
+    GameClient::set_test_table_gate(&mut client, gate.clone());
+    let app = api::router(client, "read".into(), "admin".into());
+    let hash = "a".repeat(64);
+    let table = format!("/api/v1/master-data/database/by-hash/{hash}/tables/MasterFixture");
+    let manifest = format!("/api/v1/master-data/database/by-hash/{hash}/manifest");
+    // Saturated: the table read waits out the gate and never reaches the database.
+    let held = gate.admit().await.unwrap();
+    let started = std::time::Instant::now();
+    let (status, headers, bytes) = conditional_get(&app, &table, "read", None).await;
+    assert_eq!(status, 503);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(headers.get("etag").is_none());
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["code"], "master_unavailable");
+    assert!(attempted.try_recv().is_err());
+    // Malformed requests are rejected before they could queue.
+    let started = std::time::Instant::now();
+    let malformed = format!("/api/v1/master-data/database/by-hash/{hash}/tables/..");
+    assert_eq!(conditional_get(&app, &malformed, "read", None).await.0, 400);
+    assert!(started.elapsed() < Duration::from_millis(200));
+    // Manifests are not admitted: they reach the database with the gate still saturated.
+    assert_eq!(conditional_get(&app, &manifest, "read", None).await.0, 503);
+    assert_eq!(attempted.recv().await, Some(0));
+    drop(held);
+    while attempted.try_recv().is_ok() {}
+    // Admitted: the permit is held while the database is contacted, and the error releases it.
+    assert_eq!(conditional_get(&app, &table, "read", None).await.0, 503);
+    assert_eq!(gate.available(), 1);
+    let mut seen = Vec::new();
+    while let Ok(available) = attempted.try_recv() {
+        seen.push(available);
+    }
+    assert!(!seen.is_empty() && seen.iter().all(|a| *a == 0), "{seen:?}");
+    acceptor.abort();
+}
+#[tokio::test]
+async fn registry_service_table_admission() {
+    let _guard = BUNDLE_TEST_LOCK.lock().await;
+    use crate::master_registry as registry;
+    let (_root, _input, source, _) = registry_fixture();
+    let gate = crate::master_admission::Gate::new(1, Duration::from_millis(50));
+    let app = standalone_registry_config(source.clone())
+        .prepare_with_table_gate(gate.clone())
+        .unwrap()
+        .router;
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&source, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let table = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{}",
+        manifest.snapshot, manifest.files[0].sha256
+    );
+    let token = "owner-read";
+    let held = app
+        .clone()
+        .oneshot(table_admission_get(&table, token, None))
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+    let etag = held.headers()["etag"].to_str().unwrap().to_owned();
+    assert_eq!(gate.available(), 0);
+    let (status, _, bytes) = conditional_get(&app, &table, token, None).await;
+    assert_eq!(status, 503);
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["code"], "master_unavailable");
+    // Malformed requests are rejected before they could queue.
+    let malformed = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/zz",
+        manifest.snapshot
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(conditional_get(&app, &malformed, token, None).await.0, 400);
+    assert!(started.elapsed() < Duration::from_millis(50));
+    let by_hash = format!(
+        "/api/v1/master-data/by-hash/{}/manifest",
+        manifest.content_sha256
+    );
+    let snapshot = format!(
+        "/api/v1/master-data/snapshots/{}/manifest",
+        manifest.snapshot
+    );
+    for path in [
+        "/api/v1/master-data/manifest",
+        "/api/v1/master-data/history",
+        by_hash.as_str(),
+        snapshot.as_str(),
+        // Bundle table loads stay under the bundle gate only.
+        "/api/v1/master-data/bundle",
+    ] {
+        assert_eq!(
+            conditional_get(&app, path, token, None).await.0,
+            200,
+            "{path}"
+        );
+    }
+    let bytes = held.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        bytes.as_ref(),
+        include_bytes!("../tests/fixtures/master-synthetic.json")
+    );
+    assert_eq!(gate.available(), 1);
+    let unchanged = app
+        .clone()
+        .oneshot(table_admission_get(&table, token, Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status(), 304);
+    assert_eq!(gate.available(), 1);
+    assert_eq!(conditional_get(&app, &table, token, None).await.0, 200);
+    assert_eq!(gate.available(), 1);
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
 async fn master_bundle_postgres_http_integrity_and_retention() {
@@ -10982,6 +15997,7 @@ fn registry_owner_config(
         local_interval_seconds: None,
         internal_token_env: internal,
         staging_directory: None,
+        retention: None,
     });
     cfg
 }
@@ -11924,9 +16940,16 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         DeploymentConfig::parse(multi).unwrap(),
         DeploymentConfig::Multi(_)
     ));
-    let optional = uncomment_block(&uncomment_block(multi, "tls:"), "access_log:");
+    let optional = uncomment_block(
+        &uncomment_block(&uncomment_block(multi, "tls:"), "access_log:"),
+        "http_compression:",
+    );
     assert!(optional.contains("\ntls:\n") && optional.contains("\naccess_log:\n"));
-    DeploymentConfig::parse(&optional).unwrap();
+    assert!(optional.contains("\nhttp_compression:\n"));
+    let DeploymentConfig::Multi(parsed) = DeploymentConfig::parse(&optional).unwrap() else {
+        panic!("multi-region example");
+    };
+    assert!(parsed.http_compression.unwrap().enabled);
     for (region, source) in [
         ("en", include_str!("../docs/examples/en.yaml")),
         ("hk", include_str!("../docs/examples/hk.yaml")),
@@ -11993,9 +17016,11 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
     for block in [
         "master_update:",
         "master_sync:",
+        "master_retention:",
         "accounts:",
         "tls:",
         "access_log:",
+        "http_compression:",
         "logging:",
         "asset_dispatch:",
         "node_routing:",
@@ -12019,7 +17044,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
     assert!(git.commit.signing.is_some() && git.remote.is_some());
     let registry = &lf(include_str!("../docs/examples/master-registry.yaml"));
     yaml_serde::from_str::<crate::registry_service::Config>(registry).unwrap();
-    for block in ["tls:", "access_log:"] {
+    for block in ["tls:", "access_log:", "http_compression:"] {
         let uncommented = uncomment_block(registry, block);
         assert!(uncommented.contains(&format!("\n{block}\n")), "{block}");
         yaml_serde::from_str::<crate::registry_service::Config>(&uncommented).unwrap();
@@ -12035,6 +17060,7 @@ fn every_shipped_example_parses_including_documented_optional_blocks() {
         let owner = parsed.owner.unwrap();
         assert_eq!(owner.source.is_some(), synchronizing);
         assert_eq!(owner.local_interval_seconds.is_some(), !synchronizing);
+        assert_eq!(owner.retention.is_some(), synchronizing);
     }
     // The documented PostgreSQL backend replaces the files backend.
     let files = "backend:\n  kind: files\n  directory: ./master\n";
@@ -12676,6 +17702,22 @@ fn git_output(repository: &std::path::Path, args: &[&str]) -> Option<String> {
         .success()
         .then(|| String::from_utf8(output.stdout).unwrap())
 }
+/// The raw message of `commit` (after its headers) and its parsed content trailer values.
+fn master_git_message(repository: &std::path::Path, commit: &str) -> (String, String) {
+    let raw = git_output(repository, &["cat-file", "commit", commit]).unwrap();
+    let message = raw.split_once("\n\n").unwrap().1.to_owned();
+    let trailer = git_output(
+        repository,
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Sirius-Content-SHA256,valueonly)",
+            commit,
+        ],
+    )
+    .unwrap();
+    (message, trailer.trim().to_owned())
+}
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
@@ -12688,6 +17730,7 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
     let options = master_git::Options {
         layout: master_git::Layout::IndentedRoot,
         branch: "main".into(),
+        ..Default::default()
     };
     let policy = master_git::CommitPolicy::default();
     let commit = |options: master_git::Options| {
@@ -12744,6 +17787,16 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
     )
     .unwrap();
     assert_eq!(first.content_sha256, manifest.content_sha256);
+    assert_eq!(
+        master_git_message(&repository, &first.commit),
+        (
+            format!(
+                "Sirius Master jp 1.0.0\n\nSirius-Content-SHA256: {}\n",
+                first.content_sha256
+            ),
+            first.content_sha256.clone()
+        )
+    );
     // Repeated publication and an identical reinstall (new snapshot UUID) reuse the commit.
     assert!(!commit(options.clone()).await.unwrap().changed);
     install_plain_master(
@@ -12755,11 +17808,42 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
     let repeated = commit(options.clone()).await.unwrap();
     assert!(!repeated.changed);
     assert_eq!(repeated.commit, first.commit);
+    // Only the asset version changed: version.json differs, so a new commit carries the same
+    // content identity as its predecessor. The trailer is not a one-to-one link.
+    install_plain_master(
+        &source,
+        "1.0.0",
+        Some("asset-2"),
+        &[("MasterAlpha", alpha), ("MasterBeta", beta)],
+    );
+    let asset_only = commit(options.clone()).await.unwrap();
+    assert!(asset_only.changed);
+    assert_eq!(asset_only.content_sha256, first.content_sha256);
+    assert_eq!(git(&["rev-parse", "main^"]).trim(), first.commit);
+    assert_eq!(
+        master_git_message(&repository, &asset_only.commit),
+        master_git_message(&repository, &first.commit)
+    );
+    assert_eq!(
+        git(&["log", "-1", "--format=%s", "main"]).trim(),
+        "Sirius Master jp 1.0.0"
+    );
     // A table removed upstream disappears from the tree; history is linear.
     install_plain_master(&source, "1.0.1", Some("asset-2"), &[("MasterAlpha", alpha)]);
     let next = commit(options.clone()).await.unwrap();
     assert!(next.changed);
-    assert_eq!(git(&["rev-parse", "main^"]).trim(), first.commit);
+    assert_ne!(next.content_sha256, first.content_sha256);
+    assert_eq!(git(&["rev-parse", "main^"]).trim(), asset_only.commit);
+    assert_eq!(
+        master_git_message(&repository, &next.commit),
+        (
+            format!(
+                "Sirius Master jp 1.0.1\n\nSirius-Content-SHA256: {}\n",
+                next.content_sha256
+            ),
+            next.content_sha256.clone()
+        )
+    );
     assert_eq!(
         git(&["ls-tree", "--name-only", "main"]),
         "MasterAlpha.json\nversion.json\n"
@@ -12807,6 +17891,7 @@ async fn master_git_indented_root_publishes_only_tables_and_version_on_configure
         let invalid = master_git::Options {
             layout: master_git::Layout::IndentedRoot,
             branch: branch.into(),
+            ..Default::default()
         };
         assert!(
             matches!(commit(invalid).await, Err(master_git::Error::LayoutConfig)),
@@ -12841,6 +17926,7 @@ async fn master_git_indented_root_pushes_configured_branch_to_remote() {
     let options = master_git::Options {
         layout: master_git::Layout::IndentedRoot,
         branch: "release/main".into(),
+        ..Default::default()
     };
     install_plain_master(
         &source,
@@ -12873,9 +17959,785 @@ async fn master_git_indented_root_pushes_configured_branch_to_remote() {
         git_output(&remote_path, &["show", "release/main:MasterOnly.json"]).unwrap(),
         "{\n  \"a\": {}\n}\n"
     );
+    // The pushed commit keeps its trailer.
+    assert_eq!(
+        master_git_message(&remote_path, &receipt.commit),
+        (
+            format!(
+                "Sirius Master jp 2.0.0\n\nSirius-Content-SHA256: {}\n",
+                receipt.content_sha256
+            ),
+            receipt.content_sha256.clone()
+        )
+    );
     let again = publish().await.unwrap();
     assert!(!again.changed && again.remote_verified);
     assert_eq!(again.commit, receipt.commit);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_trailer_is_not_added_to_reused_pre_1_3_commits() {
+    use crate::master_git;
+    let (root, _, source, _) = registry_fixture();
+    let state = root.path().join("git-state");
+    let repository = state.join("repository.git");
+    let first = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    assert!(first.changed);
+    // A 1.2.x publication of the same tree: subject only, no trailer.
+    let subject = git_output(&repository, &["log", "-1", "--format=%s", &first.commit]).unwrap();
+    let legacy = adopt_fixture_commit(
+        &repository,
+        "master-data",
+        &adopt_tree_entries(&repository, &first.commit),
+        None,
+        subject.trim(),
+    );
+    assert_ne!(legacy, first.commit);
+    assert_eq!(
+        master_git_message(&repository, &legacy),
+        (format!("{}\n", subject.trim()), String::new())
+    );
+    let reused = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    assert!(!reused.changed);
+    assert_eq!(reused.commit, legacy);
+    assert_eq!(reused.content_sha256, first.content_sha256);
+    assert_eq!(
+        git_output(&repository, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        legacy
+    );
+    assert_eq!(
+        git_output(&repository, &["rev-list", "--count", "master-data"])
+            .unwrap()
+            .trim(),
+        "1"
+    );
+    assert_eq!(master_git_message(&repository, &legacy).1, "");
+}
+
+/// A local bare repository reached over `file://`, for offline remote Git tests.
+#[cfg(unix)]
+fn adopt_remote(path: &std::path::Path) -> crate::master_git::Remote {
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+    crate::master_git::Remote {
+        proxy_url_env: None,
+        url: url::Url::from_directory_path(path).unwrap().to_string(),
+        authorization_env: None,
+        allow_http: false,
+        allow_file: true,
+    }
+}
+#[cfg(unix)]
+fn adopt_git(repository: &std::path::Path, args: &[&str], input: &[u8]) -> String {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repository)
+        .args([
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@localhost",
+        ])
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+/// Commit `entries` (`mode type oid\tname` lines) on `parent` and point `branch` at it.
+#[cfg(unix)]
+fn adopt_fixture_commit(
+    repository: &std::path::Path,
+    branch: &str,
+    entries: &[String],
+    parent: Option<&str>,
+    message: &str,
+) -> String {
+    let tree = adopt_git(repository, &["mktree"], entries.join("\n").as_bytes());
+    let mut args = vec!["commit-tree", &tree, "-m", message];
+    if let Some(parent) = parent {
+        args.extend(["-p", parent]);
+    }
+    let commit = adopt_git(repository, &args, b"");
+    adopt_git(
+        repository,
+        &["update-ref", &format!("refs/heads/{branch}"), &commit],
+        b"",
+    );
+    commit
+}
+#[cfg(unix)]
+fn adopt_tree_entries(repository: &std::path::Path, commit: &str) -> Vec<String> {
+    adopt_git(repository, &["ls-tree", commit], b"")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+#[cfg(unix)]
+fn adopt_blob(repository: &std::path::Path, bytes: &[u8]) -> String {
+    adopt_git(repository, &["hash-object", "-w", "--stdin"], bytes)
+}
+#[cfg(unix)]
+fn adopt_local_ref(state: &std::path::Path, branch: &str) -> Option<String> {
+    git_output(
+        &state.join("repository.git"),
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .map(|s| s.trim().to_owned())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_recovers_lost_state() {
+    use crate::{master_git, master_registry as registry};
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let published = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(published.changed && published.remote_verified);
+    std::fs::remove_dir_all(&state).unwrap();
+    // A fresh store never overwrites the remote branch...
+    assert!(matches!(
+        master_git::publish(&source, &state, registry_scope(), &remote).await,
+        Err(master_git::Error::RemoteChanged)
+    ));
+    assert_eq!(adopt_local_ref(&state, "master-data"), None);
+    // ...until the operator adopts it; adoption itself never touches the remote.
+    let adoption = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.previous, None);
+    assert_eq!(adoption.commit, published.commit);
+    assert_eq!(
+        adoption.publication.as_deref(),
+        Some(published.commit.as_str())
+    );
+    let manifest: registry::PublishedManifest = serde_json::from_slice(
+        &registry::manifest(&source, None, registry_scope())
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(adoption.version.as_deref(), Some(manifest.version.as_str()));
+    assert_eq!(
+        adopt_local_ref(&state, "master-data").as_deref(),
+        Some(published.commit.as_str())
+    );
+    assert_eq!(
+        git_output(&remote_path, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        published.commit
+    );
+    let json = serde_json::to_value(&adoption).unwrap();
+    assert_eq!(
+        json.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["adopted", "commit", "previous", "publication", "version"]
+    );
+    let after = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!after.changed && after.remote_verified);
+    assert_eq!(after.commit, published.commit);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_fast_forwards_over_manual_readme_commit() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let first = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    let mut entries = adopt_tree_entries(&remote_path, &first.commit);
+    entries.push(format!(
+        "100644 blob {}\tREADME.md",
+        adopt_blob(&remote_path, b"# Master data\n")
+    ));
+    let readme = adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        &entries,
+        Some(&first.commit),
+        "Add README",
+    );
+    assert!(matches!(
+        master_git::publish(&source, &state, registry_scope(), &remote).await,
+        Err(master_git::Error::RemoteChanged)
+    ));
+    let adoption = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.previous.as_deref(), Some(first.commit.as_str()));
+    assert_eq!(adoption.commit, readme);
+    assert_eq!(adoption.publication.as_deref(), Some(first.commit.as_str()));
+    assert_eq!(adoption.version.as_deref(), Some("1.0.0"));
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let next = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(next.changed && next.remote_verified);
+    let git = |args: &[&str]| git_output(&remote_path, args).unwrap();
+    assert_eq!(
+        git(&["rev-parse", &format!("{}^", next.commit)]).trim(),
+        readme
+    );
+    // Manually added files leave the published tree; history keeps them.
+    assert_eq!(
+        git(&["ls-tree", "--name-only", "master-data"]),
+        "MasterAlpha.json\nsirius-publication.json\n"
+    );
+    assert_eq!(
+        git(&["log", "-1", "--format=%s", "master-data"]).trim(),
+        "Sirius Master jp 1.0.1"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_refuses_divergence() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap()
+        .commit;
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let y = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    let entries = adopt_tree_entries(&remote_path, &x);
+    let z = adopt_fixture_commit(&remote_path, "master-data", &entries, Some(&x), "manual");
+    assert!(matches!(
+        master_git::adopt(&state, registry_scope(), &remote).await,
+        Err(master_git::Error::RemoteChanged)
+    ));
+    assert_eq!(adopt_local_ref(&state, "master-data"), Some(y));
+    assert_eq!(
+        git_output(&remote_path, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        z
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_refuses_unrecognized_history() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    let not_adoptable = |state: std::path::PathBuf| {
+        let remote = remote.clone();
+        async move {
+            let result = master_git::adopt(&state, registry_scope(), &remote).await;
+            assert!(
+                matches!(result, Err(master_git::Error::NotAdoptable)),
+                "{:?}",
+                result.map(|a| a.commit)
+            );
+            assert_eq!(adopt_local_ref(&state, "master-data"), None);
+        }
+    };
+    // (a) A README-only repository has no Sirius publication.
+    let readme = format!(
+        "100644 blob {}\tREADME.md",
+        adopt_blob(&remote_path, b"# Master data\n")
+    );
+    adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        std::slice::from_ref(&readme),
+        None,
+        "Initial commit",
+    );
+    not_adoptable(root.path().join("a")).await;
+    // (b) Only 64 first-parent commits are inspected.
+    adopt_git(
+        &remote_path,
+        &["update-ref", "-d", "refs/heads/master-data"],
+        b"",
+    );
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::publish(
+        &source,
+        &root.path().join("owner"),
+        registry_scope(),
+        &remote,
+    )
+    .await
+    .unwrap()
+    .commit;
+    let entries = adopt_tree_entries(&remote_path, &x);
+    let mut manual = vec![x.clone()];
+    for index in 0..64 {
+        let parent = manual.last().unwrap().clone();
+        manual.push(adopt_fixture_commit(
+            &remote_path,
+            "master-data",
+            &entries,
+            Some(&parent),
+            &format!("manual {index}"),
+        ));
+    }
+    not_adoptable(root.path().join("b")).await;
+    adopt_git(
+        &remote_path,
+        &["update-ref", "refs/heads/master-data", &manual[63]],
+        b"",
+    );
+    let deep = master_git::adopt(&root.path().join("b"), registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(deep.adopted);
+    assert_eq!(deep.publication.as_deref(), Some(x.as_str()));
+    // (c) A Sirius subject over a tree that is not exactly a publication decides the
+    // walk: the valid publication beneath it is never consulted.
+    let table = entries
+        .iter()
+        .find(|e| e.ends_with("\tMasterAlpha.json"))
+        .unwrap()
+        .clone();
+    let metadata = entries
+        .iter()
+        .find(|e| e.ends_with("\tsirius-publication.json"))
+        .unwrap()
+        .clone();
+    let subtree = adopt_git(&remote_path, &["mktree"], table.as_bytes());
+    let blob = adopt_blob(&remote_path, b"[]");
+    let forged: [Vec<String>; 6] = [
+        vec![
+            table.clone(),
+            metadata.clone(),
+            format!("040000 tree {subtree}\tnested.json"),
+        ],
+        vec![table.replace("100644", "100755"), metadata.clone()],
+        vec![table.clone()],
+        vec![
+            table.clone(),
+            metadata.clone(),
+            format!("100644 blob {blob}\tMasterExtra.json"),
+        ],
+        vec![metadata.clone()],
+        vec![
+            table.clone(),
+            metadata.clone(),
+            format!("100644 blob {blob}\tversion.json"),
+        ],
+    ];
+    for (index, entries) in forged.iter().enumerate() {
+        adopt_fixture_commit(
+            &remote_path,
+            "master-data",
+            entries,
+            Some(&x),
+            "Sirius Master jp 1.0.0",
+        );
+        not_adoptable(root.path().join(format!("c{index}"))).await;
+    }
+    // Subject version and region must match the recorded publication.
+    for subject in [
+        "Sirius Master jp 1.0.1",
+        "Sirius Master jp ../x",
+        "Sirius Master jp",
+        "Sirius Master en 1.0.0",
+    ] {
+        adopt_fixture_commit(&remote_path, "master-data", &entries, Some(&x), subject);
+        not_adoptable(root.path().join("subject")).await;
+    }
+    // The same tree with a correct subject is a recognizable publication.
+    let copy = adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        &entries,
+        Some(&x),
+        "Sirius Master jp 1.0.0",
+    );
+    let adoption = master_git::adopt(&root.path().join("subject"), registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert_eq!(adoption.publication.as_deref(), Some(copy.as_str()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_checks_region_scope_and_layout() {
+    use crate::{master_git, region::Region};
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let native_path = root.path().join("native.git");
+    let native = adopt_remote(&native_path);
+    install_plain_master(
+        &source,
+        "1.0.0",
+        Some("asset-1"),
+        &[("MasterAlpha", b"[1]")],
+    );
+    master_git::publish(
+        &source,
+        &root.path().join("owner"),
+        registry_scope(),
+        &native,
+    )
+    .await
+    .unwrap();
+    let indented = master_git::Options {
+        layout: master_git::Layout::IndentedRoot,
+        branch: "main".into(),
+        ..Default::default()
+    };
+    let native_on_indented_branch = master_git::Options {
+        layout: master_git::Layout::IndentedRoot,
+        branch: master_git::DEFAULT_BRANCH.into(),
+        ..Default::default()
+    };
+    let mut en = registry_scope();
+    en.region = Region::En;
+    let mut review = registry_scope();
+    review.environment = "review".into();
+    let mut android = registry_scope();
+    android.platform = crate::region::Platform::Android;
+    for (index, (scope, options)) in [
+        (en.clone(), master_git::Options::default()),
+        (review.clone(), master_git::Options::default()),
+        (android, master_git::Options::default()),
+        (registry_scope(), native_on_indented_branch),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = root.path().join(format!("native-{index}"));
+        assert!(matches!(
+            master_git::adopt_with_options(&state, scope, &native, &options).await,
+            Err(master_git::Error::NotAdoptable)
+        ));
+        assert_eq!(adopt_local_ref(&state, &options.branch), None);
+    }
+    let indented_path = root.path().join("indented.git");
+    let indented_remote = adopt_remote(&indented_path);
+    let policy = master_git::CommitPolicy::default();
+    let published = master_git::publish_with_options(
+        &source,
+        &root.path().join("indented-owner"),
+        registry_scope(),
+        &indented_remote,
+        &policy,
+        &indented,
+    )
+    .await
+    .unwrap();
+    let native_main = master_git::Options {
+        layout: master_git::Layout::Native,
+        branch: "main".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        master_git::adopt_with_options(
+            &root.path().join("indented-native"),
+            registry_scope(),
+            &indented_remote,
+            &native_main,
+        )
+        .await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+    assert!(matches!(
+        master_git::adopt_with_options(
+            &root.path().join("indented-en"),
+            en,
+            &indented_remote,
+            &indented,
+        )
+        .await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+    let state = root.path().join("indented");
+    let adoption =
+        master_git::adopt_with_options(&state, registry_scope(), &indented_remote, &indented)
+            .await
+            .unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.commit, published.commit);
+    assert_eq!(adoption.version.as_deref(), Some("1.0.0"));
+    let after = master_git::publish_with_options(
+        &source,
+        &state,
+        registry_scope(),
+        &indented_remote,
+        &policy,
+        &indented,
+    )
+    .await
+    .unwrap();
+    assert!(!after.changed && after.remote_verified);
+    assert_eq!(after.commit, published.commit);
+    // version.json must be exactly the published document, not merely equivalent JSON.
+    let entries: Vec<String> = adopt_tree_entries(&indented_path, &published.commit)
+        .into_iter()
+        .filter(|e| !e.ends_with("\tversion.json"))
+        .chain([format!(
+            "100644 blob {}\tversion.json",
+            adopt_blob(
+                &indented_path,
+                b"{\"dataVersion\":\"1.0.0\",\"assetVersion\":\"asset-1\"}"
+            )
+        )])
+        .collect();
+    adopt_fixture_commit(
+        &indented_path,
+        "main",
+        &entries,
+        Some(&published.commit),
+        "Sirius Master jp 1.0.0",
+    );
+    assert!(matches!(
+        master_git::adopt_with_options(
+            &root.path().join("indented-compact"),
+            registry_scope(),
+            &indented_remote,
+            &indented,
+        )
+        .await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_accepts_legacy_hk_alias() {
+    use crate::{master_git, region::Region};
+    let root = tempfile::tempdir().unwrap();
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    let table = adopt_blob(&remote_path, b"[]");
+    let metadata = serde_json::to_vec_pretty(&json!({
+        "schema_version": 1,
+        "scope": {"region": "tw", "environment": "release", "platform": "iOS"},
+        "version": "9.9.9",
+        "content_sha256": "0".repeat(64),
+        "files": [{"name": "MasterA.json", "size": 2, "sha256": "0".repeat(64)}],
+        "source_manifest": {"version": "9.9.9", "files": []},
+    }))
+    .unwrap();
+    let metadata = adopt_blob(&remote_path, &metadata);
+    let commit = adopt_fixture_commit(
+        &remote_path,
+        "master-data",
+        &[
+            format!("100644 blob {table}\tMasterA.json"),
+            format!("100644 blob {metadata}\tsirius-publication.json"),
+        ],
+        None,
+        "Sirius Master tw 9.9.9",
+    );
+    let mut hk = registry_scope();
+    hk.region = Region::Hk;
+    let state = root.path().join("hk");
+    let adoption = master_git::adopt(&state, hk, &remote).await.unwrap();
+    assert!(adoption.adopted);
+    assert_eq!(adoption.commit, commit);
+    assert_eq!(adoption.version.as_deref(), Some("9.9.9"));
+    assert!(matches!(
+        master_git::adopt(&root.path().join("jp"), registry_scope(), &remote).await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_remote_absent_and_noop_cases() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    let remote_path = root.path().join("remote.git");
+    let remote = adopt_remote(&remote_path);
+    assert!(matches!(
+        master_git::adopt(&root.path().join("empty"), registry_scope(), &remote).await,
+        Err(master_git::Error::NotAdoptable)
+    ));
+    let missing = master_git::Remote {
+        url: url::Url::from_directory_path(root.path().join("missing.git"))
+            .unwrap()
+            .to_string(),
+        ..remote.clone()
+    };
+    assert!(matches!(
+        master_git::adopt(&root.path().join("missing"), registry_scope(), &missing).await,
+        Err(master_git::Error::Git)
+    ));
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::publish(&source, &state, registry_scope(), &remote)
+        .await
+        .unwrap()
+        .commit;
+    let equal = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!equal.adopted && equal.publication.is_none() && equal.version.is_none());
+    assert_eq!(equal.commit, x);
+    assert_eq!(equal.previous.as_deref(), Some(x.as_str()));
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let y = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    let behind = master_git::adopt(&state, registry_scope(), &remote)
+        .await
+        .unwrap();
+    assert!(!behind.adopted && behind.publication.is_none());
+    assert_eq!(behind.commit, y);
+    assert_eq!(adopt_local_ref(&state, "master-data"), Some(y));
+    assert_eq!(
+        git_output(&remote_path, &["rev-parse", "refs/heads/master-data"])
+            .unwrap()
+            .trim(),
+        x
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_cas_rejects_stale_expected_value() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    let x = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    install_plain_master(&source, "1.0.1", None, &[("MasterAlpha", b"[2]")]);
+    let y = master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap()
+        .commit;
+    let options = master_git::Options::default();
+    for stale in [Some(x.as_str()), None] {
+        assert!(matches!(
+            master_git::advance_for_test(&state, registry_scope(), &options, &x, stale).await,
+            Err(master_git::Error::Git)
+        ));
+        assert_eq!(
+            adopt_local_ref(&state, "master-data").as_deref(),
+            Some(y.as_str())
+        );
+    }
+    master_git::advance_for_test(&state, registry_scope(), &options, &x, Some(&y))
+        .await
+        .unwrap();
+    assert_eq!(adopt_local_ref(&state, "master-data"), Some(x));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn master_git_adopt_respects_owner_lock_and_ownership() {
+    use crate::master_git;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("master");
+    let state = root.path().join("git");
+    install_plain_master(&source, "1.0.0", None, &[("MasterAlpha", b"[1]")]);
+    master_git::commit(&source, &state, registry_scope())
+        .await
+        .unwrap();
+    // The remote does not exist: reaching it would be `Git`, not the local refusal.
+    let unreachable = master_git::Remote {
+        proxy_url_env: None,
+        url: url::Url::from_directory_path(root.path().join("missing.git"))
+            .unwrap()
+            .to_string(),
+        authorization_env: None,
+        allow_http: false,
+        allow_file: true,
+    };
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("owner.lock"))
+        .unwrap();
+    owner.try_lock().unwrap();
+    assert!(matches!(
+        master_git::adopt(&state, registry_scope(), &unreachable).await,
+        Err(master_git::Error::Locked)
+    ));
+    drop(owner);
+    let occupied = root.path().join("occupied");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("keep"), b"user-data").unwrap();
+    assert!(matches!(
+        master_git::adopt(&occupied, registry_scope(), &unreachable).await,
+        Err(master_git::Error::Ownership)
+    ));
+    // As for publication, only the lock file may be created; no marker or repository.
+    assert!(!occupied.join("sirius-git.json").exists());
+    assert!(!occupied.join("repository.git").exists());
+    assert_eq!(std::fs::read(occupied.join("keep")).unwrap(), b"user-data");
+    let linked = root.path().join("linked");
+    std::os::unix::fs::symlink(&state, &linked).unwrap();
+    assert!(matches!(
+        master_git::adopt(&linked, registry_scope(), &unreachable).await,
+        Err(master_git::Error::Ownership)
+    ));
+    let mut wrong = registry_scope();
+    wrong.environment = "review".into();
+    assert!(matches!(
+        master_git::adopt(&state, wrong, &unreachable).await,
+        Err(master_git::Error::Ownership)
+    ));
+    assert!(matches!(
+        master_git::adopt(
+            &state,
+            registry_scope(),
+            &master_git::Remote {
+                allow_file: false,
+                ..unreachable.clone()
+            }
+        )
+        .await,
+        Err(master_git::Error::RemoteConfig)
+    ));
 }
 
 #[cfg(any(unix, windows))]
@@ -12892,6 +18754,7 @@ async fn master_git_worker_reports_missing_asset_version_and_retries_after_insta
         commit: Default::default(),
         state_directory: root.path().join("git"),
         interval_seconds: 86400,
+        timeout_seconds: 120,
         remote: None,
     });
     let game = GameClient::new(cfg.clone()).unwrap();
@@ -13132,6 +18995,7 @@ async fn master_sync_propagates_owner_asset_version_without_redownloading_tables
         &crate::master_git::Options {
             layout: crate::master_git::Layout::IndentedRoot,
             branch: "main".into(),
+            ..Default::default()
         },
     )
     .await
@@ -13330,6 +19194,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             format!("internal-{n}"),
             &format!("/api/v1/{n}"),
             &format!("/internal/v1/{n}"),
+            None,
         );
         let (status, body) = get_json(
             &app,
@@ -13383,6 +19248,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
         let options = master_git::Options {
             layout: master_git::Layout::IndentedRoot,
             branch: "main".into(),
+            ..Default::default()
         };
         let policy = master_git::CommitPolicy::default();
         let receipt = master_git::commit_with_options(
@@ -13404,6 +19270,13 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
         assert_eq!(
             git_output(&repository, &["log", "-1", "--format=%s", "main"]).unwrap(),
             format!("Sirius Master {n} master-fixture\n")
+        );
+        assert_eq!(
+            master_git_message(&repository, &receipt.commit).0,
+            format!(
+                "Sirius Master {n} master-fixture\n\nSirius-Content-SHA256: {}\n",
+                manifest.content_sha256
+            )
         );
         // The Git state is owned by this region; another region's scope is refused.
         let other = [Region::Jp, Region::Hk, Region::En, Region::Kr][(index + 2) % 4];
@@ -13471,6 +19344,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             policy_for(true),
             global_scope(region),
             consumer.clone(),
+            None,
         )
         .unwrap();
         let synced = syncer.update_once().await.unwrap();
@@ -13486,6 +19360,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             policy_for(true),
             global_scope(other),
             root.path().join("x"),
+            None,
         )
         .unwrap();
         assert!(wrong.update_once().await.is_err());
@@ -13499,6 +19374,7 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
             flat.clone(),
             global_scope(other),
             root.path().join("y"),
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -13509,7 +19385,8 @@ async fn global_master_pipeline_installs_serves_publishes_and_syncs_per_region()
         // A same-scope owner never installs on top of another region's directory history.
         let before = std::fs::read(jp_output.join("CURRENT")).unwrap();
         let onto_jp =
-            master_sync::Syncer::standalone(flat, global_scope(region), jp_output.clone()).unwrap();
+            master_sync::Syncer::standalone(flat, global_scope(region), jp_output.clone(), None)
+                .unwrap();
         assert!(matches!(
             onto_jp.update_once().await,
             Err(master_sync::Error::Storage)
@@ -13817,6 +19694,21 @@ fn multi_region_master_publishers_validate_with_distinct_state() {
             .state_directory = directory;
     });
     assert!(state_is_snapshot.validate().is_err());
+    // Regions share one SDK session per identity, so one SDK state directory.
+    let sdk_state = |hk: &str, en: &str| {
+        let (hk, en) = (hk.to_owned(), en.to_owned());
+        mutate(&move |m| {
+            for (region, directory) in [("hk", &hk), ("en", &en)] {
+                m.regions.get_mut(region).unwrap().global_login =
+                    Some(crate::global_account::LoginConfig {
+                        state_directory: Some(directory.into()),
+                        ..Default::default()
+                    });
+            }
+        })
+    };
+    assert!(sdk_state("/data/sdk", "/data/sdk").validate().is_ok());
+    assert!(sdk_state("/data/sdk", "/data/other").validate().is_err());
     let shared_remote = mutate(&|m| {
         let remote = m.regions["jp"].master_git.as_ref().unwrap().remote.clone();
         m.regions
@@ -14053,6 +19945,7 @@ async fn hk_routes_serve_hk_and_alias_paths_are_not_found() {
         logging: None,
         tls: None,
         access_log: None,
+        http_compression: None,
         listen: "127.0.0.1:0".parse().unwrap(),
         regions: BTreeMap::from([("hk".into(), regional_config(Region::Hk))]),
     }));
@@ -14517,12 +20410,16 @@ mod global_accounts {
         paths(f).iter().filter(|p| *p == path).count()
     }
 
+    /// Scripted SDK "code" answered with HTTP 502 instead of an envelope (SDK_PROTOCOL).
+    const SDK_HTTP_ERROR: i64 = i64::MIN;
     /// Local OneSDK mock: verifies every signature and answers tourist/cache login.
     type SdkRequests = Arc<Mutex<Vec<(String, HeaderMap, BTreeMap<String, String>)>>>;
     struct SdkMock {
         url: String,
         requests: SdkRequests,
         codes: Arc<Mutex<VecDeque<i64>>>,
+        /// Scripted `id_token`s of successful `cache.login` answers (default REFRESHED_ID_TOKEN).
+        tokens: Arc<Mutex<VecDeque<String>>>,
         task: tokio::task::JoinHandle<()>,
     }
     impl Drop for SdkMock {
@@ -14543,11 +20440,13 @@ mod global_accounts {
     async fn sdk_mock() -> SdkMock {
         let requests: SdkRequests = Arc::new(Mutex::new(Vec::new()));
         let codes = Arc::new(Mutex::new(VecDeque::new()));
-        let (seen, scripted) = (requests.clone(), codes.clone());
+        let tokens = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let (seen, scripted, scripted_tokens) = (requests.clone(), codes.clone(), tokens.clone());
         let app = axum::Router::new().fallback(
             move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
                 let seen = seen.clone();
                 let scripted = scripted.clone();
+                let scripted_tokens = scripted_tokens.clone();
                 async move {
                     let form = url::form_urlencoded::parse(&body)
                         .into_owned()
@@ -14563,6 +20462,10 @@ mod global_accounts {
                         .collect::<Vec<_>>();
                     let signed = map.get("sign") == Some(&global_sdk::sign(&unsigned, APP_KEY));
                     let code = scripted.lock().unwrap().pop_front().unwrap_or(0);
+                    if code == SDK_HTTP_ERROR {
+                        use axum::response::IntoResponse;
+                        return axum::http::StatusCode::BAD_GATEWAY.into_response();
+                    }
                     let body = if !signed {
                         json!({"code": -999, "message": "bad sign"})
                     } else if code != 0 {
@@ -14571,10 +20474,15 @@ mod global_accounts {
                         json!({"code": 0, "data": {"uid": UID.parse::<u64>().unwrap(), "access_key": ACCESS_KEY,
                                "id_token": ID_TOKEN, "is_tourist": 1}})
                     } else {
+                        let id_token = scripted_tokens
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or_else(|| REFRESHED_ID_TOKEN.into());
                         json!({"code": 0, "data": {"uid": map.get("uid").cloned().unwrap_or_default(),
-                               "id_token": REFRESHED_ID_TOKEN}})
+                               "id_token": id_token}})
                     };
-                    axum::Json(body)
+                    axum::response::IntoResponse::into_response(axum::Json(body))
                 }
             },
         );
@@ -14583,6 +20491,7 @@ mod global_accounts {
             url,
             requests,
             codes,
+            tokens,
             task,
         }
     }
@@ -14919,6 +20828,7 @@ mod global_accounts {
             let requests = sdk.requests.lock().unwrap();
             let (_, headers, form) = &requests[0];
             assert_eq!(headers["user-agent"], "Mozilla/5.0 BSGameSDK");
+            assert!(!headers.contains_key("accept-encoding"));
             assert_eq!(headers["api-version"], "1");
             assert_eq!(headers["one-sdk-ver"], "1.25.0");
             assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
@@ -15155,6 +21065,76 @@ mod global_accounts {
     }
 
     #[tokio::test]
+    async fn looked_up_player_not_found_keeps_the_session_and_answers_not_found() {
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        // Live 2026-09-27: another region's (or an unknown) profile ID answers gRPC 2 with
+        // PLAYER_NOT_FOUND about the target. Repeating it must not disable the account.
+        for _ in 0..3 {
+            e.script
+                .call_errors
+                .lock()
+                .unwrap()
+                .push_back((2, "PLAYER_NOT_FOUND"));
+            assert!(matches!(
+                c.public_call(crate::peer::Operation::Profile {
+                    profile_id: 99999999999
+                })
+                .await,
+                Err(AppError::NotFound)
+            ));
+        }
+        let s = status(&c);
+        assert_eq!(s["session_state"], "active");
+        assert_eq!(s["disabled"], false);
+        assert!(s.get("last_error_code").is_none());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        let last = e.f.received.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(last["x-player-credential"], "SECRETCRED-hk-1");
+        // Other codes on a lookup still describe the account's own session.
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(matches!(
+            c.public_call(crate::peer::Operation::Profile {
+                profile_id: 99999999999
+            })
+            .await,
+            Err(AppError::Grpc(16))
+        ));
+        assert_eq!(status(&c)["session_state"], "relogin_pending");
+    }
+
+    #[tokio::test]
+    async fn maintenance_during_player_login_is_maintenance_not_an_account_failure() {
+        let e = env(Region::En).await;
+        e.script
+            .login_errors
+            .lock()
+            .unwrap()
+            .push_back((2, "UNDER_MAINTENANCE"));
+        let c = GameClient::for_test(e.cfg.clone());
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::Maintenance(2))
+        ));
+        let s = status(&c);
+        assert_eq!(s["disabled"], false);
+        assert_ne!(s["session_state"], "cooling");
+        // Across peers it stays a game outcome, not a node fault.
+        let failure: crate::peer::Failure = AppError::Maintenance(2).into();
+        assert!(matches!(
+            failure,
+            crate::peer::Failure::Game { grpc_status: 2 }
+        ));
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn ban_disables_and_login_queue_cools_down_without_polling() {
         for (errors, calls, expected) in [
             (vec![(7, "BAN_ACCOUNT")], vec![], "disabled"),
@@ -15209,10 +21189,116 @@ mod global_accounts {
         // No PlayerLogin (or Version) after an SDK refusal, and no SDK retry.
         assert_eq!(count(&e.f, PLAYER_LOGIN), 0);
         assert_eq!(e.sdk.requests.lock().unwrap().len(), 1);
-        // Reload restores the account (operator action); the SDK identity is revalidated.
+        // A CAPTCHA is a refusal of the identity: a reload does not retry it before
+        // sdk_refusal_retry_seconds; a restart without a state directory does.
+        assert_eq!(s["sdk_session"], "refused");
+        c.reload_accounts().await.unwrap();
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(status(&c)["last_error_code"], "SDK_CAPTCHA");
+        assert!(status(&c).get("last_sdk_code").is_none());
+        assert_eq!(e.sdk.requests.lock().unwrap().len(), 1);
+        let restarted = GameClient::for_test(e.cfg.clone());
+        restarted.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert!(status(&restarted).get("last_sdk_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_refusal_reports_the_numeric_sdk_code_for_the_operator() {
+        let e = env(Region::En).await;
+        e.sdk.codes.lock().unwrap().push_back(500_001);
+        let c = GameClient::for_test(e.cfg.clone());
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        let s = status(&c);
+        assert_eq!(s["disabled"], true);
+        assert_eq!(s["last_error_code"], "SDK_REFUSED");
+        assert_eq!(s["last_sdk_code"], 500_001);
+        assert_eq!(s["sdk_session"], "refused");
+        // A reload does not retry a refused identity before sdk_refusal_retry_seconds.
+        c.reload_accounts().await.unwrap();
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(status(&c)["last_sdk_code"], 500_001);
+        // A replaced identity file (new access key) starts a new SDK session.
+        let path = e.cfg.accounts[0].global_identity_file.clone().unwrap();
+        let mut identity: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        identity["sdk"]["access_key"] = json!("SECRETACCESSKEY-new");
+        write_private(&path, &identity);
         c.reload_accounts().await.unwrap();
         c.call(PLAYER_DATA, json!({})).await.unwrap();
         assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert!(status(&c).get("last_sdk_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn sdk_transient_failures_open_the_sdk_path_and_never_cool_the_account() {
+        let e = env(Region::En).await;
+        e.sdk
+            .codes
+            .lock()
+            .unwrap()
+            .extend([SDK_HTTP_ERROR, SDK_HTTP_ERROR]);
+        let c = GameClient::for_test(e.cfg.clone());
+        let sdk_path = |c: &GameClient| c.account_status().unwrap()["sdk_path"].clone();
+        assert_eq!(sdk_path(&c)["state"], "closed");
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        let s = status(&c);
+        assert_eq!(s["consecutive_failures"], 0);
+        assert_eq!(s["cooldown_remaining_seconds"], 0);
+        assert_eq!(s["disabled"], false);
+        assert_eq!(s["last_error_code"], "SDK_PROTOCOL");
+        assert_eq!(sdk_path(&c)["failures"], 1);
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(sdk_path(&c)["state"], "open");
+        assert_eq!(status(&c)["consecutive_failures"], 0);
+        // An open SDK path refuses before the SDK request and spends no login.
+        let sdk_requests = e.sdk.requests.lock().unwrap().len();
+        assert_eq!(status(&c)["logins_24h"], 2);
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::UpstreamUnavailable)
+        ));
+        assert_eq!(e.sdk.requests.lock().unwrap().len(), sdk_requests);
+        assert_eq!(status(&c)["logins_24h"], 2);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 0);
+        // The game path is untouched; a successful probe closes the SDK path.
+        assert_eq!(c.account_status().unwrap()["path"]["state"], "closed");
+        c.test_path(true).expire_for_test();
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(sdk_path(&c)["state"], "closed");
+        assert_eq!(status(&c)["session_state"], "active");
+    }
+
+    #[tokio::test]
+    async fn open_game_path_refuses_global_calls_before_any_login() {
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(V, json!({})).await.unwrap();
+        e.script
+            .call_errors
+            .lock()
+            .unwrap()
+            .extend([(14, ""), (14, "")]);
+        for _ in 0..2 {
+            assert!(matches!(
+                c.call(SERVER_LIST, json!({})).await,
+                Err(AppError::Grpc(14))
+            ));
+        }
+        assert_eq!(c.account_status().unwrap()["path"]["state"], "open");
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::UpstreamUnavailable)
+        ));
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 0);
+        assert!(e.sdk.requests.lock().unwrap().is_empty());
+        let s = status(&c);
+        assert_eq!(s["logins_24h"], 0);
+        assert_eq!(s["consecutive_failures"], 0);
+        assert_eq!(s["session_state"], "none");
     }
 
     #[tokio::test]
@@ -15411,12 +21497,12 @@ mod global_accounts {
             ("account_login", "live_verified"),
             ("player_data", "live_verified"),
             ("account_identity", "implemented_unverified"),
-            ("profile", "implemented_unverified"),
+            ("profile", "live_verified"),
             ("event_ranking", "implemented_unverified"),
             ("event_deck", "implemented_unverified"),
-            ("music_ranking", "implemented_unverified"),
+            ("music_ranking", "live_verified"),
             ("challenge_ranking", "implemented_unverified"),
-            ("announcements", "implemented_unverified"),
+            ("announcements", "live_verified"),
         ] {
             assert_eq!(en["operations"][operation], expected, "{operation}");
         }
@@ -15807,6 +21893,447 @@ regions:
         ))
         .is_err());
     }
+
+    #[tokio::test]
+    async fn global_mismatch_keeps_session_and_account_and_logins_never_carry_versions() {
+        let e = env(Region::Hk).await;
+        let c = GameClient::for_test(e.cfg.clone());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        let push = |status: u16, code: &'static str| {
+            e.script
+                .call_errors
+                .lock()
+                .unwrap()
+                .push_back((status, code))
+        };
+        push(16, "MASTER_VERSION_MISMATCH");
+        assert!(matches!(
+            c.call(PLAYER_DATA, json!({})).await,
+            Err(AppError::Grpc(16))
+        ));
+        // The next call refreshes Version first, without the rejected header; the game still
+        // announces the same version, so refreshes back off instead of repeating per call.
+        push(16, "MASTER_VERSION_MISMATCH");
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        let s = status(&c);
+        assert_eq!(s["disabled"], false);
+        assert_eq!(s["session_state"], "active");
+        assert_eq!(s["last_error_code"], "MASTER_VERSION_MISMATCH");
+        assert_eq!(s["consecutive_failures"], 0);
+        assert_eq!(count(&e.f, V), 2);
+        assert!(c.version_state_for_test().await.2);
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(count(&e.f, V), 2);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 1);
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        // A relogin after the retry window, once the version is due for a refresh again.
+        c.age_version_for_test(Duration::from_secs(601)).await;
+        push(16, "TOKEN_ILLEGAL");
+        assert!(c.call(PLAYER_DATA, json!({})).await.is_err());
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 2);
+        let received = e.f.received.lock().unwrap();
+        let versions = received
+            .iter()
+            .filter(|r| r.0 == V)
+            .map(|r| r.1.contains_key("x-master-version"))
+            .collect::<Vec<_>>();
+        // The second mismatch left the version suspect until a Version call succeeds.
+        assert_eq!(versions, [false, false, false]);
+        for login in received.iter().filter(|r| r.0 == PLAYER_LOGIN) {
+            assert!(!login.1.contains_key("x-master-version"));
+            assert!(!login.1.contains_key("x-resource-version"));
+        }
+        assert_eq!(count_in(&received, WHOAMI), 0);
+    }
+    fn count_in(received: &[(String, HeaderMap, Vec<u8>)], path: &str) -> usize {
+        received.iter().filter(|r| r.0 == path).count()
+    }
+
+    #[tokio::test]
+    async fn global_login_client_update_required_does_not_disable() {
+        let e = env(Region::En).await;
+        e.script.login_errors.lock().unwrap().extend([
+            (16, "CLIENT_UPDATE_REQUIRED"),
+            (16, "CLIENT_UPDATE_REQUIRED"),
+        ]);
+        let c = GameClient::for_test(e.cfg.clone());
+        for _ in 0..2 {
+            assert!(matches!(
+                c.call(PLAYER_DATA, json!({})).await,
+                Err(AppError::AccountUnavailable)
+            ));
+        }
+        let s = status(&c);
+        assert_eq!(s["disabled"], false);
+        assert_eq!(s["last_error_code"], "CLIENT_UPDATE_REQUIRED");
+        c.call(PLAYER_DATA, json!({})).await.unwrap();
+        // The SDK identity was never marked stale: one cache.login for three PlayerLogins.
+        assert_eq!(e.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(count(&e.f, PLAYER_LOGIN), 3);
+        assert_eq!(count(&e.f, V), 1);
+        assert_eq!(status(&c)["session_state"], "active");
+    }
+
+    /// A JWT-shaped `id_token` expiring `seconds` from now (payload `{"exp": ..}`).
+    fn jwt(seconds: i64) -> String {
+        use base64::Engine;
+        let payload = json!({"exp": chrono::Utc::now().timestamp() + seconds, "sub": "fixture"});
+        format!(
+            "eyJhbGciOiJSUzI1NiJ9.{}.SECRETSIGNATURE",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
+    }
+    /// `idToken` of each PlayerLogin a fixture received, in order.
+    fn login_id_tokens(f: &Fixture) -> Vec<String> {
+        f.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == PLAYER_LOGIN)
+            .map(|r| {
+                let request = DynamicMessage::decode(
+                    global_pool()
+                        .get_message_by_name("app.playerlogin.PlayerLoginRequest")
+                        .unwrap(),
+                    &r.2[5..],
+                )
+                .unwrap();
+                serde_json::to_value(request).unwrap()["idToken"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+    /// Regions of one deployment: one SDK mock and identity, a game mock per region.
+    struct Shared {
+        dir: tempfile::TempDir,
+        sdk: SdkMock,
+        identity: PathBuf,
+        regions: Vec<(Arc<Upstream>, Fixture, Config)>,
+    }
+    async fn shared(state: bool) -> Shared {
+        let dir = tempfile::tempdir().unwrap();
+        let sdk = sdk_mock().await;
+        let identity = identity_file(dir.path(), json!({}));
+        let mut regions = Vec::new();
+        for region in [Region::Hk, Region::En] {
+            let script = Upstream::new(region.name());
+            let f = upstream(script.clone()).await;
+            let mut cfg = global_config(region, &f, &sdk, &identity);
+            if state {
+                cfg.global_login.as_mut().unwrap().state_directory =
+                    Some(dir.path().join("sdk-state"));
+            }
+            regions.push((script, f, cfg));
+        }
+        Shared {
+            dir,
+            sdk,
+            identity,
+            regions,
+        }
+    }
+    impl Shared {
+        /// A (re)started deployment: fresh clients sharing fresh sessions.
+        fn start(&self) -> Vec<Arc<GameClient>> {
+            let directory = self.regions[0]
+                .2
+                .global_login
+                .as_ref()
+                .unwrap()
+                .state_directory
+                .clone();
+            let sessions = crate::sdk_session::SdkSessions::open(directory.as_deref()).unwrap();
+            self.regions
+                .iter()
+                .map(|(_, _, cfg)| {
+                    GameClient::for_test_with_sdk_sessions(cfg.clone(), sessions.clone())
+                })
+                .collect()
+        }
+        fn state_files(&self) -> Vec<PathBuf> {
+            std::fs::read_dir(self.dir.path().join("sdk-state"))
+                .map(|d| {
+                    d.map(|e| e.unwrap().path())
+                        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    #[tokio::test]
+    async fn regions_share_one_cache_login_per_identity() {
+        let d = shared(false).await;
+        let clients = d.start();
+        let (hk, en) = (&clients[0], &clients[1]);
+        assert_eq!(status(hk)["sdk_session"], "none");
+        // Concurrent first logins of both regions: one cache.login, one PlayerLogin each.
+        let (a, b) = tokio::join!(
+            hk.call(PLAYER_DATA, json!({})),
+            en.call(PLAYER_DATA, json!({}))
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        for (_, f, _) in &d.regions {
+            assert_eq!(count(f, PLAYER_LOGIN), 1);
+            assert_eq!(login_id_tokens(f), [REFRESHED_ID_TOKEN]);
+        }
+        assert_eq!(status(hk)["sdk_session"], "valid");
+        assert_eq!(status(en)["sdk_session"], "valid");
+        // TOKEN_* in one region makes the shared identity stale: the next login of any region
+        // revalidates once, and the other region's session is untouched.
+        d.regions[0]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(hk.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(status(en)["sdk_session"], "stale");
+        hk.call(PLAYER_DATA, json!({})).await.unwrap();
+        en.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(count(&d.regions[0].1, PLAYER_LOGIN), 2);
+        assert_eq!(count(&d.regions[1].1, PLAYER_LOGIN), 1);
+        assert_eq!(status(en)["sdk_session"], "valid");
+        // Clients built on their own (no shared registry) keep separate sessions.
+        let alone = GameClient::for_test(d.regions[1].2.clone());
+        alone.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 3);
+        assert!(d.state_files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expiring_id_token_is_revalidated_instead_of_shared() {
+        let d = shared(false).await;
+        d.sdk.tokens.lock().unwrap().extend([jwt(120), jwt(7200)]);
+        let clients = d.start();
+        clients[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(status(&clients[1])["sdk_session"], "expired");
+        // Within the expiry margin: the second region revalidates instead of sending it.
+        clients[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(status(&clients[0])["sdk_session"], "valid");
+    }
+
+    #[tokio::test]
+    async fn persisted_sdk_session_skips_cache_login_after_restart() {
+        let d = shared(true).await;
+        let token = jwt(7200);
+        d.sdk.tokens.lock().unwrap().push_back(token.clone());
+        let first = d.start();
+        first[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        let files = d.state_files();
+        assert_eq!(files.len(), 1);
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(!text.contains(ACCESS_KEY));
+        assert!(!text.contains(UDID));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&files[0]).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(first);
+        // Restart: both regions log in with the persisted id_token and no SDK request.
+        let second = d.start();
+        assert_eq!(status(&second[1])["sdk_session"], "valid");
+        second[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        second[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(
+            login_id_tokens(&d.regions[0].1),
+            [token.clone(), token.clone()]
+        );
+        assert_eq!(
+            login_id_tokens(&d.regions[1].1),
+            std::slice::from_ref(&token)
+        );
+        let verified = d.start()[1]
+            .verify_global_account("en-guest", false)
+            .await
+            .unwrap();
+        assert_eq!(verified["sdk_cache_login"], "reused");
+        // TOKEN_* drops the persisted id_token: the next start revalidates.
+        d.regions[1]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_EXPIRED"));
+        assert!(second[1].call(PLAYER_DATA, json!({})).await.is_err());
+        drop(second);
+        let third = d.start();
+        assert_eq!(status(&third[0])["sdk_session"], "none");
+        third[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        // A state file of a replaced identity (another access key) is ignored.
+        drop(third);
+        let mut identity: Value =
+            serde_json::from_slice(&std::fs::read(&d.identity).unwrap()).unwrap();
+        identity["sdk"]["access_key"] = json!("SECRETACCESSKEY-replaced");
+        write_private(&d.identity, &identity);
+        assert_eq!(status(&d.start()[0])["sdk_session"], "none");
+    }
+
+    #[tokio::test]
+    async fn sdk_refusal_stops_every_region_and_survives_restart() {
+        let d = shared(true).await;
+        d.sdk.codes.lock().unwrap().push_back(900200);
+        let first = d.start();
+        assert!(matches!(
+            first[0].call(PLAYER_DATA, json!({})).await,
+            Err(AppError::AccountUnavailable)
+        ));
+        // The other region is disabled by the shared refusal without an SDK request.
+        assert!(first[1].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        for client in &first {
+            let s = status(client);
+            assert_eq!(s["disabled"], true);
+            assert_eq!(s["last_error_code"], "SDK_REFUSED");
+            assert_eq!(s["last_sdk_code"], 900200);
+            assert_eq!(s["sdk_session"], "refused");
+        }
+        for (_, f, _) in &d.regions {
+            assert_eq!(count(f, PLAYER_LOGIN), 0);
+        }
+        drop(first);
+        // A restart honours the persisted refusal: still nothing is sent.
+        let second = d.start();
+        assert!(second[1].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert_eq!(status(&second[1])["last_sdk_code"], 900200);
+        drop(second);
+        // After sdk_refusal_retry_seconds one cache.login may try again.
+        let file = d.state_files().pop().unwrap();
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        state["refusal"]["at"] = json!(chrono::Utc::now() - chrono::Duration::days(2));
+        write_private(&file, &state);
+        let third = d.start();
+        third[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(status(&third[0])["sdk_session"], "valid");
+    }
+
+    #[tokio::test]
+    async fn regions_waiting_on_a_failed_cache_login_do_not_repeat_it() {
+        let d = shared(false).await;
+        d.sdk.codes.lock().unwrap().push_back(SDK_HTTP_ERROR);
+        let clients = d.start();
+        let (a, b) = tokio::join!(
+            clients[0].call(PLAYER_DATA, json!({})),
+            clients[1].call(PLAYER_DATA, json!({}))
+        );
+        assert!(a.is_err() && b.is_err());
+        // One SDK request for both regions; neither account is disabled.
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        for client in &clients {
+            assert_eq!(status(client)["disabled"], false);
+        }
+        // The next request tries once more.
+        clients[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        clients[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn token_signal_of_an_older_generation_keeps_the_newer_sdk_session() {
+        let d = shared(false).await;
+        let clients = d.start();
+        let (hk, en) = (&clients[0], &clients[1]);
+        hk.call(PLAYER_DATA, json!({})).await.unwrap();
+        en.call(PLAYER_DATA, json!({})).await.unwrap();
+        // hk's TOKEN_* revalidates (generation 2); en's session still uses generation 1.
+        d.regions[0]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(hk.call(PLAYER_DATA, json!({})).await.is_err());
+        hk.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        // A late TOKEN_* on en's older session does not invalidate hk's newer id_token.
+        d.regions[1]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_EXPIRED"));
+        assert!(en.call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(status(en)["sdk_session"], "valid");
+        en.call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(count(&d.regions[1].1, PLAYER_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn processes_sharing_a_state_directory_keep_each_others_refusal() {
+        let d = shared(true).await;
+        d.sdk.tokens.lock().unwrap().push_back(jwt(7200));
+        // The service has a valid session; a separate process (verify) then gets refused.
+        let service = d.start();
+        service[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        let other = d.start();
+        d.regions[1]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(other[1].call(PLAYER_DATA, json!({})).await.is_err());
+        d.sdk.codes.lock().unwrap().push_back(900200);
+        assert!(other[1].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        // The service's next write keeps the newer refusal instead of overwriting it, and its
+        // next login adopts it without an SDK request.
+        d.regions[0]
+            .0
+            .call_errors
+            .lock()
+            .unwrap()
+            .push_back((16, "TOKEN_ILLEGAL"));
+        assert!(service[0].call(PLAYER_DATA, json!({})).await.is_err());
+        assert!(service[0].call(PLAYER_DATA, json!({})).await.is_err());
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        assert_eq!(status(&service[0])["last_sdk_code"], 900200);
+        let file = d.state_files().pop().unwrap();
+        let state: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        assert_eq!(state["refusal"]["code"], 900200);
+        assert_eq!(state["id_token"], "");
+    }
+
+    #[test]
+    fn sdk_state_settings_are_bounded() {
+        let mut login = LoginConfig::default();
+        assert!(login.state_directory.is_none());
+        assert_eq!(login.sdk_refusal_retry_seconds, 86_400);
+        login.validate().unwrap();
+        for retry in [3_599, 30 * 86_400 + 1] {
+            login.sdk_refusal_retry_seconds = retry;
+            assert!(login.validate().is_err());
+        }
+        login.sdk_refusal_retry_seconds = 3_600;
+        login.state_directory = Some(PathBuf::new());
+        assert!(login.validate().is_err());
+        login.state_directory = Some("/var/lib/sirius/sdk".into());
+        login.validate().unwrap();
+        let parsed: LoginConfig = yaml_serde::from_str(
+            "state_directory: /data/sdk-sessions\nsdk_refusal_retry_seconds: 172800\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.state_directory.as_deref(),
+            Some(Path::new("/data/sdk-sessions"))
+        );
+        assert_eq!(parsed.sdk_refusal_retry_seconds, 172_800);
+    }
 }
 
 #[tokio::test]
@@ -15833,4 +22360,2356 @@ async fn catalog_hash_fetch_honors_the_overall_update_deadline() {
     assert!(matches!(result, Err(AppError::SnapshotUnavailable)));
     assert!(started.elapsed() < Duration::from_secs(5));
     server.abort();
+}
+
+fn master_version_reply(version: &str) -> Reply {
+    let mut reply = Reply::version();
+    reply.bytes = framed(message(
+        "app.masterdata.VersionResponse",
+        json!({ "version": version }),
+    ));
+    reply
+}
+/// A failed answer carrying an application code and a `grpc-message` that must never escape.
+fn signal_reply(grpc_status: &str, code: &str) -> Reply {
+    let mut reply = grpc_reply(grpc_status);
+    reply.bytes.clear();
+    reply
+        .trailers
+        .insert("grpc-message", "SECRET-version-message".parse().unwrap());
+    reply
+        .trailers
+        .insert("x-sirius-error-code", code.parse().unwrap());
+    reply
+}
+fn single_account_config() -> Config {
+    let mut cfg = pool_config();
+    cfg.accounts.truncate(1);
+    cfg
+}
+/// (route, x-master-version) of every request the fixture received.
+fn sent_versions(f: &Fixture) -> Vec<(String, Option<String>)> {
+    f.received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(route, headers, _)| {
+            (
+                route.clone(),
+                headers
+                    .get("x-master-version")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+            )
+        })
+        .collect()
+}
+fn sent(route: &str, version: Option<&str>) -> (String, Option<String>) {
+    (route.to_owned(), version.map(str::to_owned))
+}
+async fn profile_call(c: &Arc<GameClient>) -> Result<Value, AppError> {
+    c.call(crate::client::PROFILE, json!({"playerProfileId":"1"}))
+        .await
+}
+
+#[test]
+fn upstream_version_max_age_is_bounded() {
+    let parse = |input: &str| yaml_serde::from_str::<crate::config::UpstreamConfig>(input);
+    assert_eq!(config().upstream.version_max_age_seconds, 600);
+    for (input, valid) in [
+        ("version_max_age_seconds: 59", false),
+        ("version_max_age_seconds: 86401", false),
+        ("version_max_age_seconds: 60", true),
+        ("version_max_age_seconds: 86400", true),
+    ] {
+        assert_eq!(parse(input).unwrap().validate().is_ok(), valid, "{input}");
+    }
+    assert!(parse("version_max_age: 600").is_err());
+    // A 1.2.x block without the key keeps the default.
+    let old = parse("timeout_ms: 20000\nanonymous_attempts: 1").unwrap();
+    assert!(old.validate().is_ok());
+    assert_eq!(old.version_max_age_seconds, 600);
+}
+
+#[tokio::test]
+async fn stale_version_refreshes_before_the_call_and_fresh_version_does_not() {
+    use crate::client::PROFILE;
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        empty_profile_reply(),
+        master_version_reply("v2"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    profile_call(&c).await.unwrap();
+    profile_call(&c).await.unwrap();
+    let (remaining, suspect, backoff) = c.version_state_for_test().await;
+    assert!(remaining.unwrap() > Duration::from_secs(590));
+    assert!(!suspect && !backoff);
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    profile_call(&c).await.unwrap();
+    // The age refresh keeps the steady-state Version shape, current header included.
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v2")),
+        ]
+    );
+    assert!(c.version_state_for_test().await.0.unwrap() > Duration::from_secs(590));
+}
+
+#[tokio::test]
+async fn mismatch_with_grpc_16_and_7_keeps_jp_account_enabled_and_refreshes_first() {
+    use crate::client::PROFILE;
+    for status in ["16", "7"] {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("application.log");
+        let (default, guard, second) = capture_application_log(&log);
+        let f = fixture(vec![
+            master_version_reply("v1"),
+            signal_reply(status, "MASTER_VERSION_MISMATCH"),
+            master_version_reply("v2"),
+            empty_profile_reply(),
+        ])
+        .await;
+        let c = client(&f, single_account_config());
+        c.call(VERSION, json!({})).await.unwrap();
+        let app = api::router(c.clone(), "api".into(), "internal".into());
+        let get = |path: &'static str, token: &'static str| {
+            app.clone().oneshot(
+                Request::get(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+        };
+        // The call that received the signal fails as before and is not replayed.
+        let response = get("/api/v1/players/by-profile-id/1", "api").await.unwrap();
+        assert_eq!(response.status(), 502);
+        let value = body(response).await;
+        assert_eq!(value["code"], "upstream_grpc");
+        assert_eq!(value["grpc_status"], status.parse::<u16>().unwrap());
+        assert!(!value.to_string().contains("SECRET"));
+        assert_eq!(f.received.lock().unwrap().len(), 2);
+        let accounts = body(get("/internal/v1/accounts", "internal").await.unwrap()).await;
+        assert_eq!(accounts["accounts"][0]["disabled"], false, "{status}");
+        assert_eq!(accounts["accounts"][0]["consecutive_failures"], 0);
+        assert!(c.version_state_for_test().await.1);
+        // The next call refreshes first, without the rejected header.
+        profile_call(&c).await.unwrap();
+        assert_eq!(
+            sent_versions(&f)[2..],
+            [sent(VERSION, None), sent(PROFILE, Some("v2"))]
+        );
+        assert!(!c.version_state_for_test().await.1);
+        drop((default, second));
+        drop(guard);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let row = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|row| row["fields"]["error_code"] == "MASTER_VERSION_MISMATCH")
+            .expect("mismatch logged");
+        assert_eq!(row["level"], "WARN");
+        assert_eq!(row["fields"]["region"], "jp");
+        assert_eq!(row["fields"]["status"], status.parse::<u16>().unwrap());
+        assert!(!text.contains("SECRET") && !text.contains("secret-one"));
+    }
+}
+
+#[tokio::test]
+async fn client_update_required_keeps_account_and_does_not_refresh() {
+    use crate::client::PROFILE;
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "CLIENT_UPDATE_REQUIRED"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    assert!(matches!(profile_call(&c).await, Err(AppError::Grpc(16))));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["disabled"], false);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    assert!(!c.version_state_for_test().await.1);
+    profile_call(&c).await.unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v1")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn jp_player_data_whoami_mismatch_does_not_disable_the_account() {
+    use crate::client::{PLAYER_DATA, WHOAMI};
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+        master_version_reply("v2"),
+        whoami_reply("player-one"),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    assert!(matches!(
+        c.call_account("one", PLAYER_DATA).await,
+        Err(AppError::Grpc(16))
+    ));
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["disabled"], false);
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    c.call_account("one", WHOAMI).await.unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(WHOAMI, Some("v1")),
+            sent(VERSION, None),
+            sent(WHOAMI, Some("v2")),
+        ]
+    );
+    // A plain 16 on the identity check still disables, as before.
+    let f = fixture(vec![Reply::version(), grpc_reply("16")]).await;
+    let c = client(&f, single_account_config());
+    assert!(c.call_account("one", PLAYER_DATA).await.is_err());
+    assert_eq!(c.account_status().unwrap()["accounts"][0]["disabled"], true);
+}
+
+#[tokio::test]
+async fn concurrent_suspect_calls_refresh_once() {
+    use crate::client::PROFILE;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut refreshed = master_version_reply("v2");
+    refreshed.gate = Some(gate.clone());
+    let mut replies = vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+        refreshed,
+    ];
+    replies.extend(std::iter::repeat_n(empty_profile_reply(), 20));
+    let f = fixture(replies).await;
+    let c = client(&f, pool_config());
+    assert!(profile_call(&c).await.is_err());
+    let calls = (0..20)
+        .map(|_| {
+            let c = c.clone();
+            tokio::spawn(async move { profile_call(&c).await })
+        })
+        .collect::<Vec<_>>();
+    wait_for_requests(&f, 3).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Everyone waits for the refresh instead of repeating the rejected header.
+    assert_eq!(f.received.lock().unwrap().len(), 3);
+    gate.add_permits(1);
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    let seen = sent_versions(&f);
+    assert_eq!(seen.iter().filter(|(route, _)| route == VERSION).count(), 2);
+    assert_eq!(seen[2], sent(VERSION, None));
+    assert!(seen[3..].iter().all(|s| *s == sent(PROFILE, Some("v2"))));
+    let status = c.account_status().unwrap();
+    for account in status["accounts"].as_array().unwrap() {
+        assert_eq!(account["disabled"], false);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_age_refresh_does_not_block_callers() {
+    use crate::client::PROFILE;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut refreshed = master_version_reply("v2");
+    refreshed.gate = Some(gate.clone());
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        refreshed,
+        empty_profile_reply(),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, pool_config());
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    let refreshing = {
+        let c = c.clone();
+        tokio::spawn(async move { profile_call(&c).await })
+    };
+    wait_for_requests(&f, 3).await;
+    // Another caller does not wait for an age-only refresh: it keeps the current header.
+    tokio::time::timeout(Duration::from_secs(2), profile_call(&c))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!refreshing.is_finished());
+    gate.add_permits(1);
+    refreshing.await.unwrap().unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v2")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn failed_refresh_keeps_old_header_and_backs_off() {
+    use crate::client::PROFILE;
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        unavailable_reply(),
+        empty_profile_reply(),
+        empty_profile_reply(),
+        master_version_reply("v2"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    profile_call(&c).await.unwrap();
+    let (_, suspect, backoff) = c.version_state_for_test().await;
+    assert!(!suspect && backoff);
+    let status = c.account_status().unwrap();
+    assert_eq!(status["accounts"][0]["consecutive_failures"], 0);
+    assert_eq!(status["accounts"][0]["cooldown_remaining_seconds"], 0);
+    // Inside the retry window the old header is used without another Version.
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(31)).await;
+    profile_call(&c).await.unwrap();
+    assert_eq!(
+        sent_versions(&f),
+        [
+            sent(VERSION, None),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(PROFILE, Some("v1")),
+            sent(VERSION, Some("v1")),
+            sent(PROFILE, Some("v2")),
+        ]
+    );
+    assert!(!c.version_state_for_test().await.2);
+}
+
+#[tokio::test]
+async fn refresh_uses_at_most_half_the_remaining_deadline() {
+    let mut slow = master_version_reply("v2");
+    slow.delay = Duration::from_secs(2);
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        empty_profile_reply(),
+        slow,
+        empty_profile_reply(),
+    ])
+    .await;
+    let mut c = client(&f, single_account_config());
+    GameClient::set_test_timeout(&mut c, Duration::from_secs(1));
+    profile_call(&c).await.unwrap();
+    c.age_version_for_test(Duration::from_secs(601)).await;
+    let started = tokio::time::Instant::now();
+    profile_call(&c).await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let seen = f.received.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[3].1["x-master-version"], "v1");
+    let budget: u64 = seen[3].1["grpc-timeout"]
+        .to_str()
+        .unwrap()
+        .strip_suffix('m')
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(budget <= 500, "{budget}");
+}
+
+#[tokio::test]
+async fn bootstrap_without_version_still_fails_closed() {
+    let f = fixture(vec![unavailable_reply()]).await;
+    let c = client(&f, single_account_config());
+    assert!(matches!(profile_call(&c).await, Err(AppError::Grpc(14))));
+    assert_eq!(f.received.lock().unwrap().len(), 1);
+    assert_eq!(c.version_state_for_test().await, (None, false, false));
+}
+
+#[tokio::test]
+async fn late_mismatch_for_replaced_version_is_ignored() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut late = signal_reply("16", "MASTER_VERSION_MISMATCH");
+    late.gate = Some(gate.clone());
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        late,
+        master_version_reply("v2"),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    c.call(VERSION, json!({})).await.unwrap();
+    let pending = {
+        let c = c.clone();
+        tokio::spawn(async move { profile_call(&c).await })
+    };
+    wait_for_requests(&f, 2).await;
+    c.call(VERSION, json!({})).await.unwrap();
+    gate.add_permits(1);
+    assert!(matches!(pending.await.unwrap(), Err(AppError::Grpc(16))));
+    assert!(!c.version_state_for_test().await.1);
+    assert_eq!(c.observation().await.master_version.as_deref(), Some("v2"));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["disabled"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn mismatch_with_status_14_is_not_retried_anonymously() {
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("14", "MASTER_VERSION_MISMATCH"),
+    ])
+    .await;
+    let mut cfg = config();
+    cfg.upstream.anonymous_attempts = 3;
+    cfg.upstream.retry_delay_ms = 1;
+    let c = client(&f, cfg);
+    c.call(VERSION, json!({})).await.unwrap();
+    assert!(matches!(
+        c.call(crate::client::ANNOUNCEMENTS, json!({"selectedTab":0}))
+            .await,
+        Err(AppError::Grpc(14))
+    ));
+    assert_eq!(f.received.lock().unwrap().len(), 2);
+    assert!(c.version_state_for_test().await.1);
+    // An application code on 14 is an answer, not a path fault.
+    assert_eq!(c.account_status().unwrap()["path"]["failures"], 0);
+}
+
+#[tokio::test]
+async fn protocol_reload_resets_version_freshness() {
+    use crate::client::PROFILE;
+    let directory = copy_protocol_bundle();
+    let mut cfg = single_account_config();
+    cfg.protocol_directory = directory.path().into();
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+        master_version_reply("v2"),
+        empty_profile_reply(),
+    ])
+    .await;
+    let c = client(&f, cfg);
+    assert!(profile_call(&c).await.is_err());
+    assert!(c.version_state_for_test().await.1);
+    edit_version_proto(
+        directory.path(),
+        "string version = 1;",
+        "string version = 1;\n  string extra = 2;",
+    );
+    std::fs::write(
+        directory.path().join("bundle.json"),
+        r#"{"version":"1.0.4"}"#,
+    )
+    .unwrap();
+    c.reload_protocol().await.unwrap();
+    assert_eq!(c.version_state_for_test().await, (None, false, false));
+    profile_call(&c).await.unwrap();
+    assert_eq!(
+        sent_versions(&f)[2..],
+        [sent(VERSION, None), sent(PROFILE, Some("v2"))]
+    );
+}
+
+#[tokio::test]
+async fn peer_executor_mismatch_keeps_the_game_failure_wire_format() {
+    let f = fixture(vec![
+        master_version_reply("v1"),
+        signal_reply("16", "MASTER_VERSION_MISMATCH"),
+    ])
+    .await;
+    let c = client(&f, single_account_config());
+    let app = crate::peer::router(c.clone(), "/internal/v1/peer", "peer".into());
+    let request = peer_request(
+        c.peer_identity().unwrap(),
+        json!({"type":"profile","profile_id":1}),
+    );
+    let reply = body(peer_send(app, "peer", request).await).await;
+    assert_eq!(
+        reply["outcome"],
+        json!({"status":"failure","kind":{"type":"game","grpc_status":16}})
+    );
+    assert!(!reply.to_string().contains("SECRET"));
+    assert!(matches!(
+        crate::node_routing::failure_error(crate::peer::Failure::Game { grpc_status: 16 }, false),
+        AppError::Grpc(16)
+    ));
+    assert_eq!(
+        c.account_status().unwrap()["accounts"][0]["disabled"],
+        false
+    );
+}
+
+/// Import `count` more committed installations, each with a distinct Master version.
+fn retention_imports(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    count: usize,
+) -> Vec<crate::master::ImportReceipt> {
+    let (mut manifest, decoder, _) = master_fixture();
+    (0..count)
+        .map(|_| {
+            manifest.version = format!("retention-{}", uuid::Uuid::new_v4().simple());
+            std::fs::write(
+                input.join("MasterManifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            crate::master::import_directory(input, output, &decoder).unwrap()
+        })
+        .collect()
+}
+/// A chain of `total` committed installations, oldest first.
+fn retention_chain(
+    total: usize,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Vec<String>,
+) {
+    let (root, input, output, first) = registry_fixture();
+    let mut chain = vec![first.snapshot];
+    chain.extend(
+        retention_imports(&input, &output, total - 1)
+            .into_iter()
+            .map(|r| r.snapshot),
+    );
+    (root, input, output, chain)
+}
+fn master_snapshot_directories(root: &std::path::Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("master-"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+fn retention_prune(root: &std::path::Path, keep: usize) -> usize {
+    let writer = crate::master::WriterLock::acquire(root).unwrap();
+    crate::master_registry::prune(&writer, root, keep).unwrap()
+}
+fn history_snapshots(history: &crate::master_registry::History) -> Vec<&str> {
+    history
+        .entries
+        .iter()
+        .map(|entry| entry.snapshot.as_str())
+        .collect()
+}
+
+#[test]
+fn retention_keeps_newest_snapshots_along_committed_chain() {
+    use crate::master_registry as registry;
+    let (_root, _input, output, chain) = retention_chain(5);
+    let pointer = std::fs::read(output.join("CURRENT")).unwrap();
+    assert_eq!(retention_prune(&output, 2), 3);
+    let mut kept = vec![chain[3].clone(), chain[4].clone()];
+    kept.sort();
+    assert_eq!(master_snapshot_directories(&output), kept);
+    assert_eq!(
+        registry::retention_boundary(&output).unwrap().as_deref(),
+        Some(chain[3].as_str())
+    );
+    assert_eq!(std::fs::read(output.join("CURRENT")).unwrap(), pointer);
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[4], &chain[3]]);
+    assert!(history.retention_boundary && !history.legacy_boundary);
+    assert!(!history.has_more && history.next_before.is_none());
+    assert_eq!(
+        serde_json::to_value(&history).unwrap()["retention_boundary"],
+        true
+    );
+    // CURRENT still reads normally.
+    assert!(crate::master::read_current(&output, Some("MasterFixture")).is_ok());
+}
+
+#[test]
+fn retention_is_idempotent_and_off_by_default() {
+    use crate::{master_database as db, master_registry as registry};
+    let (_root, _input, output, _) = retention_chain(4);
+    // Never pruned: no record, no field, and the migration plan digest of 1.2.x.
+    assert!(registry::retention_boundary(&output).unwrap().is_none());
+    let history = registry::committed_history(&output, registry_scope()).unwrap();
+    assert!(!history.retention_boundary);
+    assert!(serde_json::to_value(&history)
+        .unwrap()
+        .get("retention_boundary")
+        .is_none());
+    assert_eq!(
+        db::migration_plan_digest(&history).unwrap(),
+        legacy_migration_plan_digest(&history)
+    );
+    let receipt = db::MigrationReceipt {
+        head: history.head.clone(),
+        source_sha256: "0".repeat(64),
+        publications: 4,
+        legacy_boundary: false,
+        retention_boundary: false,
+        changed: true,
+    };
+    let encoded = serde_json::to_value(&receipt).unwrap();
+    assert!(encoded.get("retention_boundary").is_none());
+    let decoded: db::MigrationReceipt = serde_json::from_value(encoded).unwrap();
+    assert!(!decoded.retention_boundary);
+    assert_eq!(retention_prune(&output, 2), 2);
+    let record = output.join("retention.json");
+    let (bytes, modified) = (
+        std::fs::read(&record).unwrap(),
+        std::fs::metadata(&record).unwrap().modified().unwrap(),
+    );
+    assert_eq!(retention_prune(&output, 2), 0);
+    assert_eq!(std::fs::read(&record).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().modified().unwrap(),
+        modified
+    );
+    // A pruned plan differs from any 1.2 plan and records the boundary.
+    let pruned = registry::committed_history(&output, registry_scope()).unwrap();
+    assert!(pruned.retention_boundary);
+    assert_ne!(
+        db::migration_plan_digest(&pruned).unwrap(),
+        legacy_migration_plan_digest(&pruned)
+    );
+    let receipt = db::MigrationReceipt {
+        retention_boundary: true,
+        ..receipt
+    };
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["retention_boundary"],
+        true
+    );
+}
+
+#[test]
+fn retention_leaves_staging_orphans_and_legacy_untouched() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, legacy) = registry_fixture();
+    // The oldest snapshot predates publication records.
+    std::fs::remove_file(output.join(&legacy.snapshot).join("publication.json")).unwrap();
+    let chain = retention_imports(&input, &output, 4);
+    let orphan = retention_imports(&input, &output, 1).remove(0);
+    std::fs::write(output.join("CURRENT"), &chain[3].snapshot).unwrap();
+    for name in [".master-stage-x", ".master-sync-x", ".master-download-x"] {
+        std::fs::create_dir(output.join(name)).unwrap();
+    }
+    assert_eq!(retention_prune(&output, 2), 2);
+    for name in [
+        ".master-stage-x",
+        ".master-sync-x",
+        ".master-download-x",
+        legacy.snapshot.as_str(),
+        orphan.snapshot.as_str(),
+        chain[2].snapshot.as_str(),
+        chain[3].snapshot.as_str(),
+    ] {
+        assert!(output.join(name).is_dir(), "{name}");
+    }
+    for pruned in &chain[..2] {
+        assert!(!output.join(&pruned.snapshot).exists());
+    }
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history.entries.len(), 2);
+    assert!(history.retention_boundary && !history.legacy_boundary);
+    // A chain that reaches a legacy snapshot inside the window prunes nothing.
+    let (_root, input, output, legacy) = registry_fixture();
+    std::fs::remove_file(output.join(&legacy.snapshot).join("publication.json")).unwrap();
+    retention_imports(&input, &output, 2);
+    for keep in [3, 5] {
+        assert_eq!(retention_prune(&output, keep), 0);
+    }
+    assert_eq!(master_snapshot_directories(&output).len(), 3);
+    assert!(!output.join("retention.json").exists());
+    // Without a committed CURRENT there is nothing to prune.
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(retention_prune(empty.path(), 2), 0);
+    let writer = master::WriterLock::acquire(empty.path()).unwrap();
+    for keep in [0, 1, 10_001] {
+        assert!(registry::prune(&writer, empty.path(), keep).is_err());
+    }
+}
+
+#[tokio::test]
+async fn retention_history_pages_stop_at_boundary() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(6);
+    assert_eq!(retention_prune(&output, 3), 3);
+    let mut before = None::<String>;
+    let mut seen = Vec::new();
+    loop {
+        let page = registry::history_page(&output, registry_scope(), 1, before.as_deref()).unwrap();
+        seen.extend(page.entries.iter().map(|e| e.snapshot.clone()));
+        match page.next_before {
+            Some(next) => {
+                assert!(page.has_more && !page.retention_boundary);
+                before = Some(next);
+            }
+            None => {
+                assert!(!page.has_more && page.retention_boundary);
+                break;
+            }
+        }
+    }
+    assert_eq!(seen, [&chain[5], &chain[4], &chain[3]].map(String::clone));
+    let last = registry::history_page(&output, registry_scope(), 1, Some(&chain[3])).unwrap();
+    assert!(last.entries.is_empty() && !last.has_more && last.next_before.is_none());
+    assert!(last.retention_boundary);
+    assert!(matches!(
+        registry::history_page(&output, registry_scope(), 1, Some(&chain[1])),
+        Err(MasterError::NotFound)
+    ));
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    let get = |query: String| {
+        Request::get(format!("/api/v1/master-data/history{query}"))
+            .header("authorization", "Bearer api")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let response = app
+        .clone()
+        .oneshot(get(format!("?before={}", chain[1])))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let response = app.clone().oneshot(get(String::new())).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let page = body(response).await;
+    assert_eq!(page["retention_boundary"], true);
+    assert_eq!(page["entries"].as_array().unwrap().len(), 3);
+    assert!(f.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn retention_by_hash_and_pinned_reads_return_404_for_pruned_content() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(4);
+    let before = registry::history(&output, registry_scope(), 100).unwrap();
+    let hash_of = |snapshot: &str| {
+        before
+            .entries
+            .iter()
+            .find(|e| e.snapshot == snapshot)
+            .unwrap()
+            .content_sha256
+            .clone()
+    };
+    let (kept, pruned) = (chain[2].clone(), chain[1].clone());
+    let (kept_hash, pruned_hash) = (hash_of(&kept), hash_of(&pruned));
+    let table_sha = registry::digest(include_bytes!("../tests/fixtures/master-synthetic.json"));
+    assert_eq!(retention_prune(&output, 2), 2);
+    assert!(matches!(
+        registry::manifest_by_hash(&output, registry_scope(), &pruned_hash),
+        Err(MasterError::NotFound)
+    ));
+    assert!(registry::manifest_by_hash(&output, registry_scope(), &kept_hash).is_ok());
+    let f = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(output.clone());
+    let app = api::router(client(&f, cfg), "api".into(), "internal".into());
+    for (path, expected) in [
+        (format!("by-hash/{pruned_hash}/manifest"), 404),
+        (format!("by-hash/{kept_hash}/manifest"), 200),
+        (format!("by-hash/{pruned_hash}/bundle"), 404),
+        (format!("by-hash/{kept_hash}/bundle"), 200),
+        (format!("snapshots/{pruned}/manifest"), 404),
+        (format!("snapshots/{kept}/manifest"), 200),
+        (
+            format!("snapshots/{pruned}/tables/MasterFixture/{table_sha}"),
+            404,
+        ),
+        (
+            format!("snapshots/{kept}/tables/MasterFixture/{table_sha}"),
+            200,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/master-data/{path}"))
+                    .header("authorization", "Bearer api")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected, "{path}");
+    }
+    assert!(f.received.lock().unwrap().is_empty());
+}
+
+#[test]
+fn retention_config_bounds() {
+    use crate::master_registry::Retention;
+    for (keep, valid) in [
+        (0, false),
+        (1, false),
+        (2, true),
+        (10_000, true),
+        (10_001, false),
+    ] {
+        assert_eq!(
+            Retention {
+                keep_snapshots: keep
+            }
+            .valid(),
+            valid
+        );
+    }
+    assert!(yaml_serde::from_str::<Retention>("keep_snapshots: 2\nextra: 1\n").is_err());
+    assert!(yaml_serde::from_str::<Retention>("keep_snapshots: -1\n").is_err());
+    let keep = |n| Some(Retention { keep_snapshots: n });
+    let directory = tempfile::tempdir().unwrap();
+    // Root profile: a directory and a writer in this process are both required.
+    let mut cfg = config();
+    cfg.master_retention = keep(20);
+    assert!(cfg.validate().is_err());
+    cfg.master_directory = Some(directory.path().join("master"));
+    assert!(cfg.validate().is_err());
+    let mut cfg = master_sync_config("http://127.0.0.1:9".into(), directory.path().join("master"));
+    cfg.validate().unwrap();
+    for (n, ok) in [(1, false), (2, true), (10_000, true), (10_001, false)] {
+        cfg.master_retention = keep(n);
+        assert_eq!(cfg.validate().is_ok(), ok, "{n}");
+    }
+    let mut cfg = remote_master_config_at("https://cdn.example.invalid", directory.path());
+    cfg.master_retention = keep(2);
+    let parsed = cfg.validate();
+    cfg.master_retention = None;
+    assert_eq!(parsed.is_ok(), cfg.validate().is_ok());
+    // Registry owner: retention applies only where synchronization writes snapshots.
+    let mut owner =
+        registry_owner_config("http://127.0.0.1:9".into(), directory.path().join("owner"))
+            .owner
+            .unwrap();
+    owner.retention = keep(2);
+    assert!(crate::registry_owner::Worker::new(
+        &owner,
+        registry_scope(),
+        directory.path().join("owner"),
+        None
+    )
+    .is_ok());
+    owner.retention = keep(1);
+    assert!(crate::registry_owner::Worker::new(
+        &owner,
+        registry_scope(),
+        directory.path().join("owner"),
+        None
+    )
+    .is_err());
+    owner.retention = keep(2);
+    owner.source = None;
+    owner.local_interval_seconds = Some(300);
+    assert!(crate::registry_owner::Worker::new(
+        &owner,
+        registry_scope(),
+        directory.path().join("owner"),
+        None
+    )
+    .is_err());
+    let parsed: crate::registry_owner::Config =
+        yaml_serde::from_str("internal_token_env: X\nretention:\n  keep_snapshots: 5\n").unwrap();
+    assert_eq!(parsed.retention.unwrap().keep_snapshots, 5);
+    assert!(yaml_serde::from_str::<crate::registry_owner::Config>(
+        "internal_token_env: X\nretention:\n  keep: 5\n"
+    )
+    .is_err());
+}
+
+#[test]
+fn retention_crash_after_boundary_before_delete_is_readable() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(5);
+    let hashes = registry::history(&output, registry_scope(), 100)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| (e.snapshot.clone(), e.content_sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    // An interrupted keep=2 pass: boundary durable, only the oldest candidate removed, and a
+    // renamed directory whose removal never finished.
+    std::fs::write(
+        output.join("retention.json"),
+        serde_json::to_vec(&json!({"schema_version":1,"boundary":chain[3]})).unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(output.join(&chain[0]), output.join(".master-pruned-x")).unwrap();
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[4], &chain[3]]);
+    assert!(history.retention_boundary);
+    let committed = registry::committed_history(&output, registry_scope()).unwrap();
+    assert_eq!(committed.entries.len(), 2);
+    assert!(registry::manifest_by_hash(&output, registry_scope(), &hashes[&chain[3]]).is_ok());
+    // Candidates still on disk are beyond the boundary and no longer addressable.
+    assert!(matches!(
+        registry::manifest_by_hash(&output, registry_scope(), &hashes[&chain[2]]),
+        Err(MasterError::NotFound)
+    ));
+    assert_eq!(retention_prune(&output, 2), 2);
+    assert!(output.join(".master-pruned-x").is_dir());
+    let mut kept = vec![chain[3].clone(), chain[4].clone()];
+    kept.sort();
+    assert_eq!(master_snapshot_directories(&output), kept);
+    // Malformed records fail explicitly instead of widening or narrowing history.
+    for record in [
+        json!({"schema_version":1,"boundary":"../escape"}),
+        json!({"schema_version":2,"boundary":chain[3]}),
+        json!({"schema_version":1,"boundary":chain[3],"extra":1}),
+    ] {
+        std::fs::write(
+            output.join("retention.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            registry::history(&output, registry_scope(), 100),
+            Err(MasterError::Format)
+        ));
+    }
+}
+
+#[test]
+fn retention_budget_spreads_large_backlog() {
+    use crate::{master, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(8);
+    let writer = master::WriterLock::acquire(&output).unwrap();
+    for pass in 0..3 {
+        assert_eq!(registry::prune_within(&writer, &output, 2, 2).unwrap(), 2);
+        // Oldest first: the remaining candidates stay contiguous behind the boundary.
+        for (index, snapshot) in chain.iter().enumerate() {
+            assert_eq!(
+                output.join(snapshot).exists(),
+                index >= 2 * (pass + 1),
+                "{pass} {index}"
+            );
+        }
+        let history = registry::history(&output, registry_scope(), 100).unwrap();
+        assert_eq!(history_snapshots(&history), [&chain[7], &chain[6]]);
+        assert!(history.retention_boundary);
+    }
+    assert_eq!(registry::prune_within(&writer, &output, 2, 2).unwrap(), 0);
+}
+
+#[test]
+fn retention_keep_increase_does_not_move_boundary_back() {
+    use crate::{master, master_registry as registry};
+    let (_root, input, output, chain) = retention_chain(5);
+    let writer = master::WriterLock::acquire(&output).unwrap();
+    assert_eq!(registry::prune_within(&writer, &output, 2, 1).unwrap(), 1);
+    let record = std::fs::read(output.join("retention.json")).unwrap();
+    assert_eq!(registry::prune(&writer, &output, 5).unwrap(), 2);
+    assert_eq!(
+        std::fs::read(output.join("retention.json")).unwrap(),
+        record
+    );
+    assert_eq!(
+        registry::retention_boundary(&output).unwrap().as_deref(),
+        Some(chain[3].as_str())
+    );
+    assert_eq!(master_snapshot_directories(&output).len(), 2);
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[4], &chain[3]]);
+    // New publications move the boundary forward again.
+    drop(writer);
+    let newer = retention_imports(&input, &output, 1).remove(0);
+    assert_eq!(retention_prune(&output, 2), 1);
+    assert_eq!(
+        registry::retention_boundary(&output).unwrap().as_deref(),
+        Some(chain[4].as_str())
+    );
+    let history = registry::history(&output, registry_scope(), 100).unwrap();
+    assert_eq!(
+        history_snapshots(&history),
+        [newer.snapshot.as_str(), chain[4].as_str()]
+    );
+}
+
+#[test]
+fn retention_reader_recovers_from_concurrent_prune() {
+    use crate::{master::MasterError, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(5);
+    let hashes = registry::history(&output, registry_scope(), 100)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| (e.snapshot.clone(), e.content_sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    // A pass named C and renamed older directories away after the reader read no boundary.
+    std::fs::write(
+        output.join("retention.json"),
+        serde_json::to_vec(&json!({"schema_version":1,"boundary":chain[2]})).unwrap(),
+    )
+    .unwrap();
+    for snapshot in &chain[..2] {
+        std::fs::rename(
+            output.join(snapshot),
+            output.join(format!(".master-pruned-{snapshot}")),
+        )
+        .unwrap();
+    }
+    let history =
+        registry::history_page_with_boundary(&output, registry_scope(), 100, None, None).unwrap();
+    assert_eq!(
+        history_snapshots(&history),
+        [&chain[4], &chain[3], &chain[2]]
+    );
+    assert!(history.retention_boundary && !history.has_more);
+    let page =
+        registry::history_page_with_boundary(&output, registry_scope(), 100, Some(&chain[3]), None)
+            .unwrap();
+    assert_eq!(history_snapshots(&page), [&chain[2]]);
+    let at =
+        registry::history_page_with_boundary(&output, registry_scope(), 100, Some(&chain[2]), None)
+            .unwrap();
+    assert!(at.entries.is_empty() && at.retention_boundary);
+    assert!(matches!(
+        registry::history_page_with_boundary(&output, registry_scope(), 100, Some(&chain[1]), None),
+        Err(MasterError::NotFound)
+    ));
+    assert!(matches!(
+        registry::manifest_by_hash_with_boundary(
+            &output,
+            registry_scope(),
+            &hashes[&chain[0]],
+            None
+        ),
+        Err(MasterError::NotFound)
+    ));
+    assert!(registry::manifest_by_hash_with_boundary(
+        &output,
+        registry_scope(),
+        &hashes[&chain[2]],
+        None
+    )
+    .is_ok());
+    // A missing directory without boundary evidence is never presented as retention.
+    std::fs::remove_file(output.join("retention.json")).unwrap();
+    assert!(registry::history(&output, registry_scope(), 100).is_err());
+    assert!(registry::committed_history(&output, registry_scope()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_refuses_symlinked_predecessor() {
+    use crate::{master, master_registry as registry};
+    let (root, _input, output, chain) = retention_chain(5);
+    let elsewhere = root.path().join("elsewhere");
+    std::fs::rename(output.join(&chain[1]), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, output.join(&chain[1])).unwrap();
+    let writer = master::WriterLock::acquire(&output).unwrap();
+    assert!(registry::prune(&writer, &output, 2).is_err());
+    assert!(elsewhere.join("publication.json").is_file());
+    for snapshot in [&chain[0], &chain[2], &chain[3], &chain[4]] {
+        assert!(output.join(snapshot).is_dir());
+    }
+    assert!(!output.join("retention.json").exists());
+    assert!(crate::master::read_current(&output, Some("MasterFixture")).is_ok());
+}
+
+#[tokio::test]
+async fn retention_migration_uses_retained_window() {
+    use crate::{master_database as db, master_registry as registry};
+    let (_root, _input, output, chain) = retention_chain(4);
+    assert_eq!(retention_prune(&output, 2), 2);
+    let history = registry::committed_history(&output, registry_scope()).unwrap();
+    assert_eq!(history_snapshots(&history), [&chain[3], &chain[2]]);
+    assert!(history.retention_boundary && !history.has_more && !history.legacy_boundary);
+    // Source verification passes before any connection is attempted: the failure that
+    // follows is the unreachable database, never the source snapshot.
+    let mut cfg = master_database_config();
+    cfg.port = 9;
+    cfg.timeout_seconds = 2;
+    let result = db::migrate_history(&cfg, &output, registry_scope()).await;
+    assert!(result.is_err());
+    assert!(!matches!(result, Err(db::Error::Snapshot)));
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL server and SIRIUS_TEST_POSTGRES_PORT/PASSWORD"]
+async fn master_database_migration_imports_retained_window() {
+    let _guard = POSTGRES_TEST_LOCK.lock().await;
+    use crate::{master_database as db, master_registry as registry};
+    use sqlx::{Connection, Row};
+    let mut cfg = master_database_config();
+    cfg.port = std::env::var("SIRIUS_TEST_POSTGRES_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    cfg.keep_snapshots = 10;
+    let mut scope = registry_scope();
+    scope.environment = format!("retention-{}", uuid::Uuid::new_v4().simple());
+    let key = serde_json::to_string(&scope).unwrap();
+    let (_root, input, source, _) = retention_chain(5);
+    assert_eq!(retention_prune(&source, 3), 2);
+    let chain = registry::committed_history(&source, scope.clone()).unwrap();
+    assert_eq!(chain.entries.len(), 3);
+    let receipt = db::migrate_history(&cfg, &source, scope.clone())
+        .await
+        .unwrap();
+    assert!(receipt.changed && receipt.retention_boundary && !receipt.legacy_boundary);
+    assert_eq!(receipt.publications, 3);
+    assert_eq!(
+        receipt.source_sha256,
+        db::migration_plan_digest(&chain).unwrap()
+    );
+    let replay = db::migrate_history(&cfg, &source, scope.clone())
+        .await
+        .unwrap();
+    assert!(!replay.changed && replay.retention_boundary);
+    let mut conn = sqlx::PgConnection::connect_with(&cfg.options().unwrap())
+        .await
+        .unwrap();
+    let rows = sqlx::query("SELECT content_hash,published_at::text AS at FROM public.sirius_master_history WHERE scope=$1 ORDER BY id DESC")
+        .bind(&key).fetch_all(&mut conn).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    for (row, entry) in rows.iter().zip(&chain.entries) {
+        assert_eq!(row.get::<String, _>("content_hash"), entry.content_sha256);
+        let at: String = row.get("at");
+        let parsed = chrono::DateTime::parse_from_str(&at, "%Y-%m-%d %H:%M:%S%.f%#z").unwrap();
+        assert_eq!(
+            parsed.timestamp_micros(),
+            entry.published_at.unwrap().timestamp_micros()
+        );
+    }
+    // Pruning locally after migration changes the plan: a rerun is refused.
+    retention_imports(&input, &source, 1);
+    assert_eq!(retention_prune(&source, 3), 1);
+    assert!(matches!(
+        db::migrate_history(&cfg, &source, scope.clone()).await,
+        Err(db::Error::Integrity)
+    ));
+}
+
+#[tokio::test]
+async fn retention_skips_when_writer_busy() {
+    use crate::{master, master_registry as registry};
+    let (_root, _input, output, _) = retention_chain(4);
+    let keep = Some(registry::Retention { keep_snapshots: 2 });
+    let busy = master::WriterLock::acquire(&output).unwrap();
+    assert_eq!(registry::retain(&output, keep).await, None);
+    assert_eq!(master_snapshot_directories(&output).len(), 4);
+    drop(busy);
+    assert_eq!(registry::retain(&output, None).await, None);
+    assert_eq!(master_snapshot_directories(&output).len(), 4);
+    assert_eq!(registry::retain(&output, keep).await, Some(2));
+    assert_eq!(master_snapshot_directories(&output).len(), 2);
+}
+
+#[tokio::test]
+async fn master_updater_prunes_after_settled_result_including_unchanged_cycles() {
+    use crate::{master_registry::Retention, master_update::MasterUpdater};
+    let root = tempfile::tempdir().unwrap();
+    let input = tempfile::tempdir().unwrap();
+    let (mut manifest, decoder, bytes) = master_fixture();
+    std::fs::write(input.path().join("MasterFixture.bin"), bytes).unwrap();
+    let mut install = |version: &str| {
+        manifest.version = version.into();
+        std::fs::write(
+            input.path().join("MasterManifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        crate::master::import_directory(input.path(), root.path(), &decoder).unwrap();
+    };
+    install("fixture-v1");
+    install("fixture-v2");
+    let cdn = cdn_fixture(vec![
+        cdn_reply(remote_master_manifest()),
+        cdn_reply(master_fixture().2.to_vec()),
+    ])
+    .await;
+    let game = fixture(vec![
+        Reply::version(),
+        Reply::version(),
+        Reply::version(),
+        Reply::version(),
+    ])
+    .await;
+    let mut cfg = remote_master_config(&cdn, root.path());
+    cfg.master_retention = Some(Retention { keep_snapshots: 2 });
+    let c = client(&game, cfg.clone());
+    let updater = MasterUpdater::new(&cfg, c.clone()).unwrap();
+    let result = updater.update_once().await.unwrap();
+    assert_eq!(result["action"], "updated");
+    assert_eq!(result["pruned_snapshots"], 1);
+    let status = c.master_update_status().await;
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["result"]["pruned_snapshots"], 1);
+    assert_eq!(master_snapshot_directories(root.path()).len(), 2);
+    // Identical content installed locally twice more: an unchanged cycle converges too.
+    install("master-fixture");
+    install("master-fixture");
+    let result = updater.update_once().await.unwrap();
+    assert_eq!(result["action"], "unchanged");
+    assert_eq!(result["pruned_snapshots"], 2);
+    assert_eq!(master_snapshot_directories(root.path()).len(), 2);
+    // Without retention the result shape is that of 1.2.x.
+    let mut plain = cfg.clone();
+    plain.master_retention = None;
+    let result = MasterUpdater::new(&plain, c.clone())
+        .unwrap()
+        .update_once()
+        .await
+        .unwrap();
+    assert_eq!(result["action"], "unchanged");
+    assert!(result.get("pruned_snapshots").is_none());
+    assert_eq!(c.master_update_status().await["status"], "ready");
+}
+
+#[tokio::test]
+async fn master_sync_prunes_owner_and_consumer_independently() {
+    use crate::{master_registry as registry, master_sync::Syncer};
+    let (_owner_root, input, owner, _) = registry_fixture();
+    let game = fixture(vec![]).await;
+    let mut cfg = config();
+    cfg.master_directory = Some(owner.clone());
+    let app = api::router(
+        client(&game, cfg),
+        "owner-read".into(),
+        "owner-admin".into(),
+    );
+    let (origin, server) = peer_http_server(app).await;
+    let consumers = tempfile::tempdir().unwrap();
+    let policy = master_sync_config(origin, consumers.path().join("unused"))
+        .master_sync
+        .unwrap();
+    let pruning_dir = consumers.path().join("pruning");
+    let keeping_dir = consumers.path().join("keeping");
+    let pruning = Syncer::standalone(
+        policy.clone(),
+        registry_scope(),
+        pruning_dir.clone(),
+        Some(registry::Retention { keep_snapshots: 2 }),
+    )
+    .unwrap();
+    let keeping = Syncer::standalone(policy, registry_scope(), keeping_dir.clone(), None).unwrap();
+    let first = pruning.update_once().await.unwrap();
+    assert_eq!(first["action"], "updated");
+    assert_eq!(first["pruned_snapshots"], 0);
+    assert!(keeping
+        .update_once()
+        .await
+        .unwrap()
+        .get("pruned_snapshots")
+        .is_none());
+    let mut last = Value::Null;
+    for _ in 0..3 {
+        retention_imports(&input, &owner, 1);
+        last = pruning.update_once().await.unwrap();
+        assert_eq!(last["action"], "updated");
+        let kept = keeping.update_once().await.unwrap();
+        assert_eq!(kept["action"], "updated");
+        assert!(kept.get("pruned_snapshots").is_none());
+    }
+    assert_eq!(last["pruned_snapshots"], 1);
+    assert_eq!(master_snapshot_directories(&pruning_dir).len(), 2);
+    assert_eq!(master_snapshot_directories(&keeping_dir).len(), 4);
+    assert_eq!(master_snapshot_directories(&owner).len(), 4);
+    // The owner's own retention never reaches a consumer that keeps everything.
+    assert_eq!(retention_prune(&owner, 2), 2);
+    assert_eq!(keeping.update_once().await.unwrap()["action"], "unchanged");
+    assert_eq!(master_snapshot_directories(&keeping_dir).len(), 4);
+    // The snapshot a new owner publication replaced stays readable for pinned consumers.
+    let replaced = registry::current_snapshot(&owner).unwrap();
+    retention_imports(&input, &owner, 1);
+    assert_eq!(retention_prune(&owner, 2), 1);
+    let table_sha = registry::digest(include_bytes!("../tests/fixtures/master-synthetic.json"));
+    assert!(registry::table(
+        &owner,
+        crate::region::Region::Jp,
+        &replaced,
+        "MasterFixture",
+        &table_sha
+    )
+    .is_ok());
+    let synced = pruning.update_once().await.unwrap();
+    assert_eq!(synced["action"], "updated");
+    assert_eq!(synced["pruned_snapshots"], 1);
+    assert_eq!(master_snapshot_directories(&pruning_dir).len(), 2);
+    server.abort();
+}
+fn dockerfile_stage<'a>(dockerfile: &'a str, header: &str) -> &'a str {
+    let start = dockerfile
+        .find(&format!("{header}\n"))
+        .unwrap_or_else(|| panic!("missing stage {header}"));
+    let body = &dockerfile[start + header.len()..];
+    body.find("\nFROM ").map_or(body, |end| &body[..end])
+}
+#[test]
+fn dockerfile_caches_dependencies_before_sources() {
+    let dockerfile = &lf(include_str!("../Dockerfile"));
+    assert!(!dockerfile.contains("COPY . ."));
+    let chef = dockerfile_stage(dockerfile, "FROM rust:1.96-alpine AS chef");
+    assert!(chef.contains("cargo install cargo-chef --version 0.1.78 --locked"));
+    let planner = dockerfile_stage(dockerfile, "FROM chef AS planner");
+    // Without build.rs the recipe has no build script and cook skips the build-dependencies.
+    assert!(planner.contains("COPY Cargo.toml Cargo.lock build.rs ./"));
+    assert!(planner.contains("cargo chef prepare --recipe-path recipe.json"));
+    let builder = dockerfile_stage(dockerfile, "FROM chef AS builder");
+    let at = |needle: &str| {
+        builder
+            .find(needle)
+            .unwrap_or_else(|| panic!("builder lacks {needle}"))
+    };
+    let cook = at("RUN cargo chef cook --release --locked --recipe-path recipe.json");
+    let build = at("RUN cargo build --release --locked");
+    for input in [
+        "COPY Cargo.toml Cargo.lock build.rs ./",
+        "COPY src ./src",
+        "COPY protocol ./protocol",
+        "COPY LICENSE* ./",
+    ] {
+        assert!(cook < at(input) && at(input) < build, "{input}");
+    }
+    // VERSION stays out of the cooked layer and is still checked before the real build.
+    let version = at("ARG VERSION=dev");
+    let check = at("grep -Fx \"version = \\\"${VERSION#v}\\\"\" Cargo.toml");
+    assert!(cook < version && version < check && check < build);
+    let runtime = dockerfile_stage(dockerfile, "FROM alpine:3.24");
+    for line in [
+        "RUN apk add --no-cache ca-certificates tzdata git openssh-keygen",
+        "COPY --from=builder /app/LICENSE* /usr/share/licenses/sirius-api-proxy/",
+        "COPY --from=builder /app/target/release/sirius-api-proxy /usr/local/bin/sirius-api-proxy",
+        "COPY --from=builder /app/protocol /app/protocol",
+        "USER sirius",
+    ] {
+        assert!(runtime.contains(line), "{line}");
+    }
+    // The context is a whitelist, so local configuration and secrets never reach the builder.
+    let ignore = lf(include_str!("../.dockerignore"));
+    let entries: Vec<&str> = ignore.lines().collect();
+    assert_eq!(entries.first(), Some(&"**"));
+    for input in [
+        "!Cargo.toml",
+        "!Cargo.lock",
+        "!build.rs",
+        "!src/**",
+        "!protocol/**",
+        "!LICENSE*",
+    ] {
+        assert!(entries.contains(&input), "{input}");
+    }
+}
+
+#[test]
+fn health_uptime_counts_from_first_mark_and_never_decreases() {
+    api::mark_started();
+    let started = api::started_at();
+    api::mark_started();
+    assert_eq!(api::started_at(), started);
+    let t = std::time::Instant::now();
+    assert_eq!(api::uptime_secs_between(t, t + Duration::from_secs(90)), 90);
+    assert_eq!(
+        api::uptime_secs_between(t, t + Duration::from_millis(1999)),
+        1
+    );
+    assert_eq!(api::uptime_secs_between(t + Duration::from_secs(5), t), 0);
+    let first = api::health_body("x").0["uptime_secs"].as_u64().unwrap();
+    let second = api::health_body("x").0["uptime_secs"].as_u64().unwrap();
+    assert!(second >= first);
+}
+
+fn compression_on() -> Option<crate::http_compression::Config> {
+    Some(crate::http_compression::Config { enabled: true })
+}
+/// A JSON string document of exactly `len` bytes.
+fn compression_json(len: usize) -> Vec<u8> {
+    let mut bytes = vec![b'"'];
+    bytes.extend((0..len - 2).map(|i| b"sirius-master-row-"[i % 18]));
+    bytes.push(b'"');
+    bytes
+}
+fn canned(
+    status: u16,
+    headers: &[(&'static str, &'static str)],
+    body: Vec<u8>,
+) -> axum::routing::MethodRouter {
+    let headers = headers.to_vec();
+    let body = Bytes::from(body);
+    axum::routing::get(move || {
+        let (headers, body) = (headers.clone(), body.clone());
+        async move {
+            let mut response = axum::http::Response::builder().status(status);
+            for (name, value) in headers {
+                response = response.header(name, value);
+            }
+            response.body(axum::body::Body::from(body)).unwrap()
+        }
+    })
+}
+const COMPRESSION_PATHS: [&str; 8] = [
+    "/json",
+    "/small",
+    "/threshold",
+    "/missing",
+    "/unavailable",
+    "/tar",
+    "/encoded",
+    "/not-modified",
+];
+fn compression_test_router() -> axum::Router {
+    const JSON: (&str, &str) = ("content-type", "application/json");
+    axum::Router::new()
+        .route(
+            "/json",
+            canned(
+                200,
+                &[
+                    JSON,
+                    ("etag", "\"fixture-etag\""),
+                    ("content-length", "65536"),
+                    ("x-master-version", "fixture-v1"),
+                ],
+                compression_json(65536),
+            ),
+        )
+        .route("/small", canned(200, &[JSON], compression_json(1023)))
+        .route("/threshold", canned(200, &[JSON], compression_json(1024)))
+        .route("/missing", canned(404, &[JSON], compression_json(2048)))
+        .route("/unavailable", canned(503, &[JSON], compression_json(2048)))
+        .route(
+            "/tar",
+            canned(
+                200,
+                &[
+                    ("content-type", "application/x-tar"),
+                    ("content-length", "2048"),
+                ],
+                vec![0; 2048],
+            ),
+        )
+        .route(
+            "/encoded",
+            canned(
+                200,
+                &[JSON, ("content-encoding", "gzip")],
+                compression_json(2048),
+            ),
+        )
+        .route(
+            "/not-modified",
+            canned(304, &[JSON, ("etag", "\"fixture-etag\"")], Vec::new()),
+        )
+}
+/// Sends `method path` with `headers`; answers (status, headers, raw body bytes).
+async fn negotiated(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, axum::http::HeaderMap, Vec<u8>) {
+    let mut request = Request::builder().method(method).uri(path);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+/// The representation bytes: decodes gzip/zstd, identity otherwise.
+fn decoded(headers: &axum::http::HeaderMap, bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    match headers.get("content-encoding").map(|v| v.to_str().unwrap()) {
+        None => bytes.to_vec(),
+        Some("gzip") => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .unwrap();
+            out
+        }
+        Some("zstd") => zstd::decode_all(bytes).unwrap(),
+        Some(other) => panic!("unexpected content-encoding {other}"),
+    }
+}
+fn varies_on_encoding(headers: &axum::http::HeaderMap) -> bool {
+    let vary = headers.get_all("vary").iter().collect::<Vec<_>>();
+    assert!(vary.len() <= 1, "duplicate Vary: {vary:?}");
+    vary.first()
+        .is_some_and(|v| v.to_str().unwrap().eq_ignore_ascii_case("accept-encoding"))
+}
+/// A registry fixture whose single table is replaced by a >= 64 KiB JSON array with a matching
+/// tables.json index, so the served bytes cross the compression threshold.
+fn large_registry_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    crate::master::ImportReceipt,
+    Vec<u8>,
+) {
+    let (root, _input, output, receipt) = registry_fixture();
+    let rows = (0..2000)
+        .map(|i| json!({"id": i, "name": format!("fixture-row-{i}"), "value": i * 7}))
+        .collect::<Vec<_>>();
+    let table = serde_json::to_vec(&rows).unwrap();
+    assert!(table.len() >= 64 * 1024);
+    let snapshot = output.join(&receipt.snapshot);
+    std::fs::write(snapshot.join("MasterFixture.json"), &table).unwrap();
+    let mut index: crate::master_registry::Inventory =
+        serde_json::from_slice(&std::fs::read(snapshot.join("tables.json")).unwrap()).unwrap();
+    index.files = vec![crate::master_registry::file(
+        "MasterFixture.json".into(),
+        &table,
+    )];
+    std::fs::write(
+        snapshot.join("tables.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    (root, output, receipt, table)
+}
+
+#[tokio::test]
+async fn http_compression_layer_negotiates_gzip_zstd_and_identity() {
+    let app = crate::http_compression::wrap(compression_test_router(), compression_on().as_ref());
+    let original = compression_json(65536);
+    for (accept, expected) in [
+        (None, None),
+        (Some("gzip"), Some("gzip")),
+        (Some("zstd"), Some("zstd")),
+        (Some("gzip, zstd"), Some("zstd")),
+        (Some("gzip;q=1, zstd;q=0.5"), Some("gzip")),
+        (Some("br"), None),
+        (Some("*"), None),
+        (Some("gzip;q=0"), None),
+        (Some("identity"), None),
+    ] {
+        let headers = accept
+            .map(|a| vec![("accept-encoding", a)])
+            .unwrap_or_default();
+        let (status, headers, bytes) = negotiated(&app, "GET", "/json", &headers).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("content-encoding").map(|v| v.to_str().unwrap()),
+            expected,
+            "{accept:?}"
+        );
+        assert_eq!(decoded(&headers, &bytes), original, "{accept:?}");
+        assert!(varies_on_encoding(&headers), "{accept:?}");
+        assert_eq!(headers["x-master-version"], "fixture-v1");
+        assert_eq!(headers["content-type"], "application/json");
+        if expected.is_some() {
+            assert!(headers.get("content-length").is_none());
+            assert_eq!(headers["etag"], "W/\"fixture-etag\"");
+            assert!(bytes.len() < original.len() / 4);
+        } else {
+            assert_eq!(bytes, original);
+            assert_eq!(headers["content-length"], "65536");
+            assert_eq!(headers["etag"], "\"fixture-etag\"");
+        }
+    }
+    // The threshold is inclusive.
+    let (_, headers, bytes) =
+        negotiated(&app, "GET", "/threshold", &[("accept-encoding", "gzip")]).await;
+    assert_eq!(headers["content-encoding"], "gzip");
+    assert_eq!(decoded(&headers, &bytes), compression_json(1024));
+}
+
+#[tokio::test]
+async fn http_compression_skips_small_errors_non_json_and_conditional() {
+    let app = crate::http_compression::wrap(compression_test_router(), compression_on().as_ref());
+    let gzip = [("accept-encoding", "gzip, zstd")];
+    let (status, headers, bytes) = negotiated(&app, "GET", "/small", &gzip).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(bytes, compression_json(1023));
+    assert!(varies_on_encoding(&headers));
+    for (path, code) in [("/missing", 404), ("/unavailable", 503)] {
+        let (status, headers, bytes) = negotiated(&app, "GET", path, &gzip).await;
+        assert_eq!(status, code);
+        assert!(headers.get("content-encoding").is_none(), "{path}");
+        assert!(headers.get("vary").is_none(), "{path}");
+        assert_eq!(bytes, compression_json(2048));
+    }
+    // Bundles keep their exact length and are never negotiated.
+    let (status, headers, bytes) = negotiated(&app, "GET", "/tar", &gzip).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none());
+    assert!(headers.get("vary").is_none());
+    assert_eq!(headers["content-length"], "2048");
+    assert_eq!(bytes, vec![0; 2048]);
+    // Already-encoded bodies are passed through untouched.
+    let (status, headers, bytes) = negotiated(&app, "GET", "/encoded", &gzip).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .get_all("content-encoding")
+            .iter()
+            .collect::<Vec<_>>(),
+        ["gzip"]
+    );
+    assert_eq!(bytes, compression_json(2048));
+    // 304: empty, identity, strong validator, still varies.
+    let (status, headers, bytes) = negotiated(&app, "GET", "/not-modified", &gzip).await;
+    assert_eq!(status, 304);
+    assert!(bytes.is_empty());
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(headers["etag"], "\"fixture-etag\"");
+    assert!(varies_on_encoding(&headers));
+    // HEAD is answered normally, without a body.
+    let (status, _, bytes) = negotiated(&app, "HEAD", "/json", &gzip).await;
+    assert_eq!(status, 200);
+    assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn http_compression_disabled_is_byte_identical() {
+    let plain = compression_test_router();
+    let off = crate::http_compression::Config { enabled: false };
+    for app in [
+        crate::http_compression::wrap(compression_test_router(), None),
+        crate::http_compression::wrap(compression_test_router(), Some(&off)),
+    ] {
+        for path in COMPRESSION_PATHS {
+            for accept in [vec![], vec![("accept-encoding", "gzip, zstd")]] {
+                let expected = negotiated(&plain, "GET", path, &accept).await;
+                let actual = negotiated(&app, "GET", path, &accept).await;
+                assert!(actual.1.get("vary").is_none(), "{path}");
+                assert_eq!(actual, expected, "{path}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn public_api_compression_routing_and_conditional_revalidation() {
+    use crate::{deployment::DeploymentConfig, region::Region};
+    let (_root, output, receipt, table) = large_registry_fixture();
+    let sha = crate::master_registry::digest(&table);
+    let mut cfg = regional_config(Region::Jp);
+    cfg.master_directory = Some(output);
+    cfg.http_compression = compression_on();
+    // Every route below is served locally; the configured game endpoint is never contacted.
+    let app = DeploymentConfig::Single(Box::new(cfg))
+        .prepare()
+        .unwrap()
+        .router;
+    let public = ("authorization", "Bearer public-jp");
+    let pinned = format!(
+        "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{sha}",
+        receipt.snapshot
+    );
+    for (path, coding) in [
+        (pinned.as_str(), "gzip"),
+        ("/api/v1/master-data/tables/MasterFixture", "zstd"),
+    ] {
+        let (status, headers, bytes) =
+            negotiated(&app, "GET", path, &[public, ("accept-encoding", coding)]).await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(headers["content-encoding"], coding);
+        assert_eq!(decoded(&headers, &bytes), table);
+        assert!(headers.get("content-length").is_none());
+        assert!(varies_on_encoding(&headers));
+        assert_eq!(headers["x-master-version"], "fixture-v1");
+        let weak = format!("W/\"{sha}\"");
+        assert_eq!(headers["etag"], weak.as_str());
+        // The weak validator revalidates; the empty 304 keeps the strong tag.
+        let (status, headers, bytes) = negotiated(
+            &app,
+            "GET",
+            path,
+            &[
+                public,
+                ("accept-encoding", coding),
+                ("if-none-match", &weak),
+            ],
+        )
+        .await;
+        assert_eq!(status, 304, "{path}");
+        assert!(bytes.is_empty());
+        assert!(headers.get("content-encoding").is_none());
+        assert_eq!(headers["etag"], format!("\"{sha}\"").as_str());
+        assert!(varies_on_encoding(&headers));
+        // A client without Accept-Encoding sees 1.2.x bytes and the strong tag.
+        let (status, headers, bytes) = negotiated(&app, "GET", path, &[public]).await;
+        assert_eq!(status, 200);
+        assert!(headers.get("content-encoding").is_none());
+        assert_eq!(bytes, table);
+        assert_eq!(headers["etag"], format!("\"{sha}\"").as_str());
+        assert!(varies_on_encoding(&headers));
+    }
+    let manifest = "/api/v1/master-data/manifest";
+    let (status, headers, bytes) = negotiated(
+        &app,
+        "GET",
+        manifest,
+        &[public, ("accept-encoding", "gzip")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(varies_on_encoding(&headers));
+    let published: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&decoded(&headers, &bytes)).unwrap();
+    assert_eq!(published.files[0].sha256, sha);
+    let etag = headers["etag"].to_str().unwrap();
+    assert_eq!(
+        negotiated(&app, "GET", manifest, &[public, ("if-none-match", etag)])
+            .await
+            .0,
+        304
+    );
+    // Bundles stay identity with an exact length.
+    let (status, headers, bytes) = negotiated(
+        &app,
+        "GET",
+        "/api/v1/master-data/bundle",
+        &[public, ("accept-encoding", "gzip, zstd")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-type"], "application/x-tar");
+    assert!(headers.get("content-encoding").is_none());
+    assert!(headers.get("vary").is_none());
+    assert_eq!(headers["content-length"], bytes.len().to_string().as_str());
+    // Unauthenticated requests never cost encoder work.
+    let (status, headers, _) = negotiated(
+        &app,
+        "GET",
+        "/api/v1/master-data/tables/MasterFixture",
+        &[("accept-encoding", "gzip")],
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert!(headers.get("content-encoding").is_none());
+    assert!(headers.get("vary").is_none());
+    // Health and internal routes are never wrapped.
+    for (path, token) in [
+        ("/health", None),
+        ("/internal/v1/nodes", Some("Bearer internal-jp")),
+        ("/internal/v1/accounts", Some("Bearer internal-jp")),
+        ("/internal/v1/protocol", Some("Bearer internal-jp")),
+    ] {
+        let mut headers = vec![("accept-encoding", "gzip, zstd")];
+        headers.extend(token.map(|t| ("authorization", t)));
+        let (status, headers, _) = negotiated(&app, "GET", path, &headers).await;
+        assert_eq!(status, 200, "{path}");
+        assert!(headers.get("content-encoding").is_none(), "{path}");
+        assert!(headers.get("vary").is_none(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn multi_region_compression_is_root_only_and_peer_stays_identity() {
+    use crate::{
+        deployment::{DeploymentConfig, MultiConfig},
+        error::AppError,
+        region::Region,
+    };
+    let mut jp = regional_config(Region::Jp);
+    let peer = format!("SIRIUS_TEST_PEER_{}", uuid::Uuid::new_v4().simple());
+    std::env::set_var(&peer, "compression-peer");
+    jp.peer_token_env = Some(peer);
+    let identity = GameClient::new(jp.clone())
+        .unwrap()
+        .peer_identity()
+        .unwrap();
+    let mut m = MultiConfig {
+        logging: None,
+        tls: None,
+        access_log: None,
+        http_compression: compression_on(),
+        listen: "127.0.0.1:0".parse().unwrap(),
+        regions: BTreeMap::from([
+            ("jp".into(), jp),
+            ("hk".into(), regional_config(Region::Hk)),
+        ]),
+    };
+    let app = DeploymentConfig::Multi(Box::new(m.clone()))
+        .prepare()
+        .unwrap()
+        .router;
+    for region in ["jp", "hk"] {
+        let (status, headers, bytes) = negotiated(
+            &app,
+            "GET",
+            &format!("/api/v1/{region}/regions"),
+            &[
+                ("authorization", &format!("Bearer public-{region}")),
+                ("accept-encoding", "gzip"),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-encoding"], "gzip");
+        assert!(varies_on_encoding(&headers));
+        let body: Value = serde_json::from_slice(&decoded(&headers, &bytes)).unwrap();
+        assert_eq!(body["selected"], region);
+    }
+    // The peer wire stays identity for 1.2.x callers: a mismatched identity is answered
+    // locally without any game call.
+    let mut identity = identity;
+    identity.protocol_sha256 = "0".repeat(64);
+    let payload = peer_request(identity, json!({"type":"version"}));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/internal/v1/jp/peer/query")
+                .header("authorization", "Bearer compression-peer")
+                .header("content-type", "application/json")
+                .header("accept-encoding", "gzip, zstd")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers().get("content-encoding").is_none());
+    assert!(response.headers().get("vary").is_none());
+    assert_eq!(
+        body(response).await["outcome"]["kind"]["type"],
+        "identity_mismatch"
+    );
+    // A region-level setting is rejected; the setting is deployment-wide.
+    m.regions.get_mut("hk").unwrap().http_compression = compression_on();
+    match DeploymentConfig::Multi(Box::new(m)).validate() {
+        Err(AppError::Config(message)) => assert!(message.contains("http_compression")),
+        _ => panic!("region-level http_compression must be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn standalone_registry_compression_public_only() {
+    let (_root, source, receipt, table) = large_registry_fixture();
+    let sha = crate::master_registry::digest(&table);
+    let mut cfg = standalone_registry_config(source.clone());
+    cfg.http_compression = compression_on();
+    let app = cfg.prepare().unwrap().router;
+    let read = ("authorization", "Bearer owner-read");
+    let zstd = ("accept-encoding", "zstd");
+    let (status, headers, bytes) =
+        negotiated(&app, "GET", "/api/v1/master-data/manifest", &[read, zstd]).await;
+    assert_eq!(status, 200);
+    assert!(varies_on_encoding(&headers));
+    let manifest: crate::master_registry::PublishedManifest =
+        serde_json::from_slice(&decoded(&headers, &bytes)).unwrap();
+    assert_eq!(manifest.snapshot, receipt.snapshot);
+    let (status, headers, bytes) = negotiated(
+        &app,
+        "GET",
+        &format!(
+            "/api/v1/master-data/snapshots/{}/tables/MasterFixture/{sha}",
+            manifest.snapshot
+        ),
+        &[read, zstd],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["content-encoding"], "zstd");
+    assert_eq!(headers["etag"], format!("W/\"{sha}\"").as_str());
+    assert_eq!(decoded(&headers, &bytes), table);
+    let (status, headers, bytes) =
+        negotiated(&app, "GET", "/api/v1/master-data/bundle", &[read, zstd]).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(headers["content-length"], bytes.len().to_string().as_str());
+    let (status, headers, _) = negotiated(&app, "GET", "/health", &[zstd]).await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none() && headers.get("vary").is_none());
+    // The real consumer sends no Accept-Encoding, receives identity and installs exactly.
+    let (origin, server) = peer_http_server(app).await;
+    let consumer = tempfile::tempdir().unwrap();
+    let consumer_config = master_sync_config(origin, consumer.path().join("master"));
+    let sync = crate::master_sync::Syncer::new(
+        &consumer_config,
+        GameClient::new(consumer_config.clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sync.update_once().await.unwrap()["action"], "updated");
+    assert_eq!(
+        crate::master::read_current(&consumer.path().join("master"), Some("MasterFixture"))
+            .unwrap()
+            .bytes,
+        table
+    );
+    server.abort();
+    // Internal owner routes stay identity.
+    let mut owner = registry_owner_config("http://127.0.0.1:1".into(), source);
+    owner.http_compression = compression_on();
+    let app = owner.prepare().unwrap().router;
+    let (status, headers, _) = negotiated(
+        &app,
+        "GET",
+        "/internal/v1/master-data/updater",
+        &[("authorization", "Bearer registry-admin"), zstd],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(headers.get("content-encoding").is_none() && headers.get("vary").is_none());
+}
+
+#[test]
+fn http_compression_config_is_strict() {
+    use crate::deployment::DeploymentConfig;
+    let single = lf(include_str!("../sirius-api-config.example.yaml"));
+    let multi = lf(include_str!("../sirius-multi-region-config.example.yaml"));
+    let registry = lf(include_str!("../docs/examples/master-registry.yaml"));
+    let with = |base: &str, block: &str| format!("{base}\n{block}");
+    for enabled in [true, false] {
+        let block = format!("http_compression:\n  enabled: {enabled}\n");
+        let DeploymentConfig::Single(c) = DeploymentConfig::parse(&with(&single, &block)).unwrap()
+        else {
+            panic!("single-region example");
+        };
+        assert_eq!(c.http_compression.unwrap().enabled, enabled);
+        let DeploymentConfig::Multi(m) = DeploymentConfig::parse(&with(&multi, &block)).unwrap()
+        else {
+            panic!("multi-region example");
+        };
+        assert_eq!(m.http_compression.unwrap().enabled, enabled);
+        let r: crate::registry_service::Config =
+            yaml_serde::from_str(&with(&registry, &block)).unwrap();
+        assert_eq!(r.http_compression.unwrap().enabled, enabled);
+    }
+    for block in [
+        "http_compression:\n  enabled: true\n  level: 9\n",
+        "http_compression: {}\n",
+        "http_compression:\n  enabled: \"true\"\n",
+        "http_compression: true\n",
+    ] {
+        assert!(
+            DeploymentConfig::parse(&with(&single, block)).is_err(),
+            "{block}"
+        );
+        assert!(
+            DeploymentConfig::parse(&with(&multi, block)).is_err(),
+            "{block}"
+        );
+        assert!(
+            yaml_serde::from_str::<crate::registry_service::Config>(&with(&registry, block))
+                .is_err(),
+            "{block}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_request_body_decompression() {
+    use std::io::Write;
+    let gzip = |bytes: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    };
+    let cfg = master_sync_config(
+        "http://127.0.0.1:9".into(),
+        tempfile::tempdir().unwrap().keep(),
+    );
+    let compression = compression_on();
+    let app = crate::error::json_client_errors(api::router_at(
+        GameClient::new(cfg).unwrap(),
+        "api".into(),
+        "internal".into(),
+        "/api/v1",
+        "/internal/v1",
+        compression.as_ref(),
+    ));
+    let hint =
+        serde_json::to_vec(&json!({"scope":registry_scope(),"content_sha256":"0".repeat(64)}))
+            .unwrap();
+    let bomb = gzip(&vec![b' '; 1024 * 1024]);
+    assert!(bomb.len() < 4096);
+    let send = |body: Vec<u8>, encoded: bool| {
+        let mut request = Request::post("/internal/v1/master-data/sync")
+            .header("authorization", "Bearer internal")
+            .header("content-type", "application/json");
+        if encoded {
+            request = request.header("content-encoding", "gzip");
+        }
+        app.clone()
+            .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+    };
+    // The plain hint is accepted; its gzip form and a small bomb are never inflated.
+    assert_eq!(send(hint.clone(), false).await.unwrap().status(), 202);
+    for encoded in [gzip(&hint), bomb] {
+        let response = send(encoded, true).await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert!(response.headers().get("content-encoding").is_none());
+        assert_eq!(body(response).await["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn json_client_errors_drops_content_encoding() {
+    let app = crate::error::json_client_errors(axum::Router::new().route(
+        "/encoded",
+        canned(
+            404,
+            &[("content-type", "text/plain"), ("content-encoding", "gzip")],
+            b"not json".to_vec(),
+        ),
+    ));
+    let (status, headers, bytes) = negotiated(&app, "GET", "/encoded", &[]).await;
+    assert_eq!(status, 404);
+    assert!(headers.get("content-encoding").is_none());
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"error":"not found","code":"not_found"})
+    );
+}
+
+// Per-stage latency measurement (manual; never asserts timings).
+//
+// Run with `cargo test --release --locked perf_stages -- --ignored --nocapture
+// --test-threads=1`. Numbers depend on the host and are not recorded in the repository.
+// Deliberately excluded: loopback HTTP/2 end to end (scheduler and loopback noise; functional
+// tests cover the behavior), response compression (a tower layer inside that round trip), live
+// game or CDN traffic, PostgreSQL and Redis (they would measure a server and the network), and
+// production stage tracing or metrics, which would need configuration and log-field review.
+
+/// Samples until `min_samples` and 500 ms are both reached (at most 10 000 samples) and prints
+/// min, median and p90. `input` runs outside the timed region, and so does dropping the output.
+/// `bytes` is the payload the stage handles (the inflated JSON for gunzip); 0 prints no rate.
+fn perf_measure<I, O>(
+    label: &str,
+    bytes: usize,
+    min_samples: usize,
+    mut input: impl FnMut() -> I,
+    mut run: impl FnMut(I) -> O,
+) {
+    use std::{
+        hint::black_box,
+        time::{Duration, Instant},
+    };
+    // Slow stages (few samples) warm up once; fast stages three times.
+    for _ in 0..if min_samples <= 3 { 1 } else { 3 } {
+        black_box(run(black_box(input())));
+    }
+    let mut samples = Vec::new();
+    let mut total = Duration::ZERO;
+    while samples.len() < 10_000
+        && (samples.len() < min_samples || total < Duration::from_millis(500))
+    {
+        let value = black_box(input());
+        let started = Instant::now();
+        let output = black_box(run(value));
+        let elapsed = started.elapsed();
+        drop(output);
+        samples.push(elapsed);
+        total += elapsed;
+    }
+    samples.sort();
+    let micros = |d: Duration| d.as_secs_f64() * 1e6;
+    let median = samples[samples.len() / 2];
+    let p90 = samples[(samples.len() * 9 / 10).min(samples.len() - 1)];
+    let rate = if bytes > 0 {
+        format!(
+            "{:>9.1}",
+            bytes as f64 / (1 << 20) as f64 / median.as_secs_f64()
+        )
+    } else {
+        format!("{:>9}", "-")
+    };
+    println!(
+        "{label:<64} {:>6} {bytes:>10} {:>11.1} {:>11.1} {:>11.1} {rate}",
+        samples.len(),
+        micros(samples[0]),
+        micros(median),
+        micros(p90),
+    );
+}
+
+/// A deterministic Master-like JSON array of about `bytes` bytes. A seeded xorshift token per
+/// row keeps gzip from compressing it far better than real tables do.
+fn perf_table(bytes: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = b"[".to_vec();
+    let mut i = 0u64;
+    while out.len() < bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        if i > 0 {
+            out.push(b',');
+        }
+        let id = seed * 1_000_000 + i;
+        out.extend(
+            format!(
+                r#"{{"id":{id},"name":"fixture 中文 {i}","assetBundleName":"{state:016x}","startAt":"17000000000{i}","rewards":[{{"type":1,"id":{id},"count":3}}],"flags":[true,false],"rate":1.5}}"#
+            )
+            .bytes(),
+        );
+        i += 1;
+    }
+    out.push(b']');
+    out
+}
+
+/// Repeats every array that has no array above it to 100 elements, so ranking and
+/// announcement lists grow while nested lists stay at one element (no exponential growth).
+fn perf_widen(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .flat_map(|item| std::iter::repeat_n(item, 100))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name, perf_widen(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+#[test]
+#[ignore = "manual per-stage latency measurement; run with --release -- --ignored --nocapture"]
+fn perf_stages() {
+    use crate::{
+        master::{Entry, MasterDecoder},
+        master_registry as registry,
+        protocol::{ProtocolBundle, ProtocolStatus},
+        region::Region,
+        rijndael::Rijndael256,
+        routes::{EVENT_RANKING, GLOBAL_ROUTES, ROUTES},
+    };
+    use std::{hint::black_box, io::Read};
+    let none = || ();
+    println!(
+        "sirius-api-proxy {} perf_stages: debug_assertions={} parallelism={}",
+        env!("CARGO_PKG_VERSION"),
+        cfg!(debug_assertions),
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+    );
+    if cfg!(debug_assertions) {
+        println!("debug build: numbers are not representative, use --release");
+    }
+    println!(
+        "{:<64} {:>6} {:>10} {:>11} {:>11} {:>11} {:>9}",
+        "stage", "n", "bytes", "min_us", "median_us", "p90_us", "MiB/s"
+    );
+
+    // Master import, stage by stage, on a table the size of the largest real one. The encrypted
+    // file is built backwards from decryption, so every stage runs on valid input.
+    let large = perf_table(1536 * 1024, 1);
+    let encrypted = encrypted_master_body(&large);
+    let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let iv = [0u8; 32];
+    let cipher = Rijndael256::new(&key);
+    let plaintext = cipher.decrypt(&encrypted[32..], &iv).unwrap();
+    let compressed = &plaintext[32..];
+    let entry = Entry {
+        name: "MasterPerfLarge.bin".into(),
+        size: encrypted.len() as u64,
+        hash: registry::digest(&encrypted),
+    };
+    let decoder = MasterDecoder::new(&key, iv);
+    assert_eq!(decoder.decode(&entry, &encrypted).unwrap(), large);
+    perf_measure("master.sha256", encrypted.len(), 20, none, |_| {
+        <sha2::Sha256 as sha2::Digest>::digest(black_box(&encrypted))
+    });
+    // Paid once per MasterDecoder: the key schedule rebuilds the S-boxes each time.
+    perf_measure("master.rijndael_key_schedule", 0, 20, none, |_| {
+        Rijndael256::new(black_box(&key))
+    });
+    perf_measure(
+        "master.rijndael_cbc",
+        encrypted.len() - 32,
+        20,
+        none,
+        |_| cipher.decrypt(black_box(&encrypted[32..]), &iv),
+    );
+    perf_measure("master.gunzip", large.len(), 20, none, |_| {
+        // Bounded like MasterDecoder::decode (64 MiB limit plus one byte).
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(black_box(compressed))
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut json)
+            .unwrap();
+        json
+    });
+    perf_measure("master.json_value", large.len(), 20, none, |_| {
+        serde_json::from_slice::<Value>(black_box(&large)).unwrap()
+    });
+    perf_measure("master.json_validate", large.len(), 20, none, |_| {
+        crate::master::validate_json(black_box(&large)).unwrap()
+    });
+    perf_measure("master.decode", encrypted.len(), 20, none, |_| {
+        decoder.decode(&entry, black_box(&encrypted)).unwrap()
+    });
+
+    // Snapshot install and reads: one 1.5 MiB table plus 40 of 240 KiB (about 11 MiB, like the
+    // real data). Each install sample gets a fresh directory; creating and removing it is untimed.
+    let mut tables = vec![("MasterPerfLarge".to_owned(), large.clone())];
+    tables.extend((0..40).map(|i| (format!("MasterPerf{i:02}"), perf_table(240 * 1024, i + 2))));
+    let tables: Vec<(&str, &[u8])> = tables
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let total: usize = tables.iter().map(|(_, bytes)| bytes.len()).sum();
+    perf_measure(
+        "master.install_snapshot",
+        total,
+        3,
+        || tempfile::tempdir().unwrap(),
+        |temp| {
+            install_plain_master(&temp.path().join("master"), "perf-v1", None, &tables);
+            temp
+        },
+    );
+    let installed = tempfile::tempdir().unwrap();
+    let dir = installed.path().join("master");
+    install_plain_master(&dir, "perf-v1", None, &tables);
+    let snapshot = registry::current_snapshot(&dir).unwrap();
+    let digest = registry::digest(&large);
+    assert_eq!(
+        crate::master::read_current_in(&dir, Some("MasterPerfLarge"), Region::Jp)
+            .unwrap()
+            .bytes,
+        large
+    );
+    assert_eq!(
+        registry::table(&dir, Region::Jp, &snapshot, "MasterPerfLarge", &digest)
+            .unwrap()
+            .bytes,
+        large
+    );
+    let status = crate::master::read_current_in(&dir, None, Region::Jp).unwrap();
+    perf_measure(
+        "master.read_current_status",
+        status.bytes.len(),
+        20,
+        none,
+        |_| crate::master::read_current_in(&dir, None, Region::Jp).unwrap(),
+    );
+    perf_measure(
+        "master.read_current_table_large",
+        large.len(),
+        20,
+        none,
+        |_| crate::master::read_current_in(&dir, Some("MasterPerfLarge"), Region::Jp).unwrap(),
+    );
+    let manifest = registry::manifest(&dir, None, registry_scope()).unwrap();
+    perf_measure("registry.manifest", manifest.bytes.len(), 20, none, |_| {
+        registry::manifest(&dir, None, registry_scope()).unwrap()
+    });
+    perf_measure("registry.table_pinned_large", large.len(), 20, none, |_| {
+        registry::table(&dir, Region::Jp, &snapshot, "MasterPerfLarge", &digest).unwrap()
+    });
+
+    // Native versus dynamic codec on the same pool: the twin differs only in its codec label,
+    // so both rows run the full production decode, JSON conversion included.
+    let mut ranking = None;
+    for (family, directory, routes) in [
+        ("jp", crate::config::default_protocol_directory(), ROUTES),
+        ("global", "protocol/global/1.0.1".into(), GLOBAL_ROUTES),
+    ] {
+        let native = ProtocolBundle::load(&directory).unwrap();
+        assert_eq!(native.status.codec, "native");
+        let dynamic = ProtocolBundle {
+            pool: native.pool.clone(),
+            status: ProtocolStatus {
+                codec: "dynamic",
+                ..native.status.clone()
+            },
+        };
+        let mut inputs = Vec::new();
+        for route in routes {
+            let method = crate::protocol::method(&native.pool, route).unwrap();
+            inputs.push(populated_proto(method.input(), 6, false));
+            let output = perf_widen(populated_proto(method.output(), 6, false));
+            let bytes = DynamicMessage::deserialize(method.output(), output)
+                .unwrap()
+                .encode_to_vec();
+            let decoded = native.decode(route, &bytes).unwrap();
+            assert_eq!(decoded, dynamic.decode(route, &bytes).unwrap(), "{route}");
+            let name = route.rsplit_once('.').map_or(*route, |(_, name)| name);
+            for (codec, bundle) in [("native", &native), ("dynamic", &dynamic)] {
+                perf_measure(
+                    &format!("codec.{family}.{name}.decode.{codec}"),
+                    bytes.len(),
+                    20,
+                    none,
+                    |_| bundle.decode(route, black_box(&bytes)).unwrap(),
+                );
+            }
+            if family == "jp" && *route == EVENT_RANKING {
+                ranking = Some(decoded);
+            }
+        }
+        for (codec, bundle) in [("native", &native), ("dynamic", &dynamic)] {
+            perf_measure(
+                &format!("codec.{family}.encode_all_routes.{codec}"),
+                0,
+                20,
+                || inputs.clone(),
+                |inputs| {
+                    routes
+                        .iter()
+                        .zip(inputs)
+                        .map(|(route, input)| bundle.encode(route, input).unwrap())
+                        .collect::<Vec<_>>()
+                },
+            );
+        }
+    }
+
+    // Memory response cache: put clones and serializes the Value, a hit parses it back.
+    let value = ranking.unwrap();
+    let cache = crate::response_cache::Cache::new(crate::response_cache::Config::Memory {
+        ttl_ms: 60_000,
+        stale_while_revalidate_ms: 0,
+        route_ttl_ms: BTreeMap::new(),
+        max_entries: 1024,
+        max_bytes: 64 << 20,
+        max_entry_bytes: 8 << 20,
+    })
+    .unwrap();
+    let key = "perf:event_ranking".to_owned();
+    let serialized = serde_json::to_vec(&value).unwrap();
+    futures::executor::block_on(cache.put_route(EVENT_RANKING, key.clone(), &value));
+    assert_eq!(
+        futures::executor::block_on(cache.get(&key)).as_ref(),
+        Some(&value)
+    );
+    perf_measure(
+        "cache.put",
+        serialized.len(),
+        20,
+        || key.clone(),
+        |key| futures::executor::block_on(cache.put_route(EVENT_RANKING, key, black_box(&value))),
+    );
+    perf_measure("cache.get_hit", serialized.len(), 20, none, |_| {
+        futures::executor::block_on(cache.get(black_box(&key))).unwrap()
+    });
+    perf_measure("cache.value_to_vec", serialized.len(), 20, none, |_| {
+        serde_json::to_vec(black_box(&value)).unwrap()
+    });
+    perf_measure("cache.from_slice", serialized.len(), 20, none, |_| {
+        serde_json::from_slice::<Value>(black_box(&serialized)).unwrap()
+    });
 }

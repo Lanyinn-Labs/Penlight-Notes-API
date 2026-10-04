@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use serde::Deserialize;
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +36,9 @@ pub struct Config {
     pub tls: Option<crate::server::TlsConfig>,
     #[serde(default)]
     pub access_log: Option<crate::access_log::Config>,
+    /// Opt-in negotiated gzip/zstd for public API JSON; absent or `enabled: false` is identity.
+    #[serde(default)]
+    pub http_compression: Option<crate::http_compression::Config>,
     pub environment: String,
     pub endpoint: String,
     pub client_version: String,
@@ -60,6 +63,10 @@ pub struct Config {
     /// Optional immutable Master JSON snapshot store written by master-import.
     pub master_directory: Option<std::path::PathBuf>,
     pub master_update: Option<MasterUpdateConfig>,
+    /// Optional retention of `master_directory` snapshots along the committed chain, applied
+    /// by this process's writer (`master_update` or `master_sync`). Absent keeps everything.
+    #[serde(default)]
+    pub master_retention: Option<crate::master_registry::Retention>,
     /// Global (HK/EN/KR) resource snapshots built from the VERSION body `resourceVersion` and the
     /// base catalog `.hash` on the configured CDN root. JP snapshots come from `x-asset-version`.
     #[serde(default)]
@@ -81,6 +88,19 @@ pub struct UpstreamConfig {
     /// Total attempts for verified anonymous read RPCs; authenticated reads never replay.
     pub anonymous_attempts: usize,
     pub retry_delay_ms: u64,
+    /// Anonymous calls in flight at once while `session_lock` is true; omitted means
+    /// min(4, `max_inflight`). 1 restores the 1.2.x serialization of anonymous calls.
+    pub anonymous_max_inflight: Option<usize>,
+    /// Also share one execution among identical concurrent ranking reads (one account's result).
+    pub coalesce_public_reads: bool,
+    /// HTTP/2 PING interval while a call is open on a silent connection; omitted means
+    /// min(10000, `timeout_ms` / 2) and 0 disables keepalive (see `http2_keepalive`).
+    pub http2_keepalive_interval_ms: Option<u64>,
+    /// Wait for a PING acknowledgement before closing the connection; omitted means
+    /// min(5000, `timeout_ms` / 4).
+    pub http2_keepalive_timeout_ms: Option<u64>,
+    /// Age after which `x-master-version` is refreshed by a Version call before the next RPC.
+    pub version_max_age_seconds: u64,
 }
 impl Default for UpstreamConfig {
     fn default() -> Self {
@@ -93,6 +113,11 @@ impl Default for UpstreamConfig {
             max_inflight: 64,
             anonymous_attempts: 1,
             retry_delay_ms: 250,
+            anonymous_max_inflight: None,
+            coalesce_public_reads: false,
+            http2_keepalive_interval_ms: None,
+            http2_keepalive_timeout_ms: None,
+            version_max_age_seconds: 600,
         }
     }
 }
@@ -110,12 +135,61 @@ impl UpstreamConfig {
             || !(1..=4096).contains(&self.max_inflight)
             || !(1..=5).contains(&self.anonymous_attempts)
             || !(1..=10_000).contains(&self.retry_delay_ms)
+            || self
+                .anonymous_max_inflight
+                .is_some_and(|n| !(1..=64).contains(&n) || n > self.max_inflight)
+            || (self.http2_keepalive_timeout_ms.is_some()
+                && self.http2_keepalive_interval_ms == Some(0))
+            || self
+                .http2_keepalive_interval_ms
+                .is_some_and(|v| v != 0 && !(1_000..=300_000).contains(&v))
+            || self
+                .http2_keepalive_timeout_ms
+                .is_some_and(|v| !(1_000..=60_000).contains(&v))
+            || self.explicit_keepalive_misses_deadline()
+            || !(60..=86_400).contains(&self.version_max_age_seconds)
         {
             return Err(AppError::Config(
                 "upstream request policy exceeds supported bounds",
             ));
         }
         Ok(())
+    }
+    /// HTTP/2 keepalive (PING interval, acknowledgement timeout) for the game connection pool.
+    /// Derived values sum to at most 3/4 of `timeout_ms`, so a dead connection fails a call
+    /// before its deadline; they stay off below a 1 s acknowledgement (`timeout_ms` < 4000)
+    /// unless a key is set, which keeps 1.2.x tight-deadline configurations unchanged.
+    pub(crate) fn http2_keepalive(&self) -> Option<(Duration, Duration)> {
+        if self.http2_keepalive_interval_ms == Some(0) {
+            return None;
+        }
+        let interval = self
+            .http2_keepalive_interval_ms
+            .unwrap_or((self.timeout_ms / 2).min(10_000));
+        let ack = self
+            .http2_keepalive_timeout_ms
+            .unwrap_or((self.timeout_ms / 4).min(5_000));
+        let explicit =
+            self.http2_keepalive_interval_ms.is_some() || self.http2_keepalive_timeout_ms.is_some();
+        if !explicit && ack < 1_000 {
+            return None;
+        }
+        Some((Duration::from_millis(interval), Duration::from_millis(ack)))
+    }
+    /// Explicit keepalive values must detect a dead connection before the logical deadline.
+    fn explicit_keepalive_misses_deadline(&self) -> bool {
+        let explicit =
+            self.http2_keepalive_interval_ms.is_some() || self.http2_keepalive_timeout_ms.is_some();
+        explicit
+            && self.http2_keepalive().is_some_and(|(interval, ack)| {
+                (interval + ack).as_millis() >= u128::from(self.timeout_ms)
+            })
+    }
+    /// Anonymous call slots used while `session_lock` is true.
+    pub fn anonymous_slots(&self) -> usize {
+        self.anonymous_max_inflight
+            .unwrap_or(4)
+            .min(self.max_inflight)
     }
 }
 
@@ -124,13 +198,16 @@ fn default_session_lock() -> bool {
 }
 
 pub fn default_protocol_directory() -> std::path::PathBuf {
-    "protocol/sirius/1.0.3".into()
+    "protocol/sirius/1.0.4".into()
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MasterUpdateConfig {
-    #[serde(default)]
+    #[serde(
+        default = "crate::master_update::Network::master",
+        deserialize_with = "crate::master_update::Network::deserialize_master"
+    )]
     pub network: crate::master_update::Network,
     /// `basic` (default) sends HTTP Basic with `username_env` and the credential referenced for
     /// the effective CDN root. `none` sends no Authorization header; it is accepted only for
@@ -288,6 +365,18 @@ impl Config {
                     .is_none_or(|p| p.as_os_str().is_empty())
             {
                 return Err(AppError::Config("Master owner synchronization requires an output directory and excludes CDN updating"));
+            }
+        }
+        if let Some(retention) = &self.master_retention {
+            // Without a writer in this process the field would parse yet never apply.
+            if !retention.valid()
+                || self
+                    .master_directory
+                    .as_ref()
+                    .is_none_or(|p| p.as_os_str().is_empty())
+                || (self.master_update.is_none() && self.master_sync.is_none())
+            {
+                return Err(AppError::Config("Master retention requires master_directory, master_update or master_sync, and keep_snapshots 2..10000"));
             }
         }
         crate::accounts::validate(self)?;

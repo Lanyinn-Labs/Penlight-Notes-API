@@ -4,7 +4,7 @@ Objective: retain Haruki's reusable service/platform capabilities, replace all S
 
 Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e131 and Haruki-Sekai-Asset-Updater 3d33ed037f0ef5009e361e0535b3b19f8c239947. Preserve MIT attribution. Existing Sirius release baselines: API 5ab1e390ca514e550cb609ae4d299b19c105b79e, updater e7ffb7b905958de88aa8d5a06327dafcc8acd8ce.
 
-## API requirements (pending unless evidenced in the work log)
+## API requirements
 
 - Multi-region service configuration/routing with per-region protocol family, credentials and isolated state; retain v1.1 single-region config compatibility and reserved CN.
 - Account pool, per-account locking, selection, health/cooldown and credential reload. No speculative retries of account mutations; no fabricated Global login.
@@ -14,7 +14,7 @@ Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e
 - Master registry/manifests, owner/consumer synchronization, notifications, optional generic persistence and Git publication. Do not restore Sekai table models or Ent code.
 - Full documented config surface, examples, migration, meaningful local integration tests including failure/authorization cases.
 
-## Updater requirements (all pending unless specifically evidenced)
+## Updater requirements
 
 - Authenticated long-running HTTP service, region configs, job submission/list/detail/cancel/retry, bounded queue/concurrency, progress, retention and safe shutdown/restart.
 - Invoke Sirius catalog/download/verify/export pipeline from the service, not a stub or arbitrary shell executor; retain CLI support.
@@ -26,7 +26,10 @@ Reference baseline: local Haruki-Sekai-API 07da6b80e6a59ece89251f4694afe94bea72e
 - Update trigger/scheduling, completion notification and generic publication integration where applicable. Sekai chart-hash/character-ID/3D model adapters are removed, not copied.
 - End-to-end tests cover queue saturation, cancellation, restart, per-region serialization, incremental behavior, upload failure safety and secrets.
 
-## Release gates (all pending)
+## Release gates
+
+The requirement lists above were the plan written before work started; the status of each item is
+recorded in the ledger below (all were completed for 1.2.0; later releases are in CHANGELOG.md).
 
 - Audit each feature against original code/config; no placeholders or silent ignored config fields; record any game-specific non-applicability with evidence. API configuration: [CONFIG_AUDIT.md](CONFIG_AUDIT.md).
 - Both repositories fmt/check/Clippy/tests and release packaging smoke pass.
@@ -222,14 +225,14 @@ live game system query, and served as the game API for the paired updater's full
 incremental end-to-end runs. Published archives were re-downloaded, checksum-verified and
 startup-tested. Global remains limited to verified discovery/version capabilities; CN is reserved.
 
-Post-1.2.0 (1.2.1, unreleased): Master Git `indented_root` layout and configurable branch for
+Post-1.2.0 (1.2.1): Master Git `indented_root` layout and configurable branch for
 public per-region Master repositories; asset-version provenance recorded with installations,
 exposed in manifests outside content identity and carried by owner-to-consumer sync. Native
 layout output is unchanged. Covered by real-Git tests (tree listing, byte-exact indentation,
 token-preservation property, dedup, table removal, missing provenance, branch/remote), updater
 and sync provenance tests; Linux and Windows CI.
 
-Post-1.2.0 (1.2.1, unreleased): Master data for TW/EN/KR (CN still reserved). The Global Master
+Post-1.2.0 (1.2.1): Master data for TW/EN/KR (CN still reserved). The Global Master
 CDN layout, encryption and unauthenticated access were verified live on 2026-09-26 with the
 user's approval. The JP-only gates in configuration, updater, registry, sync, notification,
 standalone registry, Git and database workers were lifted for Global. Anonymous CDN access is an
@@ -242,14 +245,14 @@ remote), same-region sync, cross-region rejection, notifications, CDN-authorizat
 region-recording imports and legacy receipts, and a four-region `master_update` + `master_git`
 publisher deployment. Linux and Windows CI.
 
-Post-1.2.0 (1.2.1, unreleased): the Traditional Chinese region identifier is renamed from `tw` to
+Post-1.2.0 (1.2.1): the Traditional Chinese region identifier is renamed from `tw` to
 `hk`, the name the game uses (CDN `/prod/hk_…`, `l12-prod-hk-…` endpoints, server list). The
 ledger entries above keep the wording of their time. `tw` survives only as a deprecated
 configuration/CLI alias with a startup warning; snapshot receipts and Git state recorded as `tw`
 are read as `hk`, and nothing writes or serves `tw`. See
 [the `hk` identifier](REGIONS.md#the-hk-identifier).
 
-Post-1.2.0 (1.2.1, unreleased): Global resource snapshots (schema 3) from the VERSION body
+Post-1.2.0 (1.2.1): Global resource snapshots (schema 3) from the VERSION body
 `resourceVersion` plus the base catalog `.hash`. The Global asset CDN layout
 (`{CdnRoot}/asset/Android/catalog_{rv}[_{locale}].bin|.hash`, bundles in `{CdnRoot}/asset/Android`)
 and its unauthenticated access were verified live on 2026-09-26 with the user's approval; tests
@@ -258,7 +261,7 @@ use only local mocks. The tests cover snapshot creation for each Global region, 
 missing and redirected `.hash` responses, refusal of server-announced roots, Basic credential
 scope, configuration validation, and JP schema-2 stability. JP snapshots are unchanged.
 
-Post-1.2.0 (1.2.1, unreleased): Global (HK/EN/KR) player accounts and the JP operations on Global.
+Post-1.2.0 (1.2.1): Global (HK/EN/KR) player accounts and the JP operations on Global.
 SDK guest `tourist.login`/`cache.login`, PlayerLogin (area 6, channel 2001, brand 5, platform
 omitted) and GetPlayerData with `x-player-bid`/`x-player-id`/`x-player-credential`/
 `x-master-version`/`x-resource-version` were verified live on all three servers on 2026-09-26 with

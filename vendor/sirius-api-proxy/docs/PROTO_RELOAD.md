@@ -17,13 +17,30 @@ load executable code. Transport remains binary Protobuf over HTTP/2 gRPC in both
 Unknown enum numbers can require a dynamic JSON fallback within a native generation because
 pbjson cannot represent them. The fallback uses the same pinned schema and validates the
 input; binary decode errors still fail. `codec: native` describes the preferred path, not a
-promise that every input avoids reflection. Performance differences have not been benchmarked.
+promise that every input avoids reflection.
+
+### Measuring codec cost
+
+The ignored `perf_stages` test (`src/tests.rs`) decodes the same payload for every exposed
+JP and Global route with the native bundle and with a dynamic twin of the same pool, after
+checking that both produce equal JSON. Top-level lists are widened to 100 entries, so rankings
+and announcements carry realistic list lengths. It also times encoding, Master import stages,
+Master and registry reads and memory response-cache serialization. It prints min, median and p90
+per stage and never asserts timings:
+
+```sh
+cargo test --release --locked perf_stages -- --ignored --nocapture --test-threads=1
+```
+
+Use a release build; a debug build prints a warning and its numbers are not representative.
+The first release build is slow (thin LTO, one codegen unit). Numbers depend on the host and
+are not recorded in the repository.
 
 ## Bundle layout
 
 ```text
-protocol/sirius/1.0.3/
-  bundle.json                 # {"version":"1.0.3"}
+protocol/sirius/1.0.4/
+  bundle.json                 # {"version":"1.0.4"}
   proto/
     app/...
     entity/...
@@ -71,8 +88,9 @@ are rejected. Additional services do not automatically become HTTP routes.
 This is conservative compatibility validation, not a general protocol migration engine.
 A schema that added fields cannot hot-reload backward to a schema missing those fields;
 stop the service and deploy the validated old executable/bundle pair for that rollback.
-Activation invalidates Master version observations and marks old resource snapshots stale.
-The next account query bootstraps Version again. A new protocol label must be supported and
+Activation invalidates Master version observations, including their freshness and a pending
+mismatch, and marks old resource snapshots stale. The next account query bootstraps Version
+again. A new protocol label must be supported and
 independently validated by the asset updater; editing a label alone does not add game support.
 
 Tests compare the independent descriptor baseline with all source/native RPCs, including

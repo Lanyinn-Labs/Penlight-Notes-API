@@ -3,13 +3,14 @@
 HTTP routes → allowlisted RPCs → active native/dynamic codec → HTTP/2 unary gRPC.
 Each configured region owns its environment, protocol bundle, bounded account pool and state.
 Single-region deployments preserve the original routes; multi-region deployments add region prefixes.
-Authenticated queries first establish the Master version; anonymous RPCs omit account credentials.
+Authenticated queries first establish the Master version, which is refreshed by age and on a mismatch signal; anonymous RPCs omit account credentials.
 
 - `src/api.rs`: public queries and internal state/account routes.
 - `src/peer.rs`: separately authorized, local-only node query contract.
 - `src/node_routing.rs`, `src/peer_transport.rs`: public query priorities, passive health and bounded peer calls.
 - `src/deployment.rs`, `src/accounts.rs`: region assembly, account selection and credential reload.
 - `src/response_cache.rs`: bounded memory/Redis cache with opt-in stale refresh.
+- `src/single_flight.rs`: in-process shared execution of identical in-flight reads.
 - `src/asset_dispatch.rs`, `src/asset_outbox.rs`: durable updater dispatch and recovery.
 - `build.rs`, `src/native.rs`: generated Protobuf/JSON codecs and static RPC dispatch.
 - `src/proto_source.rs`: shared source snapshot compiler and semantic fingerprint.

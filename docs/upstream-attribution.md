@@ -6,8 +6,8 @@ Penlight-Notes-API 的在线游戏通信实现复用 [Srirus-Project/sirius-api-
 
 上游源文件位于 `vendor/sirius-api-proxy/`，作为本地 Cargo 库依赖编译进同一个进程。官方 HTTP/2 gRPC、Protobuf 编解码、现有账号凭据、账号池与锁、上游响应缓存、节点查询路由、Master 解密和快照校验来自上游。Penlight 自己的资源整理、日文文本解析、账号数据拆分和榜线缓存位于根目录 `src/`。
 
-- 上游版本：1.2.1。
-- 来源提交：`c2df04b7979cadc89fd25fa120cb8c406aa4ef86`。
+- 上游版本：1.3.3。
+- 来源提交：`cd19e2fe1d7f6c9a69304e6718e95fbc61817561`。
 - `vendor/sirius-api-proxy/UPSTREAM.json` 记录来源及所复用文件的 SHA-256。
 - `vendor/sirius-api-proxy/LICENSE` 保留 Haruki Dev Team 和 Sirius Project 的 MIT 版权与完整许可。
 - `vendor/sirius-api-proxy/LICENSE-protobuf` 保留 Google Protobuf 的许可证。

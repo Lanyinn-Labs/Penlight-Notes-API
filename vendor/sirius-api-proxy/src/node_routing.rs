@@ -4,7 +4,7 @@ use crate::{
     config::secret,
     error::AppError,
     peer::{self, Failure, Operation, Outcome},
-    peer_transport,
+    peer_transport, routes,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -108,6 +108,7 @@ impl Config {
         Ok(())
     }
 }
+#[derive(Clone)]
 pub struct Execution {
     pub result: Result<Value, AppError>,
     pub observation: Observation,
@@ -136,6 +137,14 @@ struct Permit<'a> {
     target: &'a Target,
     probe: bool,
 }
+/// A health change worth an operator log line; logged after the health lock is released.
+#[derive(Debug, PartialEq, Eq)]
+enum Transition {
+    None,
+    CooldownStarted,
+    ProbeFailed,
+    Recovered,
+}
 impl Target {
     fn admit(&self) -> Option<Permit<'_>> {
         let mut health = self.health.lock().ok()?;
@@ -152,18 +161,87 @@ impl Target {
     }
 }
 impl Permit<'_> {
-    fn finish(&self, failed: bool, config: &Config) {
-        if let Ok(mut health) = self.target.health.lock() {
-            if failed {
-                health.failures = health.failures.saturating_add(1);
-                if health.failures >= config.failure_threshold {
-                    health.open_until =
-                        Some(Instant::now() + Duration::from_millis(config.cooldown_ms));
-                }
-            } else {
-                health.failures = 0;
-                health.open_until = None;
+    fn finish(&self, failed: bool, config: &Config) -> Transition {
+        let Ok(mut health) = self.target.health.lock() else {
+            return Transition::None;
+        };
+        if failed {
+            health.failures = health.failures.saturating_add(1);
+            if health.failures >= config.failure_threshold {
+                let cooling = health.open_until.is_some();
+                health.open_until =
+                    Some(Instant::now() + Duration::from_millis(config.cooldown_ms));
+                return match (self.probe, cooling) {
+                    (true, _) => Transition::ProbeFailed,
+                    (false, false) => Transition::CooldownStarted,
+                    (false, true) => Transition::None,
+                };
             }
+            Transition::None
+        } else {
+            health.failures = 0;
+            if health.open_until.take().is_some() {
+                Transition::Recovered
+            } else {
+                Transition::None
+            }
+        }
+    }
+}
+/// Drives one target's health through `outcomes` (true = target fault), expiring any cooldown
+/// before each call so it is admitted as a probe, and returns the transitions.
+#[cfg(test)]
+pub(crate) fn test_transitions(config: &Config, outcomes: &[bool]) -> Vec<String> {
+    let target = Target {
+        name: "t".into(),
+        priority: 0,
+        remote: None,
+        health: Default::default(),
+    };
+    outcomes
+        .iter()
+        .map(|failed| {
+            if let Some(until) = target.health.lock().unwrap().open_until.as_mut() {
+                *until = Instant::now();
+            }
+            let permit = target.admit().expect("admitted");
+            format!("{:?}", permit.finish(*failed, config))
+        })
+        .collect()
+}
+/// `status` is the peer's HTTP status when it answered one (a bare number, never a body).
+fn log_transition(
+    node: &str,
+    transition: Transition,
+    error: Option<&AppError>,
+    status: Option<u16>,
+    config: &Config,
+) {
+    let error_code = error.map(AppError::code);
+    match transition {
+        Transition::None => {}
+        Transition::CooldownStarted => tracing::warn!(
+            event = "node_cooldown_started",
+            node,
+            error_code,
+            status,
+            cooldown_ms = config.cooldown_ms,
+            "Node reached the failure threshold; cooling down"
+        ),
+        Transition::ProbeFailed => tracing::warn!(
+            event = "node_probe_failed",
+            node,
+            error_code,
+            status,
+            cooldown_ms = config.cooldown_ms,
+            "Node probe failed; cooldown extended"
+        ),
+        Transition::Recovered => {
+            tracing::info!(
+                event = "node_recovered",
+                node,
+                "Node recovered after cooldown"
+            )
         }
     }
 }
@@ -180,6 +258,7 @@ pub struct Router {
     config: Config,
     targets: Vec<Target>,
     inflight: tokio::sync::Semaphore,
+    flights: crate::single_flight::SingleFlight<Execution>,
 }
 impl Router {
     pub fn new(config: Config, region: crate::region::Region) -> Result<Self, AppError> {
@@ -212,11 +291,17 @@ impl Router {
         }
         // Stable sort keeps local first on ties, followed by configured remote order.
         targets.sort_by_key(|target| target.priority);
+        tracing::info!(
+            event = "node_router_ready",
+            total = targets.len() as u64,
+            "Node routing enabled"
+        );
         let inflight = tokio::sync::Semaphore::new(config.max_inflight);
         Ok(Self {
             config,
             targets,
             inflight,
+            flights: crate::single_flight::SingleFlight::new(),
         })
     }
     pub fn status(&self) -> Value {
@@ -238,12 +323,57 @@ impl Router {
             Ok(v) => v,
             Err(e) => return Execution::error(e),
         };
+        let deadline = Instant::now() + Duration::from_millis(self.config.timeout_ms);
+        if !client.coalesces(route) {
+            return self
+                .call_inner(client, operation, route, input, identity, deadline)
+                .await;
+        }
+        // Identical public reads share one routed execution (one admission, one peer POST)
+        // before any target is chosen. The request ID is per execution and not part of the key.
+        let key = match flight_key(client, &identity, &operation) {
+            Ok(v) => v,
+            Err(e) => return Execution::error(e),
+        };
+        self.flights
+            .run(
+                key,
+                deadline,
+                Execution::error(AppError::Timeout),
+                || async {
+                    let mut execution = self
+                        .call_inner(client, operation, route, input, identity, deadline)
+                        .await;
+                    if matches!(route, routes::MUSIC_RANKING | routes::CHALLENGE_RANKING) {
+                        if let Some(object) = execution
+                            .result
+                            .as_mut()
+                            .ok()
+                            .and_then(Value::as_object_mut)
+                        {
+                            object.remove("myRank");
+                            object.remove("myScore");
+                        }
+                    }
+                    execution
+                },
+            )
+            .await
+    }
+    async fn call_inner(
+        &self,
+        client: &Arc<GameClient>,
+        operation: Operation,
+        route: &'static str,
+        input: Value,
+        identity: peer::Identity,
+        deadline: Instant,
+    ) -> Execution {
         let request = peer::Request {
             request_id: uuid::Uuid::new_v4().to_string(),
             identity,
             operation,
         };
-        let deadline = Instant::now() + Duration::from_millis(self.config.timeout_ms);
         let _admission = match tokio::time::timeout_at(deadline, self.inflight.acquire()).await {
             Ok(Ok(v)) => v,
             _ => return Execution::error(AppError::Timeout),
@@ -256,6 +386,7 @@ impl Router {
             let Some(permit) = target.admit() else {
                 continue;
             };
+            let mut status = None;
             let (execution, definitely_not_executed) = if let Some(remote) = &target.remote {
                 match remote.call(&request, deadline).await {
                     Ok(reply) => {
@@ -267,9 +398,10 @@ impl Router {
                                     | Failure::UnavailableBeforeDispatch {}
                             }
                         );
+                        let maintenance = reply.observation.maintenance;
                         let result = match reply.outcome {
                             Outcome::Success { data } => Ok(data),
-                            Outcome::Failure { kind } => Err(failure_error(kind)),
+                            Outcome::Failure { kind } => Err(failure_error(kind, maintenance)),
                         };
                         (
                             Execution {
@@ -280,7 +412,10 @@ impl Router {
                         )
                     }
                     Err(error) => {
-                        let safe = error.definitely_not_sent();
+                        let safe = error.definitely_not_sent() || error.rejected_before_dispatch();
+                        if let peer_transport::Error::Status(code) = &error {
+                            status = Some(*code);
+                        }
                         let error = match error {
                             peer_transport::Error::Timeout | peer_transport::Error::NotSent => {
                                 AppError::Timeout
@@ -323,16 +458,57 @@ impl Router {
                     | AppError::AccountUnavailable
                     | AppError::UnsupportedRegionOperation)
             );
-            permit.finish(target_fault, &self.config);
-            if !target_fault || (!definitely_not_executed && crate::client::authenticated(route)) {
+            let transition = permit.finish(target_fault, &self.config);
+            log_transition(
+                &target.name,
+                transition,
+                execution.result.as_ref().err(),
+                status,
+                &self.config,
+            );
+            // Authenticated reads fail over only when the attempt provably did not execute: a
+            // connection-level not-sent error, a typed pre-dispatch outcome, or a peer HTTP
+            // status the executor answers only before dispatch (`PRE_DISPATCH_STATUSES`).
+            let stop = !definitely_not_executed && crate::client::authenticated(route);
+            if target_fault {
+                tracing::debug!(
+                    event = "node_target_failed",
+                    node = target.name.as_str(),
+                    error_code = execution.result.as_ref().err().map(AppError::code),
+                    status,
+                    failover = !stop,
+                    "Node call failed"
+                );
+            }
+            if !target_fault || stop {
                 return execution;
             }
             last = execution;
         }
+        if let Err(error) = &last.result {
+            tracing::warn!(
+                event = "node_unavailable",
+                error_code = error.code(),
+                "No node completed the call"
+            );
+        }
         last
     }
 }
-fn failure_error(failure: Failure) -> AppError {
+/// Identity of a shared routed execution: the caller identity (including the protocol hash),
+/// the protocol generation and the operation.
+fn flight_key(
+    client: &GameClient,
+    identity: &peer::Identity,
+    operation: &Operation,
+) -> Result<[u8; 32], AppError> {
+    use sha2::{Digest, Sha256};
+    let scope = json!({"schema":1,"identity":identity,
+        "protocol_generation":client.protocol_status()?.generation,"operation":operation});
+    let bytes = serde_json::to_vec(&scope).map_err(|_| AppError::Protocol)?;
+    Ok(Sha256::digest(bytes).into())
+}
+pub(crate) fn failure_error(failure: Failure, maintenance: bool) -> AppError {
     match failure {
         Failure::IdentityMismatch {} => AppError::PeerIdentityMismatch,
         Failure::UnsupportedOperation {} => AppError::UnsupportedRegionOperation,
@@ -341,6 +517,8 @@ fn failure_error(failure: Failure) -> AppError {
         Failure::Timeout {} => AppError::Timeout,
         Failure::Transport {} => AppError::Transport,
         Failure::Protocol {} => AppError::Protocol,
+        Failure::Game { grpc_status } if maintenance => AppError::Maintenance(grpc_status),
         Failure::Game { grpc_status } => AppError::Grpc(grpc_status),
+        Failure::NotFound {} => AppError::NotFound,
     }
 }

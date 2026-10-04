@@ -77,6 +77,8 @@ status 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数
 | `/items` | items |
 | `/stamps` | stamps |
 | `/characters` | characterRank |
+| `/character-costumes` | characterCurrentCostumes，日服 1.0.4 当前服装 |
+| `/unlocked-costumes` | characterUnlockedCostumes，日服 1.0.4 已解锁服装 |
 | `/music-scores` | liveScore |
 | `/music` | liveMusic |
 | `/missions` | playerMissionData |
@@ -138,6 +140,7 @@ master-schema 始终是构建时提取的 APK 结构，不等于线上最新结�
 | 503 | master_data_unavailable | 快照缺失、损坏或来源不符 |
 | 503 | upstream_authentication_unavailable | 游戏账号会话不可用 |
 | 503 | upstream_rate_limited | 官方限流 |
+| 503 | upstream_maintenance | 官方维护，不惩罚账号、不重试该请求 |
 | 503 | upstream_unavailable | 官方服务不可用 |
 | 502 | upstream_invalid_response | 返回数据不符合预期 |
 | 502 | upstream_game_error | 官方 gRPC 业务错误，message 包含状态码 |
