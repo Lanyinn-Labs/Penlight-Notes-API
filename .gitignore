@@ -23,3 +23,6 @@ __pycache__/
 
 # Generated release archives
 /dist/
+
+# Local credential extraction procedure
+/docs/android-save-extraction.local.md
