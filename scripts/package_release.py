@@ -11,7 +11,7 @@ import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLIC_FILES = ['README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', '.env.example',
+PUBLIC_FILES = ['README.md', 'CONTRIBUTING.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', '.env.example',
                 'data/jp-client.json', 'vendor/sirius-api-proxy/LICENSE',
                 'vendor/sirius-api-proxy/LICENSE-protobuf', 'vendor/sirius-api-proxy/UPSTREAM.json']
 PUBLIC_TREES = ['docs', 'vendor/sirius-api-proxy/protocol', 'vendor/sirius-api-proxy/docs']

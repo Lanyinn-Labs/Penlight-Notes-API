@@ -45,6 +45,7 @@ docker compose up -d --pull always
 
 ## 文档
 
+- [开发与提交规范](CONTRIBUTING.md)
 - [API 参考](docs/api.md)
 - [配置参考](docs/configuration.md)
 - [账号配置](docs/account-setup.md)

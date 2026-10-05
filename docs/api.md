@@ -11,7 +11,7 @@
 | GET 路径 | 说明 |
 | --- | --- |
 | `/health` | 进程状态、上游最近通信及 Master 更新状态 |
-| `/version` | 服务版本、stage: online、协议来源及固定提交 |
+| `/version` | 服务版本、upstream_version、运行协议 protocol_version、stage: online、协议来源及固定提交 |
 | `/servers` | 各区服启用状态、版本、协议是否配置及可用状态 |
 
 这些接口无需认证，不执行网络探测，也不占用接口限流额度。`/health` 的 `status: ok` 表示 HTTP 服务运行，`upstream` 包含最近实际通信的 `last_observed_at`、`age_ms`、`grpc_status` 和 `maintenance`。状态为 disabled（未启用）、unknown（尚无记录）、available、unavailable 或 stale（超过 `PENLIGHT_STATUS_TTL_SECONDS`，默认 300 秒）。记录来自底层客户端，包括普通查询和后台 Master 版本检查；缓存命中、本地 Master 读取不刷新时间。`upstream_ready` 保留为兼容字段，仅在 available 时为 true。它不代表所有账号、接口均可用。

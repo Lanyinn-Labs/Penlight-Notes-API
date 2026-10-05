@@ -1,0 +1,9 @@
+# <type>(<scope>): <short imperative summary>
+# Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+# Scope is optional. Keep the title within 72 characters, without a final period.
+#
+# Explain the concrete problem, resulting behavior and relevant tradeoffs.
+#
+# Validation: describe checks actually completed and remaining limitations.
+#
+# For incompatible API changes, add BREAKING CHANGE: with migration instructions.

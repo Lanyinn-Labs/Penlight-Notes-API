@@ -9,7 +9,7 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
-use super::{handlers, ApiState, SharedState};
+use super::{events, handlers, ApiState, SharedState};
 use crate::{
     client::sirius::{SiriusClient, SiriusRankingSource},
     config::Config,
@@ -62,10 +62,10 @@ fn assemble(
     });
     let mut api = Router::new()
         .route("/{region}/application", get(handlers::application))
-        .route("/{region}/events/current", get(handlers::current_event))
+        .route("/{region}/events/current", get(events::current_event))
         .route(
             "/{region}/events/current/cutoffs",
-            get(handlers::current_event_cutoffs),
+            get(events::current_event_cutoffs),
         )
         .route("/{region}/announcements", get(handlers::announcements))
         .route("/{region}/announcements/{id}", get(handlers::announcement))
@@ -75,11 +75,11 @@ fn assemble(
         )
         .route(
             "/{region}/events/{event_id}/rankings",
-            get(handlers::event_rankings),
+            get(events::event_rankings),
         )
         .route(
             "/{region}/events/{event_id}/players/{player_id}/deck",
-            get(handlers::event_deck),
+            get(events::event_deck),
         )
         .route(
             "/{region}/music/{id}/rankings",
@@ -93,7 +93,7 @@ fn assemble(
         .route("/{region}/user/data", get(handlers::user_data))
         .route(
             "/{region}/events/{event_id}/cutoffs",
-            get(handlers::event_cutoffs),
+            get(events::event_cutoffs),
         )
         .route("/{region}/master-schema", get(handlers::master_schema_list))
         .route("/{region}/master-data", get(handlers::master_data))

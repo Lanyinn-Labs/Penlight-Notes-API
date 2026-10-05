@@ -7,3 +7,4 @@ pub mod events;
 pub mod offline_master;
 pub mod ranking;
 pub mod region;
+pub mod upstream;

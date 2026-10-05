@@ -90,6 +90,14 @@ async fn embedded_protocol_initializes_without_a_proxy_listener() {
             .await["status"],
         "unknown"
     );
+    let mut config = Config::default();
+    config.regions[1].sirius = Some(settings());
+    let (_, version) = get(api::build(Arc::new(config)), "/version").await;
+    let provenance: Value =
+        serde_json::from_str(include_str!("../vendor/sirius-api-proxy/UPSTREAM.json")).unwrap();
+    assert_eq!(version["upstream_version"], provenance["version"]);
+    assert_eq!(version["protocol_revision"], provenance["revision"]);
+    assert_eq!(version["protocol_version"], "1.0.4");
     let mut wrong = settings();
     wrong.region = sirius_api_proxy::region::Region::En;
     assert!(SiriusClient::new(wrong).is_err());
@@ -456,4 +464,39 @@ async fn disabled_event_rankings_never_fetch_or_fabricate_points() {
     );
     assert_eq!(get(router.clone(), "/api/jp/events/current").await.0, 404);
     assert_eq!(get(router, "/api/jp/events/current/cutoffs").await.0, 404);
+}
+
+#[tokio::test]
+async fn current_event_metadata_works_with_an_offline_snapshot() {
+    let directory = Directory::new();
+    let schema: Value =
+        serde_json::from_str(include_str!("../data/master-schema-jp.json")).unwrap();
+    fs::write(
+        directory.0.join("summary.json"),
+        serde_json::to_vec(&json!({
+        "source_asset_pack_apk_sha256":schema["apk_sha256"],
+        "source_base_apk_sha256":schema["base_apk_sha256"]}))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.0.join("MasterEvent.json"),
+        serde_json::to_vec(&json!({"_allData":[event_record(false)]})).unwrap(),
+    )
+    .unwrap();
+    let mut config = Config::default();
+    config.regions[1].master_dir = Some(directory.0.clone());
+    let router = api::build(Arc::new(config.clone()));
+    let (status, event) = get(router.clone(), "/api/jp/events/current").await;
+    assert_eq!(status, 200);
+    assert_eq!(event["event"]["id"], 1);
+    assert_eq!(event["source"], "apk_master_snapshot");
+    assert_eq!(get(router, "/api/jp/events/current/cutoffs").await.0, 501);
+    config.regions[1].enabled = false;
+    assert_eq!(
+        get(api::build(Arc::new(config)), "/api/jp/events/current")
+            .await
+            .0,
+        503
+    );
 }
