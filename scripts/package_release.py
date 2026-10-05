@@ -11,10 +11,12 @@ import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-PUBLIC_FILES = ['README.md', 'CONTRIBUTING.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', '.env.example',
+PUBLIC_FILES = ['README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', '.env.example',
+                'docs/account-setup.md', 'docs/api.md', 'docs/configuration.md', 'docs/downloads.md',
+                'docs/updates.md', 'docs/upstream-attribution.md',
                 'data/jp-client.json', 'vendor/sirius-api-proxy/LICENSE',
                 'vendor/sirius-api-proxy/LICENSE-protobuf', 'vendor/sirius-api-proxy/UPSTREAM.json']
-PUBLIC_TREES = ['docs', 'vendor/sirius-api-proxy/protocol', 'vendor/sirius-api-proxy/docs']
+PUBLIC_TREES = ['vendor/sirius-api-proxy/protocol', 'vendor/sirius-api-proxy/docs']
 TOOLS = ['check_android_version.py', 'import_jp_master.py', 'inspect_jp_local_save.py', 'decrypt_master.py',
          'decrypt_master_split_apk.py', 'README.md']
 

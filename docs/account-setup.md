@@ -34,6 +34,5 @@ uv run --no-project --with py3rijndael python scripts/inspect_jp_local_save.py \
 - 服务启动后通过 Sirius 原始客户端读取凭据并请求官方服务，运行时不需要手机连接或 MITM。
 - 修改账号配置或凭据文件后重启服务。
 - `/user/*` 返回部署者的账号信息；必须设置 API Key。
-- 当前已验证应用状态、账号数据、公告、公开资料及歌曲排名。没有活动时，缺失的榜线分数为 null。
 
 配置及接口说明见 [配置参考](configuration.md)、[API 文档](api.md)。

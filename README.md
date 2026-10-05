@@ -9,7 +9,7 @@
 - 歌曲排行、活动排行、当前活动与默认/自定义档位的活动档线缓存
 - Master 快照查询、资源列表与详情、日文名称解析
 
-日服在线接口已接入；国际服目前提供离线 Master 查询。当前活动及档线接口识别官方排名开关；2026-10-05 活动 ID 1 总分排名关闭，歌曲排名已实服验证。
+日服在线接口已接入；国际服目前提供离线 Master 查询。当前活动及档线接口识别官方排名开关。
 
 ## 快速开始
 
@@ -45,12 +45,11 @@ docker compose up -d --pull always
 
 ## 文档
 
-- [开发与提交规范](CONTRIBUTING.md)
 - [API 参考](docs/api.md)
 - [配置参考](docs/configuration.md)
 - [账号配置](docs/account-setup.md)
 - [自动更新](docs/updates.md)
-- [构建与发布](docs/releases.md)
+- [下载包使用](docs/downloads.md)
 - [维护工具](scripts/README.md)
 
 ## 许可证

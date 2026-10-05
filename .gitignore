@@ -24,5 +24,9 @@ __pycache__/
 # Generated release archives
 /dist/
 
-# Local credential extraction procedure
-/docs/android-save-extraction.local.md
+# Local development and release guidance
+/CONTRIBUTING.md
+/.gitmessage
+/docs/releases.md
+/docs/roadmap.md
+/docs/*.local.md

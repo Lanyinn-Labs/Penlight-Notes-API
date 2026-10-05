@@ -9,7 +9,6 @@
 | `docker-entrypoint.sh` | Docker 启动时下载、校验并原子替换客户端配置；失败保留缓存 |
 | `smoke_container.py` | 关闭容器网络后验证镜像启动及认证 |
 | `check_project.py` | 与 CI 共用的来源、格式、编译、Clippy 和回归检查；支持 --offline |
-| `check_commit_messages.py` | 检查提交标题格式、长度及正文分隔；支持文件或 Git 范围 |
 | `check_upstream.py` | 离线校验原始 Sirius 文件摘要及许可证；CI 使用 |
 | `import_jp_master.py` | 从已验证的日服元数据读取常量，调用进程内 Master 导入器 |
 | `inspect_jp_local_save.py` | 从自有日服存档副本恢复现有账号凭据 |
@@ -19,5 +18,3 @@
 发布工具需要 Python 3.11 或更高版本，不依赖第三方 Python 包。账号和 Master 工具需要 `py3rijndael`，可用 `uv run --no-project --with py3rijndael python scripts/<script>.py --help` 查看参数。Python 至少使用 3.10。
 
 导出工具通过元数据偏移和 SHA-256 指纹校验客户端常量；已验证的在线客户端版本、CDN 认证和 Master key/IV 集中在 `data/jp-client.json`，由程序启动时读取，Docker 启动时拉取并缓存最新版本。部署者的账号、API Key 等个人认证不进入该文件。解密产物默认留在忽略的 `artifacts/`；这些脚本针对已经验证的具体构建，不自动适配新版本。
-
-Frida 探针、协议探索和报告生成工具已移出发布目录。正式服务通过 Sirius 客户端完成通信。

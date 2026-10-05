@@ -13,11 +13,7 @@ Penlight-Notes-API 的在线游戏通信实现复用 [Srirus-Project/sirius-api-
 - `vendor/sirius-api-proxy/LICENSE-protobuf` 保留 Google Protobuf 的许可证。
 - 上游原始源码未作修改；集成逻辑在 `src/client/sirius.rs`。
 
-项目没有 fork、Issue、PR 或评论操作。文档仅使用普通仓库链接，不 @提及作者。
-
 ## 更新与分发
-
-更新上游时，选择明确的版本或提交，替换对应文件，更新来源记录和文件摘要，再验证编译、认证和数据接口。不要将本地凭据、客户端文件或私密配置混入 vendor 目录。
 
 分发源码、二进制或容器时一并附带上述许可证和来源声明。Dockerfile 已将许可和归属文档复制到最终镜像的 `/usr/share/doc/penlight-notes-api/`。
 
