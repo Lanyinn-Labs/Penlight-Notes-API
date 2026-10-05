@@ -219,6 +219,25 @@ pub async fn user_data(
         .map(Json)
 }
 
+pub async fn user_export(
+    State(state): State<SharedState>,
+    Path(region): Path<String>,
+) -> Result<(axum::http::HeaderMap, Json<Value>), AppError> {
+    let data = private_online(&state, Region::parse(&region)?)?
+        .account_data_shared()
+        .await?;
+    let snapshot = crate::account_export::snapshot(
+        &data,
+        &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )?;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    Ok((headers, Json(snapshot)))
+}
+
 pub const USER_RESOURCES: &[(&str, &str)] = &[
     ("profile", "myProfile"),
     ("decks", "decks"),

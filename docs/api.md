@@ -107,6 +107,7 @@ ID 必须为正整数。活动 rankings 必须指定 ranks；cutoffs 可省略 r
 | --- | --- |
 | `/account` | Whoami 验证，仅返回 data.authenticated，不返回认证凭据 |
 | `/data` | 完整 GetPlayerData 响应，缓存 15 秒 |
+| `/export` | `ournotes-account@1` 账号导出，供离线计算器导入 |
 | `/profile` | myProfile |
 | `/decks` | decks |
 | `/cards` | memberCards |
@@ -125,6 +126,20 @@ ID 必须为正整数。活动 rankings 必须指定 ranks；cutoffs 可省略 r
 | `/tutorial` | tutorialProgress |
 
 拆分接口将对应字段放入通用响应的 data；缺失的重复字段返回 []，缺失的 profile、missions、tutorial 对象返回 null。仅提供读取操作。
+
+### 离线组队计算器导出
+
+`GET /api/jp/user/export` 返回独立的 `ournotes-account@1` JSON，不使用通用 data 封装。需 API Key 认证，响应为 `Cache-Control: private, no-store`；账号数据复用 15 秒缓存，`exported_at` 表示生成导出文件的时间。
+
+导出包含公开 profile ID、昵称、持有成员卡及 Snapshot 的经验/Rank/觉醒/技能等级、角色经验、乐队道具等级、VIP 点数及保存编队。编队槽位使用 0–4 的 `index` 和 `trigger_index`，空卡位统一为 ID 0（游戏中的 -1 空位会转换为 0）。仅按明确字段生成，不包含账号 credential、内部 player ID、绑定账号或货币/背包记录。此文件仍包含个人卡池与编队，建议保留在本地。
+
+```bash
+# API Key 从 PENLIGHT_API_KEY 环境变量读取
+python scripts/export_account.py --api-url http://127.0.0.1:8081 \
+  --output /path/to/ournotes-deck-calculator/imports/account.json
+```
+
+导出文件通过临时文件原子替换，Unix 文件权限为 `0600`。`ournotes-deck-calculator` 的 `compile_from_master.py --account` 使用匹配的 Master 和谱面，将经验解析为等级，按实际持有卡和养成生成计算输入；账号 JSON 本身不包含谱面或 Master 表。
 
 ## Master 查询
 

@@ -91,6 +91,7 @@ fn assemble(
         )
         .route("/{region}/user/account", get(handlers::account))
         .route("/{region}/user/data", get(handlers::user_data))
+        .route("/{region}/user/export", get(handlers::user_export))
         .route(
             "/{region}/events/{event_id}/cutoffs",
             get(events::event_cutoffs),

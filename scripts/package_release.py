@@ -17,7 +17,7 @@ PUBLIC_FILES = ['README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md'
                 'data/jp-client.json', 'vendor/sirius-api-proxy/LICENSE',
                 'vendor/sirius-api-proxy/LICENSE-protobuf', 'vendor/sirius-api-proxy/UPSTREAM.json']
 PUBLIC_TREES = ['vendor/sirius-api-proxy/protocol', 'vendor/sirius-api-proxy/docs']
-TOOLS = ['check_android_version.py', 'import_jp_master.py', 'inspect_jp_local_save.py', 'decrypt_master.py',
+TOOLS = ['export_account.py', 'check_android_version.py', 'import_jp_master.py', 'inspect_jp_local_save.py', 'decrypt_master.py',
          'decrypt_master_split_apk.py', 'README.md']
 
 

@@ -2,6 +2,7 @@
 
 | 脚本 | 用途 |
 | --- | --- |
+| `export_account.py` | 从已认证 API 导出不含凭据的账号 JSON，供离线组队计算器导入 |
 | `check_android_version.py` | 只读检测 Google Play 官方安卓版本并与当前配置比较 |
 | `check_release.py` | 校验来源及 GitHub 版本标签 |
 | `package_release.py` | 按公开文件清单打包运行环境 |

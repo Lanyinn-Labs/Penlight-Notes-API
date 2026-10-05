@@ -116,6 +116,7 @@ async fn invalid_queries_and_private_access_are_rejected_before_game_dispatch() 
     for path in [
         "/api/jp/user/account",
         "/api/jp/user/data",
+        "/api/jp/user/export",
         "/api/jp/user/decks",
     ] {
         assert_eq!(get(router.clone(), path).await.0, 401, "{path}");
