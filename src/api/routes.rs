@@ -62,6 +62,11 @@ fn assemble(
     });
     let mut api = Router::new()
         .route("/{region}/application", get(handlers::application))
+        .route("/{region}/events/current", get(handlers::current_event))
+        .route(
+            "/{region}/events/current/cutoffs",
+            get(handlers::current_event_cutoffs),
+        )
         .route("/{region}/announcements", get(handlers::announcements))
         .route("/{region}/announcements/{id}", get(handlers::announcement))
         .route(

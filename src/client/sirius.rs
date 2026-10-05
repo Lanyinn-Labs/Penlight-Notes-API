@@ -333,29 +333,69 @@ impl RankingSource for SiriusRankingSource {
                     ranks: request.ranks.clone(),
                 })
                 .await?;
-            let entries = match data.get("ranking") {
-                None => return Ok(Vec::new()), // Protobuf JSON can omit an empty repeated field.
-                Some(value) => value.as_array().ok_or(AppError::UpstreamInvalidResponse)?,
-            };
-            entries
-                .iter()
-                .map(|entry| {
-                    Ok(RankingPoint {
-                        rank: entry["rank"]
-                            .as_i64()
-                            .and_then(|n| i32::try_from(n).ok())
-                            .ok_or(AppError::UpstreamInvalidResponse)?,
-                        point: match entry.get("point") {
-                            None => 0,
-                            Some(value) => value
-                                .as_i64()
-                                .and_then(|n| i32::try_from(n).ok())
-                                .ok_or(AppError::UpstreamInvalidResponse)?,
-                        },
-                    })
-                })
-                .collect()
+            ranking_points(&data)
         })
+    }
+}
+
+fn ranking_points(data: &Value) -> Result<Vec<RankingPoint>, AppError> {
+    if !data.is_object() {
+        return Err(AppError::UpstreamInvalidResponse);
+    }
+    let entries = match data.get("ranking") {
+        None => return Ok(Vec::new()), // An empty Protobuf repeated field may be absent.
+        Some(value) => value.as_array().ok_or(AppError::UpstreamInvalidResponse)?,
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let integer = |field: &str| {
+                entry[field]
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or(AppError::UpstreamInvalidResponse)
+            };
+            Ok(RankingPoint {
+                rank: integer("rank")?,
+                point: if entry.get("point").is_none() {
+                    0
+                } else {
+                    integer("point")?
+                },
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod ranking_tests {
+    use super::*;
+    #[test]
+    fn protobuf_rankings_keep_zero_and_reject_malformed_data() {
+        assert!(ranking_points(&json!({})).unwrap().is_empty());
+        assert!(ranking_points(&json!({"ranking":[]})).unwrap().is_empty());
+        assert_eq!(
+            ranking_points(&json!({"ranking":[{"rank":100}]})).unwrap(),
+            vec![RankingPoint {
+                rank: 100,
+                point: 0
+            }]
+        );
+        assert_eq!(
+            ranking_points(&json!({"ranking":[{"rank":1,"point":2147483647}]})).unwrap()[0].point,
+            i32::MAX
+        );
+        for invalid in [
+            json!(null),
+            json!([]),
+            json!({"ranking":null}),
+            json!({"ranking":[{"rank":1,"point":null}]}),
+            json!({"ranking":[{"rank":1,"point":2147483648u64}]}),
+            json!({"ranking":[{"point":100}]}),
+            json!({"ranking":[{"rank":"100"}]}),
+        ] {
+            assert!(ranking_points(&invalid).is_err(), "{invalid}");
+        }
     }
 }
 

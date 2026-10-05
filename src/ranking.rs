@@ -111,6 +111,7 @@ pub struct CutoffResponse {
     event_id: i64,
     source: &'static str,
     status: &'static str,
+    complete: bool,
     observed_at_unix_ms: u128,
     age_ms: u128,
     cutoffs: Vec<Cutoff>,
@@ -138,8 +139,14 @@ impl RankingService {
         let slot = {
             let mut slots = self.slots.lock().expect("ranking cache mutex poisoned");
             if !slots.contains_key(&key) && slots.len() >= MAX_CACHE_KEYS {
-                if let Some(evicted) = slots.keys().next().cloned() {
+                if let Some(evicted) = slots
+                    .iter()
+                    .find(|(_, slot)| Arc::strong_count(slot) == 1)
+                    .map(|(key, _)| key.clone())
+                {
                     slots.remove(&evicted);
+                } else {
+                    return Err(AppError::ApiBusy);
                 }
             }
             slots.entry(key).or_default().clone()
@@ -240,6 +247,7 @@ fn response(
         event_id: request.event_id,
         source: "official_game_service",
         status,
+        complete: request.ranks.iter().all(|rank| points.contains_key(rank)),
         observed_at_unix_ms: snapshot.observed_at_unix_ms,
         age_ms: snapshot.fetched_at.elapsed().as_millis(),
         cutoffs: request
@@ -250,5 +258,98 @@ fn response(
                 point: points.get(rank).copied(),
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct EmptySource(std::sync::atomic::AtomicUsize);
+    impl RankingSource for EmptySource {
+        fn fetch<'a>(
+            &'a self,
+            _: Region,
+            _: &'a RankingRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<RankingPoint>, AppError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![])
+            })
+        }
+    }
+    #[tokio::test]
+    async fn cache_pressure_keeps_active_slots_and_remains_bounded() {
+        let source = Arc::new(EmptySource(std::sync::atomic::AtomicUsize::new(0)));
+        let service = RankingService::new(
+            source.clone(),
+            CachePolicy {
+                fresh: Duration::from_secs(30),
+                stale: Duration::from_secs(300),
+                retry: Duration::from_secs(5),
+            },
+        );
+        let mut pinned = vec![];
+        {
+            let mut slots = service.slots.lock().unwrap();
+            for event_id in 1..=MAX_CACHE_KEYS as i64 {
+                let slot = Arc::new(AsyncMutex::new(SlotState::default()));
+                pinned.push(slot.clone());
+                slots.insert(
+                    CacheKey {
+                        region: Region::Jp,
+                        event_id,
+                        ranks: vec![100],
+                    },
+                    slot,
+                );
+            }
+        }
+        let request = RankingRequest::parse("2048", "100").unwrap();
+        assert!(matches!(
+            service.get(Region::Jp, request.clone()).await,
+            Err(AppError::ApiBusy)
+        ));
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(service.slots.lock().unwrap().len(), MAX_CACHE_KEYS);
+        drop(pinned);
+        assert!(service.get(Region::Jp, request).await.is_ok());
+        assert_eq!(service.slots.lock().unwrap().len(), MAX_CACHE_KEYS);
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn malformed_points_never_replace_a_verified_snapshot() {
+        let request = RankingRequest::parse("1", "100").unwrap();
+        for points in [
+            vec![RankingPoint {
+                rank: 100,
+                point: -1,
+            }],
+            vec![
+                RankingPoint {
+                    rank: 100,
+                    point: 1,
+                },
+                RankingPoint {
+                    rank: 100,
+                    point: 2,
+                },
+            ],
+            vec![RankingPoint {
+                rank: 101,
+                point: 1,
+            }],
+        ] {
+            assert!(validate_points(&request, &points).is_err());
+        }
+        assert!(validate_points(
+            &request,
+            &[RankingPoint {
+                rank: 100,
+                point: 0
+            }]
+        )
+        .is_ok());
+        assert!(validate_points(&request, &[]).is_ok());
     }
 }

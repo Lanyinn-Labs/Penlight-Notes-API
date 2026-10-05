@@ -32,6 +32,7 @@ cargo run --locked
 | `PENLIGHT_REQUEST_BURST` | `60` | 令牌桶容量 |
 | `PENLIGHT_REQUEST_TIMEOUT_SECONDS` | `30` | API 请求总超时 |
 | `PENLIGHT_STATUS_TTL_SECONDS` | `300` | 最近上游通信状态有效期 |
+| `PENLIGHT_RANKING_DEFAULT_RANKS` | `1,10,50,100,500,1000,2000,3000,5000,10000` | 省略 ranks 时的档位，1–20 个正整数 |
 | `PENLIGHT_RANKING_FRESH_SECONDS` | `30` | 榜线新鲜缓存时间 |
 | `PENLIGHT_RANKING_STALE_SECONDS` | `300` | 刷新失败时旧榜线最长保留时间 |
 | `PENLIGHT_RANKING_RETRY_SECONDS` | `5` | 榜线刷新失败后的重试间隔 |

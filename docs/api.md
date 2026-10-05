@@ -39,7 +39,7 @@
 | `/music/{id}/rankings` | 歌曲排名，移除调用账号的 myRank/myScore |
 | `/challenge-music/{id}/rankings` | 挑战歌曲排名，移除调用账号的 myRank/myScore |
 
-ID 必须为正整数。活动 rankings 和 cutoffs 的 ranks 必须包含 1 至 20 个逗号分隔的正整数，排序并去重；不接受未知查询参数。
+ID 必须为正整数。活动 rankings 必须指定 ranks；cutoffs 可省略 ranks 使用服务默认档位。显式 ranks 必须包含 1 至 20 个逗号分隔的正整数，排序并去重；空字符串、超出 int32 范围或未知查询参数返回 400。
 
 在线响应封装如下，data 内部保留上游 Protobuf JSON 结构：
 
@@ -52,15 +52,53 @@ ID 必须为正整数。活动 rankings 和 cutoffs 的 ranks 必须包含 1 至
 }
 ```
 
-### 活动榜线
+### 活动档线（榜线）
 
-`GET /api/jp/events/{event_id}/cutoffs?ranks=100,1000`
+| GET 路径 | 说明 |
+| --- | --- |
+| `/api/jp/events/current` | 经校验的 Master 中正在进行的活动及排名开关 |
+| `/api/jp/events/current/cutoffs` | 当前活动的默认档位；可用 `?ranks=100,1000` 覆盖 |
+| `/api/jp/events/{event_id}/cutoffs` | 指定活动的默认档位；可用 `?ranks=100,1000` 覆盖 |
 
-响应包含 region、event_id、source: official_game_service、status、observed_at_unix_ms、age_ms 和 cutoffs。每个榜线包含 rank 和 point。上游未返回某名次时，point 为 null；已返回的零分保留为 0。
+默认档位为 `1,10,50,100,500,1000,2000,3000,5000,10000`，是服务查询预设，可通过 `PENLIGHT_RANKING_DEFAULT_RANKS` 修改，不代表官方奖励分档。原始活动 rankings 接口仍要求显式 ranks。
 
-status 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数据。超过旧数据保留期后返回实际错误；缓存时间由 `PENLIGHT_RANKING_*_SECONDS` 配置。相同请求并发合并，并限制失败后的重试。
+当前活动接口需要已配置的日服 Master 数据。根据 `_startAt`、`_endAt` 判定活动进行中（含边界），按日本时间 UTC+9 解析，输出 UTC ISO 8601 时间；没有进行中的活动返回 404，损坏或多个同时进行的活动返回 503 master_data_unavailable。响应包含 Master 版本/快照和 event：
 
-2026-09-27 导入的 Master 没有活动，活动查询返回空排名。这验证了请求链路及空结果处理，实际活动分数仍待活动开放后验证。
+```json
+{
+  "id": 1,
+  "name_text_id": "Event_Name_0001",
+  "starts_at": "2026-09-30T09:00:00Z",
+  "ends_at": "2026-10-08T11:59:59Z",
+  "display_ends_at": "2026-10-10T11:59:59Z",
+  "ranking_enabled": false,
+  "music_ranking_enabled": true,
+  "total_music_ranking_enabled": true
+}
+```
+
+当 Master 标记 `_isRankingDisabled: true` 时，当前活动和指定活动的 cutoffs、原始 rankings 返回 `409 event_ranking_disabled`，不请求官方，不返回伪造分数。配置 Master 后查询其中不存在的活动返回 404；未配置 Master 时仍允许按活动 ID 查询官方档线。其他歌曲/挑战排行接口不受总分排名开关影响。
+
+可用的档线响应示例（仅用于说明结构，非实服分数）：
+
+```json
+{
+  "region": "jp",
+  "event_id": 42,
+  "source": "official_game_service",
+  "status": "fresh",
+  "complete": false,
+  "observed_at_unix_ms": 1791158400000,
+  "age_ms": 0,
+  "cutoffs": [{"rank": 100, "point": 12345}, {"rank": 1000, "point": null}]
+}
+```
+
+`complete` 表示官方是否返回所有请求名次。未返回名次的 point 为 null；已返回的零分保留为 0。`status` 为 fresh 表示新鲜缓存，stale 表示刷新失败后返回的旧数据。失败和缓存命中均不改变观测时间；超过旧数据保留期返回实际错误。响应使用 `Cache-Control: private, no-store`，避免 HTTP 缓存冻结 age/status。
+
+缓存时间由 `PENLIGHT_RANKING_*_SECONDS` 配置。相同活动和规范化档位共享缓存，并发请求合并，失败后按配置退避。缓存最多 1024 个键，正在使用的键不会被淘汰；容量全部被占用时返回 429 api_busy。
+
+2026-10-05 实服验证：当前活动 ID 1 总分排名关闭，两个档线入口均返回 409；挑战歌曲 ID 1 排名返回 100 条记录。总分排名开放后的非零档线已通过协议/缓存测试覆盖，仍需在官方实际开放后补充实服验收。
 
 ## 现有账号查询
 
@@ -135,6 +173,7 @@ master-schema 始终是构建时提取的 APK 结构，不等于线上最新结�
 | 401 | unauthorized | 密钥缺失、错误或私有接口未配置密钥 |
 | 404 | not_found | 路径或资源不存在 |
 | 405 | method_not_allowed | 方法不支持 |
+| 409 | event_ranking_disabled | 活动总分排名关闭，未请求官方 |
 | 501 | protocol_pending | 区服在线协议未配置或未接入 |
 | 503 | region_disabled | 区服关闭 |
 | 503 | master_data_unavailable | 快照缺失、损坏或来源不符 |

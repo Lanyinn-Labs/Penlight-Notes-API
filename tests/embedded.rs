@@ -321,3 +321,139 @@ async fn master_updater_status_is_read_only_and_missing_secrets_fail_startup() {
     );
     assert!(client.start_worker().is_err());
 }
+
+fn event_record(disabled: bool) -> Value {
+    use chrono::{FixedOffset, Utc};
+    let now = Utc::now().with_timezone(&FixedOffset::east_opt(9 * 3600).unwrap());
+    json!({"_id":1,"_nameTextId":"Event_Name_0001",
+        "_startAt":(now-chrono::Duration::days(1)).format("%Y/%m/%d %H:%M:%S").to_string(),
+        "_endAt":(now+chrono::Duration::days(1)).format("%Y/%m/%d %H:%M:%S").to_string(),
+        "_displayEndAt":(now+chrono::Duration::days(2)).format("%Y/%m/%d %H:%M:%S").to_string(),
+        "_isRankingDisabled":disabled,"_isMusicRankingDisabled":false,"_isTotalMusicRankingDisabled":false})
+}
+
+struct EventRankingFixture(std::sync::atomic::AtomicUsize);
+impl penlight_notes_api::ranking::RankingSource for EventRankingFixture {
+    fn fetch<'a>(
+        &'a self,
+        _: penlight_notes_api::region::Region,
+        request: &'a penlight_notes_api::ranking::RankingRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<penlight_notes_api::ranking::RankingPoint>, AppError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(request.event_id, 1);
+            Ok(request
+                .ranks
+                .iter()
+                .map(|rank| penlight_notes_api::ranking::RankingPoint {
+                    rank: *rank,
+                    point: if *rank == 1 { 123456 } else { 0 },
+                })
+                .collect())
+        })
+    }
+}
+
+#[tokio::test]
+async fn active_event_cutoffs_use_master_capabilities_and_shared_cache() {
+    let directory = Directory::new();
+    write_snapshot(
+        &directory.0,
+        "master-event",
+        "v1",
+        &[("MasterEvent", json!({"_allData":[event_record(false)]}))],
+    );
+    let mut config = Config::default();
+    let mut protocol = settings();
+    protocol.master_directory = Some(directory.0.clone());
+    config.regions[1].sirius = Some(protocol);
+    config.ranking_default_ranks = vec![1, 100];
+    let source = Arc::new(EventRankingFixture(std::sync::atomic::AtomicUsize::new(0)));
+    let router = api::build_with_ranking_source(Arc::new(config), source.clone());
+    let (status, event) = get(router.clone(), "/api/jp/events/current").await;
+    assert_eq!(status, 200);
+    assert_eq!(event["event"]["id"], 1);
+    assert_eq!(event["event"]["ranking_enabled"], true);
+    assert_eq!(event["master_version"], "v1");
+    let (status, current) = get(router.clone(), "/api/jp/events/current/cutoffs").await;
+    assert_eq!(status, 200);
+    assert_eq!(current["event_id"], 1);
+    assert_eq!(current["complete"], true);
+    assert_eq!(current["cutoffs"][0]["point"], 123456);
+    assert_eq!(current["cutoffs"][1]["point"], 0);
+    let (status, explicit) = get(router.clone(), "/api/jp/events/1/cutoffs?ranks=100,1,1").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        current["observed_at_unix_ms"],
+        explicit["observed_at_unix_ms"]
+    );
+    assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/jp/events/1/cutoffs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert_eq!(
+        get(router.clone(), "/api/jp/events/99/cutoffs").await.0,
+        404
+    );
+    assert_eq!(
+        get(router.clone(), "/api/jp/events/current/cutoffs?ranks=0")
+            .await
+            .0,
+        400
+    );
+    assert_eq!(get(router, "/api/jp/events/1/rankings").await.0, 400);
+}
+
+#[tokio::test]
+async fn disabled_event_rankings_never_fetch_or_fabricate_points() {
+    let directory = Directory::new();
+    write_snapshot(
+        &directory.0,
+        "master-event",
+        "v1",
+        &[("MasterEvent", json!({"_allData":[event_record(true)]}))],
+    );
+    let mut config = Config::default();
+    let mut protocol = settings();
+    protocol.master_directory = Some(directory.0.clone());
+    config.regions[1].sirius = Some(protocol);
+    let source = Arc::new(EventRankingFixture(std::sync::atomic::AtomicUsize::new(0)));
+    let router = api::build_with_ranking_source(Arc::new(config), source.clone());
+    let (status, event) = get(router.clone(), "/api/jp/events/current").await;
+    assert_eq!(status, 200);
+    assert_eq!(event["event"]["ranking_enabled"], false);
+    assert_eq!(event["event"]["music_ranking_enabled"], true);
+    for path in [
+        "/api/jp/events/current/cutoffs",
+        "/api/jp/events/1/cutoffs?ranks=100",
+        "/api/jp/events/1/rankings?ranks=100",
+    ] {
+        let (status, body) = get(router.clone(), path).await;
+        assert_eq!(status, 409, "{path}");
+        assert_eq!(body["error"]["code"], "event_ranking_disabled");
+    }
+    assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    write_snapshot(
+        &directory.0,
+        "master-empty",
+        "v2",
+        &[("MasterEvent", json!({"_allData":[]}))],
+    );
+    assert_eq!(get(router.clone(), "/api/jp/events/current").await.0, 404);
+    assert_eq!(get(router, "/api/jp/events/current/cutoffs").await.0, 404);
+}

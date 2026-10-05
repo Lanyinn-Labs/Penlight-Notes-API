@@ -374,7 +374,6 @@ async fn cutoff_route_validates_requests_and_never_invents_live_scores() {
 
     for path in [
         "/api/global/events/0/cutoffs?ranks=100",
-        "/api/global/events/42/cutoffs",
         "/api/global/events/42/cutoffs?ranks=",
         "/api/global/events/42/cutoffs?ranks=0",
         "/api/global/events/42/cutoffs?ranks=100,nope",
@@ -429,6 +428,7 @@ async fn cutoff_cache_merges_identical_requests_and_preserves_observation_time()
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
     assert_eq!(first.1["source"], "official_game_service");
     assert_eq!(first.1["status"], "fresh");
+    assert_eq!(first.1["complete"], false);
     assert_eq!(first.1["cutoffs"][0]["rank"], 100);
     assert_eq!(first.1["cutoffs"][0]["point"], 12345);
     assert_eq!(first.1["cutoffs"][1]["rank"], 1000);

@@ -16,6 +16,8 @@ pub enum AppError {
     ProtocolPending,
     #[error("event ID and ranks must be positive; provide 1 to 20 comma-separated ranks")]
     InvalidRankingQuery,
+    #[error("event point ranking is disabled for this event")]
+    EventRankingDisabled,
     #[error("Master record ID must be a positive integer")]
     InvalidMasterId,
     #[error("query parameters must contain valid positive IDs or a tab from 0 to 2")]
@@ -57,6 +59,7 @@ impl IntoResponse for AppError {
             Self::RegionDisabled => (StatusCode::SERVICE_UNAVAILABLE, "region_disabled"),
             Self::ProtocolPending => (StatusCode::NOT_IMPLEMENTED, "protocol_pending"),
             Self::InvalidRankingQuery => (StatusCode::BAD_REQUEST, "invalid_ranking_query"),
+            Self::EventRankingDisabled => (StatusCode::CONFLICT, "event_ranking_disabled"),
             Self::InvalidMasterId => (StatusCode::BAD_REQUEST, "invalid_master_id"),
             Self::InvalidQuery => (StatusCode::BAD_REQUEST, "invalid_query"),
             Self::UpstreamTimeout => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout"),

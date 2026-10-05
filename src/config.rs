@@ -27,6 +27,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub api_key: Option<String>,
     pub ranking_cache: CachePolicy,
+    pub ranking_default_ranks: Vec<i32>,
     pub request_limits: RequestLimits,
     pub upstream_status_ttl: Duration,
     pub regions: [RegionConfig; 2],
@@ -44,6 +45,7 @@ impl Default for Config {
                 timeout: Duration::from_secs(30),
             },
             upstream_status_ttl: Duration::from_secs(300),
+            ranking_default_ranks: vec![1, 10, 50, 100, 500, 1000, 2000, 3000, 5000, 10000],
             ranking_cache: CachePolicy {
                 fresh: Duration::from_secs(30),
                 stale: Duration::from_secs(300),
@@ -138,6 +140,11 @@ impl Config {
                 "request limits and status TTL must be positive; concurrency must not exceed 65536"
                     .into(),
             );
+        }
+        if let Some(ranks) = values.optional("PENLIGHT_RANKING_DEFAULT_RANKS") {
+            config.ranking_default_ranks = crate::ranking::RankingRequest::parse("1", &ranks)
+                .map_err(|_| "invalid PENLIGHT_RANKING_DEFAULT_RANKS")?
+                .ranks;
         }
         let cache = &mut config.ranking_cache;
         cache.fresh = values.seconds("PENLIGHT_RANKING_FRESH_SECONDS", cache.fresh)?;
@@ -538,6 +545,21 @@ mod tests {
         let protocol = config.regions[1].sirius.as_ref().unwrap();
         assert!(protocol.accounts.is_empty());
         assert_eq!(protocol.client_version, "1.0.3");
+    }
+
+    #[test]
+    fn default_cutoff_ranks_are_configurable_and_bounded() {
+        let config = load(&[("PENLIGHT_RANKING_DEFAULT_RANKS", "1000,100,100")]).unwrap();
+        assert_eq!(config.ranking_default_ranks, vec![100, 1000]);
+        for value in [
+            "0",
+            "-1",
+            "nope",
+            "1,,2",
+            "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21",
+        ] {
+            assert!(load(&[("PENLIGHT_RANKING_DEFAULT_RANKS", value)]).is_err());
+        }
     }
 
     #[test]
