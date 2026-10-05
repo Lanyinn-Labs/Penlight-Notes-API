@@ -326,7 +326,7 @@ fn jp_protocol<F: Fn(&str) -> Option<String>>(
         return Err("peer routing requires PENLIGHT_JP_PEER_TOKEN".into());
     }
     let master_update = if mode == "download" {
-        let mut network = sirius_api_proxy::master_update::Network::default();
+        let mut network = sirius_api_proxy::master_update::Network::master();
         network.connect_timeout_ms = values.parse(
             "PENLIGHT_JP_MASTER_CONNECT_TIMEOUT_MS",
             network.connect_timeout_ms,
@@ -545,6 +545,38 @@ mod tests {
         let protocol = config.regions[1].sirius.as_ref().unwrap();
         assert!(protocol.accounts.is_empty());
         assert_eq!(protocol.client_version, "1.0.3");
+    }
+
+    #[test]
+    fn master_download_uses_upstream_retry_defaults_and_preserves_overrides() {
+        let config = load(&[("PENLIGHT_JP_MASTER_MODE", "download")]).unwrap();
+        let network = &config.regions[1]
+            .sirius
+            .as_ref()
+            .unwrap()
+            .master_update
+            .as_ref()
+            .unwrap()
+            .network;
+        assert_eq!(network.attempts, 3);
+        assert_eq!(network.retry_delay_ms, 250);
+        let config = load(&[
+            ("PENLIGHT_JP_MASTER_MODE", "download"),
+            ("PENLIGHT_JP_MASTER_ATTEMPTS", "1"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.regions[1]
+                .sirius
+                .as_ref()
+                .unwrap()
+                .master_update
+                .as_ref()
+                .unwrap()
+                .network
+                .attempts,
+            1
+        );
     }
 
     #[test]

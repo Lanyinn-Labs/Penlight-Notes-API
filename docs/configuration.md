@@ -82,7 +82,7 @@ APK 快照和 Sirius Master 存储是两种不同格式，只能配置一个日�
 | `PENLIGHT_JP_MASTER_TIMEOUT_SECONDS` | `600` | 单轮下载/同步总超时 |
 | `PENLIGHT_JP_MASTER_CONNECT_TIMEOUT_MS` | `10000` | 下载连接超时 |
 | `PENLIGHT_JP_MASTER_REQUEST_TIMEOUT_MS` | `60000` | 单次下载请求超时 |
-| `PENLIGHT_JP_MASTER_ATTEMPTS` | `1` | 下载总尝试次数，范围 1–8 |
+| `PENLIGHT_JP_MASTER_ATTEMPTS` | `3` | 下载总尝试次数，范围 1–8 |
 | `PENLIGHT_JP_MASTER_RETRY_DELAY_MS` | `250` | 下载重试起始延迟 |
 | `PENLIGHT_JP_MASTER_MAX_RETRY_DELAY_MS` | `5000` | 下载重试最大延迟 |
 | `PENLIGHT_CDN_USERNAME` | 客户端 JSON | 适配测试可覆盖 CDN Basic 用户名；正式部署省略 |
