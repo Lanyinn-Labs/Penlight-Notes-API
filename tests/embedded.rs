@@ -9,12 +9,7 @@ use penlight_notes_api::{
     error::AppError,
 };
 use serde_json::{json, Value};
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::PathBuf, sync::Arc};
 use tower::ServiceExt;
 
 fn settings() -> sirius_api_proxy::config::Config {
@@ -132,19 +127,52 @@ async fn invalid_queries_and_private_access_are_rejected_before_game_dispatch() 
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("penlight-embedded-{}-{n}", std::process::id()));
-        fs::create_dir(&p).unwrap();
-        Self(p)
+        Self(
+            tempfile::Builder::new()
+                .prefix("penlight-embedded-")
+                .tempdir()
+                .unwrap()
+                .keep(),
+        )
     }
 }
 impl Drop for Directory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn temporary_directories_are_isolated_under_concurrent_creation() {
+    let directories = std::thread::scope(|scope| {
+        let workers = (0..32)
+            .map(|_| scope.spawn(Directory::new))
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let paths = directories
+        .iter()
+        .map(|directory| &directory.0)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(paths.len(), directories.len());
+    for (index, directory) in directories.iter().enumerate() {
+        fs::write(directory.0.join("owner"), index.to_string()).unwrap();
+    }
+    for (index, directory) in directories.iter().enumerate() {
+        assert_eq!(
+            fs::read_to_string(directory.0.join("owner")).unwrap(),
+            index.to_string()
+        );
+    }
+    let paths = directories
+        .iter()
+        .map(|directory| directory.0.clone())
+        .collect::<Vec<_>>();
+    drop(directories);
+    assert!(paths.iter().all(|path| !path.exists()));
 }
 
 fn snapshot(root: &std::path::Path, name: &str, version: &str, id: i64) {
