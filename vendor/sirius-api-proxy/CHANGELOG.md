@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.3.6
+
+- Global protocol 1.0.3 is the default for HK/EN/KR (`protocol/global/1.0.3`, native codecs). It
+  is the same eleven-RPC subset as 1.0.1, extracted from the official Global 1.0.3 Android client,
+  and only adds definitions, the same ones JP gained in 1.0.4: `Announcement.platform`
+  (`AnnouncementPlatform`), the costume fields of `PlayerData` and `Notification` (new
+  `entity/character_costume.proto`) and `ResourceType.RESOURCE_TYPE_CHARACTER_UNLOCKED_COSTUME`.
+  Before, these fields were dropped. `PlayerLogin`, `GetServerList` and the other messages are
+  unchanged. `protocol/global/1.0.1` stays for a restart-based rollback; a running service on
+  1.0.3 cannot hot-reload back to 1.0.1.
+- HK/EN/KR resource snapshots from the default bundle report `protocol_version` 1.0.3. Asset
+  updater profiles must set `protocol_version: 1.0.3` together with the proxy switch.
+- The examples use the current client versions: JP 1.0.5 and Global 1.0.3. The JP 1.0.5 client
+  embeds the same protocol as 1.0.4 (its string literal table is identical), so JP stays on
+  `protocol/sirius/1.0.4`.
+
+## 1.3.5
+
+- Global SDK keepalive. Each `cache.login` extends the SDK `access_key` to 30 days after the call,
+  and the SDK has no refresh token. A region whose game session stays up, or an idle deployment,
+  never sends `cache.login`, so the key could lapse.
+  - Each region with Global accounts now checks once an hour (first check one hour after
+    startup). It revalidates identities whose last successful `cache.login` is
+    `global_login.sdk_keepalive_seconds` old (default 20 days; 1..28 days).
+  - Regions sharing an identity revalidate it once. The keepalive keeps the game session,
+    respects the login interval and daily cap, and skips refused or disabled identities and
+    identities never revalidated by the deployment.
+- The persisted SDK session keeps the time of the last `cache.login` even after its `id_token`
+  expires or a `TOKEN_*` signal drops it, so the keepalive works across restarts.
+- Account status adds `sdk_validated_at`, the identity's last successful `cache.login`.
+
+## 1.3.4
+
+- Global accounts: the SDK `app_ver` parameter follows the region's `client_version` instead of
+  the fixed `1.0.1`. The official client sends its APK version name, so after the 1.0.2 update
+  the proxy kept presenting an outdated SDK client. The other SDK parameters, the signature and
+  the headers are unchanged in the Global 1.0.3 APK.
+- `global-account bootstrap` requires `--client-version` and rejects an invalid one before
+  anything is sent.
+- Documented that the SDK's server configuration disables guest login for players
+  (`config_tourist_login_switch: 0`) and that guest identities have been refused since 2026-10-01.
+
 ## 1.3.3
 
 - Global accounts: the regions of a deployment share one SDK session per identity.

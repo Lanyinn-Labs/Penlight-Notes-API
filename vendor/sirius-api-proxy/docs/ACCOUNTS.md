@@ -133,6 +133,7 @@ global_login:
   concurrent_device_limit: 3           # 1..100 CONCURRENT_DEVICE signals per 24 h disable
   state_directory: /var/lib/sirius/sdk-sessions  # optional; SDK sessions survive restarts
   sdk_refusal_retry_seconds: 86400     # 3600..2592000, before a refused identity is retried
+  sdk_keepalive_seconds: 1728000       # 86400..2419200, background cache.login after this long
 ```
 
 Rules checked at startup:
@@ -189,7 +190,8 @@ writes it.
 Nothing is sent at startup. The first authenticated request of an account, while holding the
 account's session lock, performs:
 
-1. SDK `POST /gapi/client/cache.login` (signed like the Android SDK). The uid must not change;
+1. SDK `POST /gapi/client/cache.login` (signed like the Android SDK; `app_ver` is the profile's
+   `client_version`, the APK version name the official client sends). The uid must not change;
    the original `access_key` is kept, a new `id_token` is used when returned. It is skipped
    while the identity's [shared SDK session](#shared-sdk-sessions) is valid.
 2. `PlayerLoginService/PlayerLogin` on the region's API endpoint with `area_id` 6,
@@ -241,7 +243,9 @@ access key.
 `last_error_code` (an application or SDK code such as `TOKEN_ILLEGAL` or `SDK_CAPTCHA`, never
 text) and, after `SDK_REFUSED`, `last_sdk_code` (the SDK's numeric refusal code, also logged as
 `sdk_code`; it tells an invalidated identity from a risk-control block), and `sdk_session`
-(the identity's shared SDK session: `none`, `valid`, `stale`, `expired` or `refused`). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
+(the identity's shared SDK session: `none`, `valid`, `stale`, `expired` or `refused`), and
+`sdk_validated_at` (the identity's last successful `cache.login`; its SDK `access_key` lapses
+30 days later unless another one follows). No SDK uid, token, player ID, credential or device value appears in status, errors, logs
 or response cache keys. Response cache keys use the account name and SDK uid (hashed), not the
 rotating credential, so a re-login keeps cached public responses.
 
@@ -282,6 +286,27 @@ checks. Since 1.3.3:
 - Without `state_directory`, sessions and refusals live in memory only and a restart starts
   over.
 
+### SDK keepalive
+
+The SDK `access_key` lapses 30 days after the identity's last `cache.login`, and every
+`cache.login` moves that date to 30 days after the call (the key itself is unchanged; measured
+2026-10-11). The SDK has no refresh token, so this is the only renewal. A region whose game
+session stays up never sends `cache.login`, and an idle deployment sends nothing, so since 1.3.5
+each region with Global accounts checks once an hour (the first check one hour after startup)
+and revalidates an identity whose last successful `cache.login` is `sdk_keepalive_seconds` old
+(default 20 days).
+
+- Only identities this deployment has revalidated before are kept alive. With
+  `state_directory` the time of the last `cache.login` survives restarts, even when the
+  persisted `id_token` has expired; without it, the keepalive starts after the first login of
+  each process.
+- The regions sharing an identity serialize on its revalidation lock and check again after
+  acquiring it, so one identity is revalidated once. The keepalive keeps the game session and
+  counts toward `login_min_interval_seconds` and `max_logins_per_day`; while either forbids a
+  login, or the SDK path is open, it waits for a later check.
+- A refused or disabled identity is never kept alive. A refusal during a keepalive is handled
+  like any other `cache.login` refusal.
+
 Operations: after a deploy, read `GET /internal/v1/<region>/accounts`; it never logs in. Do not
 probe `/internal/v1/<region>/account` in every region, because each probe can log the first
 account in. To retry a refused identity early, stop the service, delete its state file and
@@ -299,10 +324,13 @@ Both commands are one-shot and never retry.
    ```bash
    export SIRIUS_GLOBAL_SDK_APP_KEY=...   # the APK one_appkey
    sirius-api-proxy global-account bootstrap --device device.json \
-     --identity /secure/dir/guest-1.json [--sdk-origin https://l12-sdk-login-intl.biligame.net]
+     --identity /secure/dir/guest-1.json --client-version 1.0.3 \
+     [--sdk-origin https://l12-sdk-login-intl.biligame.net]
    sirius-api-proxy global-account bootstrap --device device.json \
-     --identity /secure/dir/guest-1.json --create-sdk-guest
+     --identity /secure/dir/guest-1.json --client-version 1.0.3 --create-sdk-guest
    ```
+
+   `--client-version` is the current Global APK version; it is sent as the SDK `app_ver`.
 
    The directory must be private to its owner (0700). The command writes
    `guest-1.json.attempt.json` before the request and `guest-1.json` (mode 0600) after a
@@ -339,6 +367,13 @@ enabling Global accounts:
   logs the other session out (`CONCURRENT_DEVICE`);
 - do not bypass CAPTCHAs or login queues;
 - review the terms before offering the service to others.
+
+Guest login is not offered to players. The SDK's server configuration (`/gapi/client/config`,
+read on 2026-10-11) has `config_tourist_login_switch: 0`, which is also the APK default, so the
+official client's login menu shows no guest button and players sign in with Google, Apple or
+e-mail. `tourist.login` still answered on 2026-09-27, but every guest identity tried since
+2026-10-01 has been refused with 900200, including identities on their first `cache.login`.
+Expect guest identities to be blocked.
 
 Live verification status: SDK `tourist.login`/`cache.login`, PlayerLogin and GetPlayerData were
 verified against production on all three servers. Profile, ranking, event deck and announcement

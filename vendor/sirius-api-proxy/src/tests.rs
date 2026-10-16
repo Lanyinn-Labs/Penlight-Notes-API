@@ -1892,7 +1892,7 @@ fn region_config_defaults_and_reserved_cn_fail_closed() {
     assert!(cfg.validate().is_ok());
     assert_eq!(
         cfg.protocol_path(),
-        std::path::PathBuf::from("protocol/global/1.0.1")
+        crate::config::default_global_protocol_directory()
     );
     cfg.region = Region::Cn;
     assert!(matches!(cfg.validate(), Err(AppError::Config(_))));
@@ -1908,9 +1908,60 @@ fn region_config_defaults_and_reserved_cn_fail_closed() {
     }
 }
 #[test]
+fn global_1_0_3_fields_decode_natively_and_dynamically() {
+    let loaded =
+        crate::protocol::ProtocolBundle::load(&crate::config::default_global_protocol_directory())
+            .unwrap();
+    assert_eq!(loaded.status.version, "1.0.3");
+    assert_eq!(loaded.status.family, "global");
+    assert_eq!(loaded.status.codec, "native");
+    let dynamic = crate::protocol::ProtocolBundle {
+        pool: loaded.pool.clone(),
+        status: crate::protocol::ProtocolStatus {
+            codec: "dynamic",
+            ..loaded.status.clone()
+        },
+    };
+    // 1.0.1 stays loadable for a restart-based rollback; it has its own fingerprint, so it runs
+    // with dynamic codecs and drops the 1.0.3 fields.
+    let rollback =
+        crate::protocol::ProtocolBundle::load(std::path::Path::new("protocol/global/1.0.1"))
+            .unwrap();
+    assert_eq!(rollback.status.version, "1.0.1");
+    assert_eq!(rollback.status.family, "global");
+    assert_eq!(rollback.status.codec, "dynamic");
+    let cases = [
+        (
+            crate::routes::ANNOUNCEMENT,
+            json!({"announcement":{"title":"t","platform":"ANNOUNCEMENT_PLATFORM_ANDROID"}}),
+            "/announcement/platform",
+            json!("ANNOUNCEMENT_PLATFORM_ANDROID"),
+        ),
+        (
+            crate::routes::PLAYER_DATA,
+            json!({"playerData":{"characterCurrentCostumes":[{"characterId":"7","costumeTarget":2,"costumeGroupId":"9"}],
+                "characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]},
+                "notification":{"characterUnlockedCostumes":[{"characterId":"7","costumeGroupId":"9","gotAt":"1"}]}}),
+            "/playerData/characterCurrentCostumes/0/costumeGroupId",
+            json!("9"),
+        ),
+    ];
+    for (route, value, pointer, expected) in cases {
+        let method = crate::protocol::method(&loaded.pool, route).unwrap();
+        let bytes = DynamicMessage::deserialize(method.output(), value)
+            .unwrap()
+            .encode_to_vec();
+        let native = loaded.decode(route, &bytes).unwrap();
+        assert_eq!(native.pointer(pointer), Some(&expected), "{route}");
+        assert_eq!(native, dynamic.decode(route, &bytes).unwrap(), "{route}");
+        let old = rollback.decode(route, &bytes).unwrap();
+        assert_eq!(old.pointer(pointer), None, "{route}");
+    }
+}
+#[test]
 fn global_native_codec_and_protocol_family_are_independent() {
     let bundle =
-        crate::protocol::ProtocolBundle::load(std::path::Path::new("protocol/global/1.0.1"))
+        crate::protocol::ProtocolBundle::load(&crate::config::default_global_protocol_directory())
             .unwrap();
     assert_eq!(bundle.status.codec, "native");
     assert_eq!(bundle.status.family, "global");
@@ -2041,7 +2092,8 @@ fn known_region_endpoints_cannot_be_relabelled() {
 #[tokio::test]
 async fn global_hot_reload_preserves_family_and_returns_to_native_on_restore() {
     let temp = tempfile::tempdir().unwrap();
-    let source = std::path::Path::new("protocol/global/1.0.1");
+    let source = crate::config::default_global_protocol_directory();
+    let source = source.as_path();
     copy_tree(source, temp.path());
     let mut cfg = config();
     cfg.region = crate::region::Region::En;
@@ -2059,7 +2111,7 @@ async fn global_hot_reload_preserves_family_and_returns_to_native_on_restore() {
     assert_eq!(changed.family, "global");
     std::fs::write(
         temp.path().join("bundle.json"),
-        r#"{"version":"1.0.1","family":"jp"}"#,
+        r#"{"version":"1.0.3","family":"jp"}"#,
     )
     .unwrap();
     assert!(c.reload_protocol().await.is_err());
@@ -12013,6 +12065,9 @@ async fn master_git_refuses_unowned_locked_and_linked_destinations() {
         master_git::commit(&source, &state, registry_scope()).await,
         Err(master_git::Error::Locked)
     ));
+    // Unlock explicitly, as `file_lock::Exclusive` does: a concurrent test forking a Git child
+    // shares this open file description until exec, and closing alone would leave it locked.
+    owner.unlock().unwrap();
     drop(owner);
     let linked = root.path().join("linked");
     std::os::unix::fs::symlink(&state, &linked).unwrap();
@@ -12030,10 +12085,12 @@ async fn master_git_refuses_unowned_locked_and_linked_destinations() {
         state.join("repository.git"),
     )
     .unwrap();
-    assert!(matches!(
-        master_git::commit(&source, &state, registry_scope()).await,
-        Err(master_git::Error::Ownership)
-    ));
+    let result = master_git::commit(&source, &state, registry_scope()).await;
+    assert!(
+        matches!(result, Err(master_git::Error::Ownership)),
+        "{:?}",
+        result.err()
+    );
 }
 
 #[cfg(unix)]
@@ -18702,6 +18759,8 @@ async fn master_git_adopt_respects_owner_lock_and_ownership() {
         master_git::adopt(&state, registry_scope(), &unreachable).await,
         Err(master_git::Error::Locked)
     ));
+    // Explicit unlock: see master_git_refuses_unowned_locked_and_linked_destinations.
+    owner.unlock().unwrap();
     drop(owner);
     let occupied = root.path().join("occupied");
     std::fs::create_dir(&occupied).unwrap();
@@ -20029,7 +20088,7 @@ async fn global_resource_snapshot_uses_version_body_and_anonymous_catalog_hash()
         assert_eq!(value["schema_version"], 3, "{n}");
         assert_eq!(value["region"], n);
         assert_eq!(value["platform"], "Android");
-        assert_eq!(value["protocol_version"], "1.0.1");
+        assert_eq!(value["protocol_version"], "1.0.3");
         assert_eq!(value["master_version"], "master-fixture");
         assert_eq!(value["resource_version"], "1.0.0.104");
         assert_eq!(value["platform_hash"], SYNTHETIC_CATALOG_HASH);
@@ -20252,9 +20311,11 @@ mod global_accounts {
     fn global_pool() -> &'static DescriptorPool {
         static POOL: std::sync::OnceLock<DescriptorPool> = std::sync::OnceLock::new();
         POOL.get_or_init(|| {
-            crate::protocol::ProtocolBundle::load(Path::new("protocol/global/1.0.1"))
-                .unwrap()
-                .pool
+            crate::protocol::ProtocolBundle::load(
+                &crate::config::default_global_protocol_directory(),
+            )
+            .unwrap()
+            .pool
         })
     }
     fn gmsg(name: &str, value: Value) -> Vec<u8> {
@@ -20625,6 +20686,7 @@ mod global_accounts {
         assert_eq!(
             global_sdk::form_encode(&global_sdk::prepare(
                 &device,
+                "1.0.1",
                 "synthetic-secret",
                 1_700_000_000_123,
                 None
@@ -20640,6 +20702,7 @@ mod global_accounts {
         assert_eq!(
             global_sdk::form_encode(&global_sdk::prepare(
                 &device,
+                "1.0.1",
                 "synthetic-secret",
                 1_700_000_000_123,
                 Some(&cached)
@@ -20652,8 +20715,10 @@ mod global_accounts {
 
     #[test]
     fn player_login_wire_format_matches_verified_probe_bytes() {
-        let bundle =
-            crate::protocol::ProtocolBundle::load(Path::new("protocol/global/1.0.1")).unwrap();
+        let bundle = crate::protocol::ProtocolBundle::load(
+            &crate::config::default_global_protocol_directory(),
+        )
+        .unwrap();
         assert_eq!(bundle.status.codec, "native");
         let sdk = global_sdk::SdkAccount {
             uid: "4242".into(),
@@ -20769,7 +20834,8 @@ mod global_accounts {
             );
         let (url, task) = super::peer_http_server(app).await;
         let client =
-            global_sdk::SdkClient::new(&url, APP_KEY.into(), Duration::from_secs(5), None).unwrap();
+            global_sdk::SdkClient::new(&url, APP_KEY.into(), "1.0.3", Duration::from_secs(5), None)
+                .unwrap();
         let device: global_sdk::Device = serde_json::from_value(device()).unwrap();
         assert_eq!(
             client.tourist_login(&device).await.err(),
@@ -20788,6 +20854,16 @@ mod global_accounts {
         assert!(global_sdk::SdkClient::new(
             "https://example.com",
             "k".into(),
+            "1.0.3",
+            Duration::from_secs(5),
+            None
+        )
+        .is_err());
+        // The SDK app_ver is the client version and must be a version.
+        assert!(global_sdk::SdkClient::new(
+            global_sdk::DEFAULT_SDK_ORIGIN,
+            "k".into(),
+            "latest",
             Duration::from_secs(5),
             None
         )
@@ -20813,6 +20889,7 @@ mod global_accounts {
             identity_file: identity.clone(),
             sdk_origin: sdk.url.clone(),
             app_key_env: app_key_env(),
+            client_version: "1.0.3".into(),
             create_sdk_guest: false,
         };
         let plan = bootstrap(&options).await.unwrap();
@@ -20820,6 +20897,12 @@ mod global_accounts {
         assert!(sdk.requests.lock().unwrap().is_empty());
         assert!(!identity.exists());
         options.create_sdk_guest = true;
+        // An invalid client version fails before anything is sent or marked.
+        options.client_version = "latest".into();
+        assert!(bootstrap(&options).await.is_err());
+        assert!(sdk.requests.lock().unwrap().is_empty());
+        assert!(!crate::global_account::attempt_marker(&identity).exists());
+        options.client_version = "1.0.3".into();
         let created = bootstrap(&options).await.unwrap();
         assert_eq!(created["sdk_guest_created"], true);
         assert!(!created.to_string().contains(ACCESS_KEY));
@@ -20834,6 +20917,7 @@ mod global_accounts {
             assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
             assert_eq!(form["channel_id"], "100");
             assert_eq!(form["platform"], "google");
+            assert_eq!(form["app_ver"], "1.0.3");
             assert_eq!(form["udid"], UDID);
             assert!(!form.contains_key("access_key"));
         }
@@ -20955,6 +21039,15 @@ mod global_accounts {
         assert_eq!(login.1["x-player-bid"], UID);
         assert_eq!(login.1["x-platform"], "android");
         assert_eq!(login.1["x-client-version"], "1.0.1");
+        // The SDK app_ver follows the configured client version.
+        {
+            let requests = e.sdk.requests.lock().unwrap();
+            let cache = requests
+                .iter()
+                .find(|r| r.0 == global_sdk::CACHE_LOGIN)
+                .unwrap();
+            assert_eq!(cache.2["app_ver"], "1.0.1");
+        }
         let request = DynamicMessage::decode(
             global_pool()
                 .get_message_by_name("app.playerlogin.PlayerLoginRequest")
@@ -22333,6 +22426,85 @@ regions:
             Some(Path::new("/data/sdk-sessions"))
         );
         assert_eq!(parsed.sdk_refusal_retry_seconds, 172_800);
+        // Keepalive: 20 days by default, 1..28 days (the access_key lapses after 30).
+        assert_eq!(login.sdk_keepalive_seconds, 20 * 86_400);
+        for keepalive in [86_399, 28 * 86_400 + 1] {
+            login.sdk_keepalive_seconds = keepalive;
+            assert!(login.validate().is_err());
+        }
+        login.sdk_keepalive_seconds = 86_400;
+        login.validate().unwrap();
+        let parsed: LoginConfig = yaml_serde::from_str("sdk_keepalive_seconds: 604800\n").unwrap();
+        assert_eq!(parsed.sdk_keepalive_seconds, 604_800);
+    }
+
+    /// Rewrites the deployment's persisted SDK session as last revalidated `days` ago, and
+    /// optionally refused just now.
+    fn age_state(d: &Shared, days: i64, refused: bool) {
+        let files = d.state_files();
+        assert_eq!(files.len(), 1);
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        state["validated_at"] = json!(chrono::Utc::now() - chrono::Duration::days(days));
+        if refused {
+            state["refusal"] = json!({"code": 900200, "at": chrono::Utc::now()});
+        }
+        write_private(&files[0], &state);
+    }
+
+    #[tokio::test]
+    async fn sdk_keepalive_revalidates_an_old_identity_once_across_regions() {
+        let d = shared(true).await;
+        // Never revalidated by this deployment: nothing is sent.
+        let fresh = d.start();
+        assert_eq!(fresh[0].sdk_keepalive().await, 0);
+        assert!(crate::sdk_keepalive::Worker::for_client(fresh[0].clone()).is_some());
+        fresh[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        assert!(status(&fresh[0])["sdk_validated_at"].is_string());
+        // Recently revalidated: not due.
+        assert_eq!(fresh[1].sdk_keepalive().await, 0);
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
+        drop(fresh);
+        // 21 days later (restart in between): both regions check concurrently, one
+        // cache.login, no PlayerLogin, and the identity is fresh again.
+        age_state(&d, 21, false);
+        let clients = d.start();
+        // The persisted id_token cannot be reused (it carries no exp), yet the time of the last
+        // cache.login survives the restart and drives the keepalive.
+        assert_eq!(status(&clients[0])["sdk_session"], "none");
+        assert!(status(&clients[0])["sdk_validated_at"].is_string());
+        let logins: Vec<usize> = d
+            .regions
+            .iter()
+            .map(|(_, f, _)| count(f, PLAYER_LOGIN))
+            .collect();
+        let (a, b) = tokio::join!(clients[0].sdk_keepalive(), clients[1].sdk_keepalive());
+        assert_eq!(a + b, 1);
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+        let after: Vec<usize> = d
+            .regions
+            .iter()
+            .map(|(_, f, _)| count(f, PLAYER_LOGIN))
+            .collect();
+        assert_eq!(after, logins);
+        let validated: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(status(&clients[1])["sdk_validated_at"].clone()).unwrap();
+        assert!(chrono::Utc::now() - validated < chrono::Duration::minutes(1));
+        assert_eq!(clients[0].sdk_keepalive().await, 0);
+        // The revalidated session serves the next login without another cache.login.
+        clients[1].call(PLAYER_DATA, json!({})).await.unwrap();
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 2);
+    }
+
+    #[tokio::test]
+    async fn sdk_keepalive_never_revalidates_a_refused_identity() {
+        let d = shared(true).await;
+        d.start()[0].call(PLAYER_DATA, json!({})).await.unwrap();
+        age_state(&d, 25, true);
+        let clients = d.start();
+        assert_eq!(status(&clients[0])["sdk_session"], "refused");
+        assert_eq!(clients[0].sdk_keepalive().await, 0);
+        assert_eq!(d.sdk.count(global_sdk::CACHE_LOGIN), 1);
     }
 }
 
@@ -24626,7 +24798,11 @@ fn perf_stages() {
     let mut ranking = None;
     for (family, directory, routes) in [
         ("jp", crate::config::default_protocol_directory(), ROUTES),
-        ("global", "protocol/global/1.0.1".into(), GLOBAL_ROUTES),
+        (
+            "global",
+            crate::config::default_global_protocol_directory(),
+            GLOBAL_ROUTES,
+        ),
     ] {
         let native = ProtocolBundle::load(&directory).unwrap();
         assert_eq!(native.status.codec, "native");

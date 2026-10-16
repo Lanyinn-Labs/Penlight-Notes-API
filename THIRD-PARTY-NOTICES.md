@@ -4,7 +4,7 @@
 
 This project incorporates the MIT-licensed Rust implementation from
 [Srirus-Project/sirius-api-proxy](https://github.com/Srirus-Project/sirius-api-proxy),
-version 1.3.3, revision cd19e2fe1d7f6c9a69304e6718e95fbc61817561.
+version 1.3.6, revision 3ee3addc072dfb8bb3835750ae1cd68e2e9738b5.
 The upstream project is derived from
 [Team-Haruki/Haruki-Sekai-API](https://github.com/Team-Haruki/Haruki-Sekai-API).
 

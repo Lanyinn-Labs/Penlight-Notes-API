@@ -51,6 +51,10 @@ pub struct LoginConfig {
     /// How long an SDK refusal stops logins of the identity in every region, restarts
     /// included, before one `cache.login` may try again.
     pub sdk_refusal_retry_seconds: u64,
+    /// A revalidated identity whose last successful `cache.login` is this old is revalidated
+    /// in the background. Each `cache.login` extends the SDK `access_key` to 30 days, so an
+    /// identity whose game session stays up (or that serves no request) does not lapse.
+    pub sdk_keepalive_seconds: u64,
 }
 impl Default for LoginConfig {
     fn default() -> Self {
@@ -64,6 +68,7 @@ impl Default for LoginConfig {
             concurrent_device_limit: 3,
             state_directory: None,
             sdk_refusal_retry_seconds: 86_400,
+            sdk_keepalive_seconds: 20 * 86_400,
         }
     }
 }
@@ -81,6 +86,7 @@ impl LoginConfig {
             || !(60..=86_400).contains(&self.aegis_cooldown_seconds)
             || !(1..=100).contains(&self.concurrent_device_limit)
             || !(3_600..=30 * 86_400).contains(&self.sdk_refusal_retry_seconds)
+            || !(86_400..=28 * 86_400).contains(&self.sdk_keepalive_seconds)
             || self
                 .state_directory
                 .as_ref()
@@ -319,6 +325,8 @@ pub struct BootstrapOptions {
     pub identity_file: PathBuf,
     pub sdk_origin: String,
     pub app_key_env: String,
+    /// The client version sent as the SDK `app_ver` (the current Global APK version name).
+    pub client_version: String,
     /// Without it the command is an offline plan and sends nothing.
     pub create_sdk_guest: bool,
 }
@@ -341,7 +349,7 @@ fn write_private(path: &Path, value: &Value) -> Result<(), &'static str> {
         .and_then(|_| file.sync_all())
         .map_err(|_| "cannot write the private output file")
 }
-fn attempt_marker(identity: &Path) -> PathBuf {
+pub(crate) fn attempt_marker(identity: &Path) -> PathBuf {
     let mut name = identity.as_os_str().to_owned();
     name.push(".attempt.json");
     PathBuf::from(name)
@@ -364,6 +372,9 @@ pub async fn bootstrap(options: &BootstrapOptions) -> Result<Value, &'static str
     let device: Device =
         serde_json::from_slice(&device_bytes).map_err(|_| "invalid device file")?;
     device.validate()?;
+    if semver::Version::parse(&options.client_version).is_err() {
+        return Err("the client version must be a version such as 1.0.3");
+    }
     if !crate::global_sdk::origin_allowed(&options.sdk_origin) {
         return Err("the SDK origin must be one of the official SDK HTTPS origins");
     }
@@ -400,8 +411,14 @@ pub async fn bootstrap(options: &BootstrapOptions) -> Result<Value, &'static str
     }
     let app_key = crate::config::secret(&options.app_key_env)
         .map_err(|_| "the SDK app key environment variable is missing or invalid")?;
-    let client = SdkClient::new(&options.sdk_origin, app_key, Duration::from_secs(25), None)
-        .map_err(|_| "invalid SDK client configuration")?;
+    let client = SdkClient::new(
+        &options.sdk_origin,
+        app_key,
+        &options.client_version,
+        Duration::from_secs(25),
+        None,
+    )
+    .map_err(|_| "invalid SDK client configuration")?;
     write_private(
         &marker,
         &json!({"operation": "tourist.login", "origin": options.sdk_origin, "at": Utc::now(), "retries": 0}),
