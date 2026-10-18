@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Upgrade the unchanged vendored Sirius API Proxy from 1.3.3 to 1.3.6, including Global protocol 1.0.3, configured SDK app versions and background SDK identity keepalive.
-- Preserve the existing JP integration and offline-only Global API scope.
+- 日服 Android 客户端参数更新为 1.0.6。
+- 升级底层 Sirius API Proxy 至 1.3.6。
 
 ## 0.3.1 — 2026-10-06
 
