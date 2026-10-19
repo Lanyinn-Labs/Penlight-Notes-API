@@ -22,6 +22,7 @@ pub struct SiriusClient {
     pub core: Arc<GameClient>,
     settings: SiriusConfig,
     player_data: Mutex<Option<(Instant, Arc<Value>)>>,
+    table_cache: std::sync::Mutex<std::collections::HashMap<(String, String), Value>>,
 }
 
 impl SiriusClient {
@@ -35,6 +36,7 @@ impl SiriusClient {
             core,
             settings,
             player_data: Mutex::new(None),
+            table_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -138,15 +140,15 @@ impl SiriusClient {
             platform: self.core.platform(),
         };
         tokio::task::spawn_blocking(move || {
-            let document = sirius_api_proxy::master_registry::manifest(&root, None, scope.clone())
-                .map_err(|_| AppError::MasterDataUnavailable)?;
-            let manifest: sirius_api_proxy::master_registry::PublishedManifest =
-                serde_json::from_slice(&document.bytes)
-                    .map_err(|_| AppError::MasterDataUnavailable)?;
-            manifest
-                .validate(&scope)
-                .map_err(|_| AppError::MasterDataUnavailable)?;
-            Ok(manifest)
+            let document = sirius_api_proxy::master_registry::manifest(&root, None, scope)
+                .map_err(|error| {
+                    tracing::warn!(?error, "cannot load Master manifest");
+                    AppError::MasterDataUnavailable
+                })?;
+            serde_json::from_slice(&document.bytes).map_err(|error| {
+                tracing::warn!(?error, "cannot deserialize Master manifest");
+                AppError::MasterDataUnavailable
+            })
         })
         .await
         .map_err(|_| AppError::MasterDataUnavailable)?
@@ -169,27 +171,48 @@ impl SiriusClient {
             .to_path_buf();
         let snapshot = manifest.snapshot.clone();
         let hash = file.sha256.clone();
-        let table = table.to_owned();
+        let table_name = table.to_owned();
+        let cached = self
+            .table_cache
+            .lock()
+            .expect("table cache mutex poisoned")
+            .get(&(table_name.clone(), hash.clone()))
+            .cloned();
         let entries = tokio::task::spawn_blocking(move || {
             let bytes = sirius_api_proxy::master_registry::table(
                 &root,
                 sirius_api_proxy::region::Region::Jp,
                 &snapshot,
-                &table,
+                &table_name,
                 &hash,
             )
-            .map_err(|_| AppError::MasterDataUnavailable)?
+            .map_err(|error| {
+                tracing::warn!(table = %table_name, %snapshot, ?error, "Master table verification failed");
+                AppError::MasterDataUnavailable
+            })?
             .bytes;
+            if let Some(entries) = cached {
+                return Ok((entries, false));
+            }
             let mut document: Value =
                 serde_json::from_slice(&bytes).map_err(|_| AppError::MasterDataUnavailable)?;
-            document
+            let entries = document
                 .as_object_mut()
                 .and_then(|map| map.remove("_allData"))
                 .filter(Value::is_array)
-                .ok_or(AppError::MasterDataUnavailable)
+                .ok_or(AppError::MasterDataUnavailable)?;
+            Ok((entries, true))
         })
         .await
         .map_err(|_| AppError::MasterDataUnavailable)??;
+        let (entries, parsed_fresh) = entries;
+        if parsed_fresh {
+            let mut cache = self.table_cache.lock().expect("table cache mutex poisoned");
+            if cache.len() >= 32 {
+                cache.clear();
+            }
+            cache.insert((table.to_owned(), file.sha256.clone()), entries.clone());
+        }
         Ok(
             json!({"region":"jp", "source":"master_snapshot", "master_version":manifest.version, "snapshot":manifest.snapshot, "resource_version":manifest.resource_version, "entries":entries}),
         )
@@ -215,6 +238,20 @@ impl SiriusClient {
         })
         .await
         .map_err(|_| AppError::MasterDataUnavailable)?
+    }
+
+    pub async fn catalog_entry(&self, resource: &str, id: &str) -> Result<Value, AppError> {
+        let id = crate::offline_master::parse_master_id(id)?;
+        let spec = crate::offline_master::catalog_spec(resource).ok_or(AppError::NotFound)?;
+        let manifest = self.master_manifest().await?;
+        let mut document = self.master_records_at(&manifest, spec.table).await?;
+        let entry = crate::offline_master::extract_catalog_entry(&mut document, id)?;
+        let texts = if spec.entry_needs_text(&entry) {
+            Some(self.master_records_at(&manifest, "MasterText").await?)
+        } else {
+            None
+        };
+        crate::offline_master::normalize_jp_catalog_entry(document, entry, texts.as_ref(), resource)
     }
 
     pub async fn profile_summary(&self, raw: &Value) -> Value {

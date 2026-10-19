@@ -20,12 +20,15 @@ pub struct RankingRequest {
 }
 
 impl RankingRequest {
-    pub fn parse(event_id: &str, ranks: &str) -> Result<Self, AppError> {
-        let event_id = event_id
+    pub fn parse_event_id(event_id: &str) -> Result<i64, AppError> {
+        event_id
             .parse::<i64>()
             .ok()
             .filter(|id| *id > 0)
-            .ok_or(AppError::InvalidRankingQuery)?;
+            .ok_or(AppError::InvalidRankingQuery)
+    }
+
+    pub fn parse_ranks(ranks: &str) -> Result<Vec<i32>, AppError> {
         let mut parsed = Vec::new();
         for rank in ranks.split(',') {
             let rank = rank
@@ -43,9 +46,13 @@ impl RankingRequest {
         if parsed.is_empty() {
             return Err(AppError::InvalidRankingQuery);
         }
+        Ok(parsed)
+    }
+
+    pub fn parse(event_id: &str, ranks: &str) -> Result<Self, AppError> {
         Ok(Self {
-            event_id,
-            ranks: parsed,
+            event_id: Self::parse_event_id(event_id)?,
+            ranks: Self::parse_ranks(ranks)?,
         })
     }
 }

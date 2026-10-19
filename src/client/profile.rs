@@ -4,11 +4,10 @@ fn integer(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
 fn text<'a>(texts: &'a Value, id: &Value) -> Option<&'a str> {
-    let id = id.as_str()?;
-    texts["entries"]
-        .as_array()?
-        .iter()
-        .find(|row| row["_id"].as_str() == Some(id))?["_japanese"]
+    let target = crate::offline_master::text_key(id)?;
+    texts["entries"].as_array()?.iter().find(|row| {
+        crate::offline_master::text_key(&row["_id"]).as_deref() == Some(target.as_ref())
+    })?["_japanese"]
         .as_str()
         .filter(|value| !value.is_empty())
 }

@@ -62,18 +62,10 @@ pub struct CutoffQuery {
     ranks: Option<String>,
 }
 
-fn cutoff_request(
-    state: &SharedState,
-    event: &str,
-    ranks: Option<&str>,
-) -> Result<RankingRequest, AppError> {
+fn parse_cutoff_ranks(state: &SharedState, ranks: Option<&str>) -> Result<Vec<i32>, AppError> {
     match ranks {
-        Some(ranks) => RankingRequest::parse(event, ranks),
-        None => {
-            let mut request = RankingRequest::parse(event, "1")?;
-            request.ranks = state.config.ranking_default_ranks.clone();
-            Ok(request)
-        }
+        Some(ranks) => RankingRequest::parse_ranks(ranks),
+        None => Ok(state.config.ranking_default_ranks.clone()),
     }
 }
 
@@ -161,13 +153,20 @@ pub async fn current_event_cutoffs(
     let region = Region::parse(&region)?;
     let Query(query) = query.map_err(|_| AppError::InvalidRankingQuery)?;
     // Validate ranks before reading Master data or contacting the game.
-    let mut request = cutoff_request(&state, "1", query.ranks.as_deref())?;
+    let ranks = parse_cutoff_ranks(&state, query.ranks.as_deref())?;
     let (event, _) = active_event(&state, region).await?;
     if !event.ranking_enabled {
         return Err(AppError::EventRankingDisabled);
     }
-    request.event_id = event.id;
-    cutoff_response(&state, region, request).await
+    cutoff_response(
+        &state,
+        region,
+        RankingRequest {
+            event_id: event.id,
+            ranks,
+        },
+    )
+    .await
 }
 
 async fn cutoff_response(
@@ -197,7 +196,10 @@ pub async fn event_cutoffs(
         return Err(AppError::RegionDisabled);
     }
     let Query(query) = query.map_err(|_| AppError::InvalidRankingQuery)?;
-    let request = cutoff_request(&state, &event_id, query.ranks.as_deref())?;
+    let request = RankingRequest {
+        event_id: RankingRequest::parse_event_id(&event_id)?,
+        ranks: parse_cutoff_ranks(&state, query.ranks.as_deref())?,
+    };
     ensure_event_ranking(&state, region, request.event_id).await?;
     cutoff_response(&state, region, request).await
 }

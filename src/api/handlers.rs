@@ -375,24 +375,7 @@ pub async fn jp_catalog_entry(
         .as_ref()
         .filter(|client| client.master_configured())
     {
-        let id = positive(&id).map_err(|_| AppError::InvalidMasterId)?;
-        let mut data = client.catalog(resource).await?;
-        let entries = data
-            .as_object_mut()
-            .and_then(|map| map.remove("entries"))
-            .ok_or(AppError::MasterDataUnavailable)?;
-        let entry = entries
-            .as_array()
-            .ok_or(AppError::MasterDataUnavailable)?
-            .iter()
-            .find(|entry| {
-                entry["_id"].as_i64() == Some(id)
-                    || entry["_id"].as_str().and_then(|v| v.parse::<i64>().ok()) == Some(id)
-            })
-            .cloned()
-            .ok_or(AppError::NotFound)?;
-        data["entry"] = entry;
-        return Ok(Json(data));
+        return client.catalog_entry(resource, &id).await.map(Json);
     }
     let directory = settings
         .master_dir

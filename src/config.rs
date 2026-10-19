@@ -77,11 +77,13 @@ impl<F: Fn(&str) -> Option<String>> Environment<F> {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     }
+    fn parse_optional<T: FromStr>(&self, name: &str) -> Result<Option<T>, String> {
+        self.optional(name)
+            .map(|value| value.parse().map_err(|_| format!("invalid {name}")))
+            .transpose()
+    }
     fn parse<T: FromStr>(&self, name: &str, default: T) -> Result<T, String> {
-        match self.optional(name) {
-            Some(value) => value.parse().map_err(|_| format!("invalid {name}")),
-            None => Ok(default),
-        }
+        Ok(self.parse_optional(name)?.unwrap_or(default))
     }
     fn path(&self, name: &str) -> Option<PathBuf> {
         self.optional(name).map(PathBuf::from)
@@ -109,15 +111,15 @@ impl Config {
         get: impl Fn(&str) -> Option<String>,
         release: ClientRelease,
     ) -> Result<Self, String> {
+        let defaults = release.environment_defaults();
         let values = Environment(|name: &str| {
             get(name)
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| {
-                    release
-                        .environment_defaults()
-                        .into_iter()
+                    defaults
+                        .iter()
                         .find(|(key, _)| *key == name)
-                        .map(|(_, value)| value.to_owned())
+                        .map(|(_, value)| (*value).to_owned())
                 })
         });
         let mut config = Self::default();
@@ -142,9 +144,8 @@ impl Config {
             );
         }
         if let Some(ranks) = values.optional("PENLIGHT_RANKING_DEFAULT_RANKS") {
-            config.ranking_default_ranks = crate::ranking::RankingRequest::parse("1", &ranks)
-                .map_err(|_| "invalid PENLIGHT_RANKING_DEFAULT_RANKS")?
-                .ranks;
+            config.ranking_default_ranks = crate::ranking::RankingRequest::parse_ranks(&ranks)
+                .map_err(|_| "invalid PENLIGHT_RANKING_DEFAULT_RANKS")?;
         }
         let cache = &mut config.ranking_cache;
         cache.fresh = values.seconds("PENLIGHT_RANKING_FRESH_SECONDS", cache.fresh)?;
@@ -271,23 +272,17 @@ fn jp_protocol<F: Fn(&str) -> Option<String>>(
     let mut upstream = sirius_api_proxy::config::UpstreamConfig::default();
     upstream.timeout_ms = values.parse("PENLIGHT_JP_TIMEOUT_MS", upstream.timeout_ms)?;
     upstream.max_inflight = values.parse("PENLIGHT_JP_MAX_INFLIGHT", upstream.max_inflight)?;
-    upstream.anonymous_max_inflight = values
-        .optional("PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT")
-        .map(|_| values.parse("PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT", 4))
-        .transpose()?;
+    upstream.anonymous_max_inflight =
+        values.parse_optional("PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT")?;
     upstream.coalesce_public_reads = values.parse("PENLIGHT_JP_COALESCE_PUBLIC_READS", true)?;
     upstream.version_max_age_seconds = values.parse(
         "PENLIGHT_JP_VERSION_MAX_AGE_SECONDS",
         upstream.version_max_age_seconds,
     )?;
-    upstream.http2_keepalive_interval_ms = values
-        .optional("PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS")
-        .map(|_| values.parse("PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS", 10000))
-        .transpose()?;
-    upstream.http2_keepalive_timeout_ms = values
-        .optional("PENLIGHT_JP_HTTP2_KEEPALIVE_TIMEOUT_MS")
-        .map(|_| values.parse("PENLIGHT_JP_HTTP2_KEEPALIVE_TIMEOUT_MS", 5000))
-        .transpose()?;
+    upstream.http2_keepalive_interval_ms =
+        values.parse_optional("PENLIGHT_JP_HTTP2_KEEPALIVE_INTERVAL_MS")?;
+    upstream.http2_keepalive_timeout_ms =
+        values.parse_optional("PENLIGHT_JP_HTTP2_KEEPALIVE_TIMEOUT_MS")?;
     upstream.proxy_url_env = values
         .optional("PENLIGHT_JP_PROXY_URL")
         .map(|_| "PENLIGHT_JP_PROXY_URL".into());

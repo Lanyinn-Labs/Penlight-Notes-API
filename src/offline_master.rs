@@ -79,9 +79,14 @@ pub async fn records(region: Region, directory: &Path, name: &str) -> Result<Val
 
     let summary = tokio::fs::read(directory.join("summary.json"))
         .await
-        .map_err(|_| AppError::MasterDataUnavailable)?;
-    let summary: Value =
-        serde_json::from_slice(&summary).map_err(|_| AppError::MasterDataUnavailable)?;
+        .map_err(|error| {
+            tracing::warn!(?region, ?error, "cannot read offline Master summary.json");
+            AppError::MasterDataUnavailable
+        })?;
+    let summary: Value = serde_json::from_slice(&summary).map_err(|error| {
+        tracing::warn!(?region, ?error, "invalid offline Master summary.json");
+        AppError::MasterDataUnavailable
+    })?;
     let expected_hash = match region {
         Region::Global => &summary["source_apk_sha256"],
         Region::Jp => &summary["source_asset_pack_apk_sha256"],
@@ -89,12 +94,16 @@ pub async fn records(region: Region, directory: &Path, name: &str) -> Result<Val
     if expected_hash != &schema["apk_sha256"]
         || (region == Region::Jp && summary["source_base_apk_sha256"] != schema["base_apk_sha256"])
     {
+        tracing::warn!(?region, "offline Master snapshot APK provenance mismatch");
         return Err(AppError::MasterDataUnavailable);
     }
 
     let content = tokio::fs::read(directory.join(format!("{name}.json")))
         .await
-        .map_err(|_| AppError::MasterDataUnavailable)?;
+        .map_err(|error| {
+            tracing::warn!(?region, table = name, ?error, "cannot read Master table");
+            AppError::MasterDataUnavailable
+        })?;
     let entries = tokio::task::spawn_blocking(move || {
         let mut document: Value =
             serde_json::from_slice(&content).map_err(|_| AppError::MasterDataUnavailable)?;
@@ -140,6 +149,13 @@ impl CatalogSpec {
             && document["entries"]
                 .as_array()
                 .is_some_and(|entries| !entries.is_empty())
+    }
+
+    pub(crate) fn entry_needs_text(&self, entry: &Value) -> bool {
+        [self.name_field, self.subtitle_field]
+            .into_iter()
+            .flatten()
+            .any(|field| text_key(&entry[field]).is_some())
     }
 }
 
@@ -242,7 +258,7 @@ fn enrich_catalog_entries(
     Ok(())
 }
 
-fn text_key(value: &Value) -> Option<Cow<'_, str>> {
+pub(crate) fn text_key(value: &Value) -> Option<Cow<'_, str>> {
     match value {
         Value::String(key) => Some(Cow::Borrowed(key)),
         Value::Number(key) => Some(Cow::Owned(key.to_string())),
@@ -250,29 +266,84 @@ fn text_key(value: &Value) -> Option<Cow<'_, str>> {
     }
 }
 
+pub(crate) fn parse_master_id(id: &str) -> Result<i64, AppError> {
+    id.parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or(AppError::InvalidMasterId)
+}
+
+pub(crate) fn extract_catalog_entry(document: &mut Value, id: i64) -> Result<Value, AppError> {
+    let entries = document
+        .as_object_mut()
+        .and_then(|map| map.remove("entries"))
+        .ok_or(AppError::MasterDataUnavailable)?;
+    let Value::Array(entries) = entries else {
+        return Err(AppError::MasterDataUnavailable);
+    };
+    entries
+        .into_iter()
+        .find(|entry| {
+            entry["_id"].as_i64() == Some(id)
+                || entry["_id"].as_str().and_then(|v| v.parse::<i64>().ok()) == Some(id)
+        })
+        .ok_or(AppError::NotFound)
+}
+
+pub(crate) fn normalize_jp_catalog_entry(
+    mut document: Value,
+    mut entry: Value,
+    text_document: Option<&Value>,
+    resource: &str,
+) -> Result<Value, AppError> {
+    let spec = catalog_spec(resource).ok_or(AppError::NotFound)?;
+    let needs_text = spec.entry_needs_text(&entry);
+    let object = entry
+        .as_object_mut()
+        .ok_or(AppError::MasterDataUnavailable)?;
+    if let Some(id) = object.get("_id").cloned() {
+        object.insert("id".into(), id);
+    }
+    if needs_text {
+        let entries = text_document
+            .and_then(|doc| doc["entries"].as_array())
+            .ok_or(AppError::MasterDataUnavailable)?;
+        for (field, output) in [
+            (spec.name_field, "name_ja"),
+            (spec.subtitle_field, "subtitle_ja"),
+        ] {
+            if let Some(target) = field.and_then(|f| object.get(f)).and_then(text_key) {
+                if let Some(text) = entries.iter().find_map(|row| {
+                    (text_key(&row["_id"]).as_deref() == Some(target.as_ref()))
+                        .then(|| row["_japanese"].as_str())
+                        .flatten()
+                }) {
+                    object.insert(output.into(), Value::String(text.to_owned()));
+                }
+            }
+        }
+    }
+    document["resource"] = json!(resource);
+    document["table"] = json!(spec.table);
+    document["entry"] = entry;
+    Ok(document)
+}
+
 pub async fn jp_catalog_entry(
     directory: &Path,
     resource: &str,
     id: &str,
 ) -> Result<Value, AppError> {
-    let id: u64 = id.parse().map_err(|_| AppError::InvalidMasterId)?;
-    if id == 0 {
-        return Err(AppError::InvalidMasterId);
-    }
-    let mut document = jp_catalog(directory, resource).await?;
-    let entry = document["entries"]
-        .as_array_mut()
-        .ok_or(AppError::MasterDataUnavailable)?
-        .iter()
-        .find(|entry| entry["_id"].as_u64() == Some(id))
-        .cloned()
-        .ok_or(AppError::NotFound)?;
-    document
-        .as_object_mut()
-        .expect("catalog response is an object")
-        .remove("entries");
-    document["entry"] = entry;
-    Ok(document)
+    let id = parse_master_id(id)?;
+    let spec = catalog_spec(resource).ok_or(AppError::NotFound)?;
+    let mut document = records(Region::Jp, directory, spec.table).await?;
+    let entry = extract_catalog_entry(&mut document, id)?;
+    let text_document = if spec.entry_needs_text(&entry) {
+        Some(records(Region::Jp, directory, "MasterText").await?)
+    } else {
+        None
+    };
+    normalize_jp_catalog_entry(document, entry, text_document.as_ref(), resource)
 }
 
 #[cfg(test)]

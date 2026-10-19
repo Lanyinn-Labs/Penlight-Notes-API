@@ -49,21 +49,33 @@ impl ClientRelease {
         Self::parse(include_str!("../data/jp-client.json"))
     }
 
+    fn is_valid_version(version: &str) -> bool {
+        let mut parts = version.split('.');
+        (0..3).all(|_| {
+            parts
+                .next()
+                .is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        }) && parts.next().is_none()
+    }
+
     fn parse(document: &str) -> Result<Self, String> {
         let release: Self =
-            serde_json::from_str(document).map_err(|_| "invalid JP client configuration")?;
-        let parts: Vec<_> = release.client_version.split('.').collect();
-        if parts.len() != 3
-            || parts
-                .iter()
-                .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
-            || sirius_api_proxy::master::key_from_hex(&release.master.key_hex).is_err()
+            serde_json::from_str(document).map_err(|_| "invalid JP client configuration JSON")?;
+        if !Self::is_valid_version(&release.client_version) {
+            return Err("invalid JP client_version: expected X.Y.Z".into());
+        }
+        if sirius_api_proxy::master::key_from_hex(&release.master.key_hex).is_err()
             || sirius_api_proxy::master::key_from_hex(&release.master.iv_hex).is_err()
-            || release.cdn_username.trim().is_empty()
+        {
+            return Err(
+                "invalid JP Master key_hex or iv_hex: expected 32 bytes of hexadecimal".into(),
+            );
+        }
+        if release.cdn_username.trim().is_empty()
             || release.cdn_username.contains(':')
             || release.cdn_password.trim().is_empty()
         {
-            return Err("invalid JP client version, CDN authentication or Master constants".into());
+            return Err("invalid JP CDN credentials".into());
         }
         for origin in [&release.endpoint, &release.cdn_root] {
             let uri = origin

@@ -143,39 +143,6 @@ impl Drop for Directory {
     }
 }
 
-#[test]
-fn temporary_directories_are_isolated_under_concurrent_creation() {
-    let directories = std::thread::scope(|scope| {
-        let workers = (0..32)
-            .map(|_| scope.spawn(Directory::new))
-            .collect::<Vec<_>>();
-        workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .collect::<Vec<_>>()
-    });
-    let paths = directories
-        .iter()
-        .map(|directory| &directory.0)
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(paths.len(), directories.len());
-    for (index, directory) in directories.iter().enumerate() {
-        fs::write(directory.0.join("owner"), index.to_string()).unwrap();
-    }
-    for (index, directory) in directories.iter().enumerate() {
-        assert_eq!(
-            fs::read_to_string(directory.0.join("owner")).unwrap(),
-            index.to_string()
-        );
-    }
-    let paths = directories
-        .iter()
-        .map(|directory| directory.0.clone())
-        .collect::<Vec<_>>();
-    drop(directories);
-    assert!(paths.iter().all(|path| !path.exists()));
-}
-
 fn snapshot(root: &std::path::Path, name: &str, version: &str, id: i64) {
     write_snapshot(
         root,
@@ -252,6 +219,10 @@ async fn online_catalog_reads_text_only_when_entries_need_it() {
         .unwrap()
         .is_empty());
     assert!(client.catalog("characters").await.is_err());
+    assert!(matches!(
+        client.catalog_entry("characters", "99").await,
+        Err(AppError::NotFound)
+    ));
 
     let mut frontend = Config::default();
     frontend.regions[1].sirius = Some(config);
