@@ -1,9 +1,15 @@
 //! Gekisou Arena routes: current season, leagues overview, and ranking rewards.
-use super::SharedState;
+use super::{
+    events::CutoffQuery,
+    handlers::{online, positive},
+    SharedState,
+};
 use crate::{
     arena::{self, ArenaLeague, ArenaRankingReward},
+    client::sirius::envelope,
     error::AppError,
     offline_master,
+    ranking::RankingRequest,
     region::Region,
 };
 use axum::{
@@ -12,6 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sirius_api_proxy::peer::Operation;
 
 pub(crate) async fn arena_table(
     state: &SharedState,
@@ -105,4 +112,31 @@ pub async fn ranking_rewards(
         "snapshot": reward_doc["snapshot"],
         "rewards": rewards,
     })))
+}
+
+pub async fn arena_rankings(
+    State(state): State<SharedState>,
+    Path((region, season_id, league_id)): Path<(String, String, String)>,
+    query: Result<Query<CutoffQuery>, QueryRejection>,
+) -> Result<Json<Value>, AppError> {
+    let Query(query) = query.map_err(|_| AppError::InvalidRankingQuery)?;
+    let region = Region::parse(&region)?;
+    let client = online(&state, region)?;
+    let season_id = positive(&season_id)?;
+    let league_id = positive(&league_id)?;
+    let ranks = RankingRequest::parse_ranks(
+        query
+            .ranks
+            .as_deref()
+            .ok_or(AppError::InvalidRankingQuery)?,
+    )?;
+    client
+        .query(Operation::ArenaRanking {
+            season_id,
+            league_id,
+            ranks,
+        })
+        .await
+        .map(envelope)
+        .map(Json)
 }

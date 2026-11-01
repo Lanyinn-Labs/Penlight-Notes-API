@@ -50,7 +50,7 @@ cargo run --locked
 | `PENLIGHT_JP_ONLINE` | 按需自动开启 | 有账号路径或 Master 模式为 download/sync 时开启，可显式覆盖 |
 | `PENLIGHT_JP_CLIENT_VERSION` | 客户端 JSON | 在线请求客户端版本；通常不需要覆盖 |
 | `PENLIGHT_JP_ENDPOINT` | `https://api.bang-dream-on.jp` | HTTPS 游戏服务 origin |
-| `PENLIGHT_JP_PROTOCOL_DIR` | `vendor/sirius-api-proxy/protocol/sirius/1.0.4` | 随附 Protobuf 目录 |
+| `PENLIGHT_JP_PROTOCOL_DIR` | `crates/sirius-api-proxy/protocol/sirius/1.0.4` | 随附 Protobuf 目录 |
 | `PENLIGHT_JP_SESSION_LOCK` | `true` | 序列化同一账号的会话 |
 | `PENLIGHT_JP_TIMEOUT_MS` | `20000` | 上游请求超时 |
 | `PENLIGHT_JP_ANONYMOUS_MAX_INFLIGHT` | 上游默认最多 4 | 无账号请求并发，设为 1 恢复串行 |

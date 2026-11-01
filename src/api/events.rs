@@ -59,7 +59,7 @@ pub async fn event_deck(
 #[serde(deny_unknown_fields)]
 pub struct CutoffQuery {
     #[serde(default)]
-    ranks: Option<String>,
+    pub(crate) ranks: Option<String>,
 }
 
 fn parse_cutoff_ranks(state: &SharedState, ranks: Option<&str>) -> Result<Vec<i32>, AppError> {

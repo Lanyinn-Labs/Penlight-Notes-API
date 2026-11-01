@@ -14,9 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = ['README.md', 'CHANGELOG.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', '.env.example',
                 'docs/account-setup.md', 'docs/api.md', 'docs/configuration.md', 'docs/downloads.md',
                 'docs/updates.md', 'docs/upstream-attribution.md',
-                'data/jp-client.json', 'vendor/sirius-api-proxy/LICENSE',
-                'vendor/sirius-api-proxy/LICENSE-protobuf', 'vendor/sirius-api-proxy/UPSTREAM.json']
-PUBLIC_TREES = ['vendor/sirius-api-proxy/protocol', 'vendor/sirius-api-proxy/docs']
+                'data/jp-client.json', 'crates/sirius-api-proxy/LICENSE',
+                'crates/sirius-api-proxy/LICENSE-protobuf', 'crates/sirius-api-proxy/UPSTREAM.json']
+PUBLIC_TREES = ['crates/sirius-api-proxy/protocol', 'crates/sirius-api-proxy/docs']
 TOOLS = ['export_account.py', 'check_android_version.py', 'import_jp_master.py', 'inspect_jp_local_save.py', 'decrypt_master.py',
          'decrypt_master_split_apk.py', 'README.md']
 

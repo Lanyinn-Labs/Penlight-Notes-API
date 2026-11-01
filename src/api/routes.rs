@@ -64,6 +64,10 @@ fn assemble(
         .route("/{region}/application", get(handlers::application))
         .route("/{region}/arena/current", get(arena::current_arena))
         .route(
+            "/{region}/arena/seasons/{season_id}/leagues/{league_id}/rankings",
+            get(arena::arena_rankings),
+        )
+        .route(
             "/{region}/arena/ranking-rewards",
             get(arena::ranking_rewards),
         )

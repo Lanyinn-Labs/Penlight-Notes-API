@@ -11,7 +11,7 @@ pub struct Provenance {
 pub fn provenance() -> &'static Provenance {
     static PROVENANCE: OnceLock<Provenance> = OnceLock::new();
     PROVENANCE.get_or_init(|| {
-        serde_json::from_str(include_str!("../vendor/sirius-api-proxy/UPSTREAM.json"))
+        serde_json::from_str(include_str!("../crates/sirius-api-proxy/UPSTREAM.json"))
             .expect("verified upstream provenance must be valid")
     })
 }

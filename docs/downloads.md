@@ -10,7 +10,7 @@
 
 Release 附 `SHA256SUMS.txt` 用于核对下载包，包内 `release-manifest.json` 记录文件摘要。
 
-解压后进入包的根目录，保持 `vendor/sirius-api-proxy/protocol` 的相对位置：
+解压后进入包的根目录，保持 `crates/sirius-api-proxy/protocol` 的相对位置：
 
 ```bash
 cp .env.example .env

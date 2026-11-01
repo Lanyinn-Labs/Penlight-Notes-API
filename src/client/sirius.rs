@@ -1,6 +1,6 @@
 //! In-process integration of Sirius Project's MIT-licensed protocol implementation.
 //! The unchanged upstream source and its original copyright notices live under
-//! vendor/sirius-api-proxy. See docs/upstream-attribution.md for provenance.
+//! Integrated Sirius API proxy client. See docs/upstream-attribution.md for provenance.
 
 use crate::{
     config::SiriusConfig,

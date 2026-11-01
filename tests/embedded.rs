@@ -17,7 +17,7 @@ fn settings() -> sirius_api_proxy::config::Config {
     let mut protocol: sirius_api_proxy::config::Config = serde_json::from_value(json!({
         "region":"jp", "platform":"Android", "environment":"release",
         "endpoint":"https://api.bang-dream-on.jp", "client_version":"1.0.4",
-        "protocol_directory":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/sirius-api-proxy/protocol/sirius/1.0.4"),
+        "protocol_directory":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/sirius-api-proxy/protocol/sirius/1.0.4"),
         "api_token_env":"unused", "internal_token_env":"unused", "accounts":[],
         "default_cdn_root":"https://static.bang-dream-on.jp",
         "cdn_credential_env":{"https://static.bang-dream-on.jp":"PENLIGHT_CDN_PASSWORD"}
@@ -89,7 +89,7 @@ async fn embedded_protocol_initializes_without_a_proxy_listener() {
     config.regions[1].sirius = Some(settings());
     let (_, version) = get(api::build(Arc::new(config)), "/version").await;
     let provenance: Value =
-        serde_json::from_str(include_str!("../vendor/sirius-api-proxy/UPSTREAM.json")).unwrap();
+        serde_json::from_str(include_str!("../crates/sirius-api-proxy/UPSTREAM.json")).unwrap();
     assert_eq!(version["upstream_version"], provenance["version"]);
     assert_eq!(version["protocol_revision"], provenance["revision"]);
     assert_eq!(version["protocol_version"], "1.0.4");
@@ -110,6 +110,8 @@ async fn invalid_queries_and_private_access_are_rejected_before_game_dispatch() 
         "/api/jp/players/by-profile-id/-1",
         "/api/jp/music/0/rankings",
         "/api/jp/events/0/players/player/deck",
+        "/api/jp/arena/seasons/0/leagues/1/rankings?ranks=1",
+        "/api/jp/arena/seasons/1/leagues/0/rankings?ranks=1",
     ] {
         assert_eq!(get(router.clone(), path).await.0, 400, "{path}");
     }

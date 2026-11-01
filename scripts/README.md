@@ -10,7 +10,7 @@
 | `docker-entrypoint.sh` | Docker 启动时下载、校验并原子替换客户端配置；失败保留缓存 |
 | `smoke_container.py` | 关闭容器网络后验证镜像启动及认证 |
 | `check_project.py` | 与 CI 共用的来源、格式、编译、Clippy 和回归检查；支持 --offline |
-| `check_upstream.py` | 离线校验原始 Sirius 文件摘要及许可证；CI 使用 |
+| `check_upstream.py` | 离线校验 Sirius 协议库二次开发归属及许可证；CI 使用 |
 | `import_jp_master.py` | 从已验证的日服元数据读取常量，调用进程内 Master 导入器 |
 | `inspect_jp_local_save.py` | 从自有日服存档副本恢复现有账号凭据 |
 | `decrypt_master.py` | 导出已验证的国际服 1.0.1 APK Master JSON |

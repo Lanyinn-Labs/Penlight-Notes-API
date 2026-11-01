@@ -6,8 +6,8 @@
 !src/**
 !data/
 !data/**
-!vendor/
-!vendor/**
+!crates/
+!crates/**
 !LICENSE
 !THIRD-PARTY-NOTICES.md
 !docs/

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 将底层协议代理库 `sirius-api-proxy` 从只读 `vendor` 结构迁移为内部维护与二次开发子包（`crates/sirius-api-proxy`），保留 Haruki Dev Team 及 Sirius Project 的原始 MIT 开源许可与归属声明，解除静态文件哈希锁定。
+- 在协议层原生扩展激奏 Arena（竞技场）能力：补充 `entity/arena.proto` 与 `app/arena/arena_service.proto`，在代理路由及 `peer::Operation` 中支持 `Operation::ArenaRanking`，并提供在线榜单接口 `/{region}/arena/seasons/{season_id}/leagues/{league_id}/rankings`。
 - 新增激奏 Arena 相关接口：`/{region}/arena/current`、`/{region}/arena/ranking-rewards`、`/{region}/arena/seasons`、`/{region}/arena/leagues` 及 `/{region}/arena/ranks`，支持根据当前时间判断正在进行的赛季、乐队 League 概况、段位梯次及榜单奖励档位。
 - 日服 Master 资源目录新增 `arena-seasons`、`arena-leagues` 与 `arena-ranks`，自动关联 `MasterText` 解析 `name_ja`；完善 `events` 目录的日文名称解析。
 - 日服客户端配置升级至 1.1.0（更新 `client_version` 及 CDN 凭据），拉取更新 Master 数据至包含激奏 Arena 与活动数据的最新快照（247 张表）。

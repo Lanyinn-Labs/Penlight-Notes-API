@@ -38,6 +38,7 @@
 | `/events/{event_id}/players/{player_id}/deck` | 活动中的玩家队伍 |
 | `/music/{id}/rankings` | 歌曲排名，移除调用账号的 myRank/myScore |
 | `/challenge-music/{id}/rankings` | 挑战歌曲排名，移除调用账号的 myRank/myScore |
+| `/arena/seasons/{season_id}/leagues/{league_id}/rankings?ranks=100,1000` | 指定赛季与乐队 League 的原始激奏 Arena 排名 |
 
 ID 必须为正整数。活动 rankings 必须指定 ranks；cutoffs 可省略 ranks 使用服务默认档位。显式 ranks 必须包含 1 至 20 个逗号分隔的正整数，排序并去重；空字符串、超出 int32 范围或未知查询参数返回 400。
 
@@ -111,6 +112,7 @@ ID 必须为正整数。活动 rankings 必须指定 ranks；cutoffs 可省略 r
 | `/api/jp/arena/leagues/{id}` | 指定 League 详情 |
 | `/api/jp/arena/ranks` | 全部段位梯次列表（含 Division、LP 分界线及 `name_ja`） |
 | `/api/jp/arena/ranks/{id}` | 指定段位详情 |
+| `/api/jp/arena/seasons/{season_id}/leagues/{league_id}/rankings?ranks=100,1000` | 官方在线协议原始激奏 Arena 榜单 |
 
 当前赛季根据 `_startAt`、`_endAt` 判定进行中（含边界），按日本时间 UTC+9 解析，输出 UTC ISO 8601 时间；没有进行中的赛季返回 404，损坏或多个同时进行的赛季返回 503 master_data_unavailable。响应示例如下：
 

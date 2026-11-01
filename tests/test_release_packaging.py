@@ -58,7 +58,7 @@ class ReleasePackagingTests(unittest.TestCase):
                 self.assertFalse(any(b'LOCAL_ONLY_SENTINEL' in content for content in contents.values()))
                 for name in ['docs/downloads.md', 'docs/api.md', 'docs/configuration.md',
                              'docs/account-setup.md', 'docs/updates.md', 'docs/upstream-attribution.md',
-                             'LICENSE', 'vendor/sirius-api-proxy/LICENSE']:
+                             'LICENSE', 'crates/sirius-api-proxy/LICENSE']:
                     self.assertIn(name, contents)
                 manifest = json.loads(contents['release-manifest.json'])
                 self.assertEqual(set(manifest['files']), set(contents) - {'release-manifest.json'})

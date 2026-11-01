@@ -1,2 +1,2 @@
-# Keep vendored source hashes identical on Linux, macOS and Windows.
+# Keep source line endings identical on Linux, macOS and Windows.
 * text=auto eol=lf

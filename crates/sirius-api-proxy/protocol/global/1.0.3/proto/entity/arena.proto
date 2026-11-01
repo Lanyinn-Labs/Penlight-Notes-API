@@ -1,0 +1,11 @@
+syntax = "proto3";
+package entity;
+import "entity/player_profile.proto";
+
+message ArenaRankingEntry {
+  .entity.PlayerSimpleProfile profile = 1;
+  int32 rank = 2;
+  int64 point = 3;
+  int64 season_id = 4;
+  int64 league_id = 5;
+}

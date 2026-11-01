@@ -12,7 +12,7 @@ Copyright (c) 2025 Haruki Dev Team
 Copyright (c) 2026 Sirius Project
 
 The original source, copyright and full MIT permission notice are retained in
-[vendor/sirius-api-proxy/LICENSE](vendor/sirius-api-proxy/LICENSE).
+[crates/sirius-api-proxy/LICENSE](crates/sirius-api-proxy/LICENSE).
 The bundled Protobuf descriptor license is retained in
-[vendor/sirius-api-proxy/LICENSE-protobuf](vendor/sirius-api-proxy/LICENSE-protobuf).
+[crates/sirius-api-proxy/LICENSE-protobuf](crates/sirius-api-proxy/LICENSE-protobuf).
 See [provenance and integration](docs/upstream-attribution.md).

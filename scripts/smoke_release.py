@@ -52,10 +52,10 @@ def verify(archive, expected_target=None):
             assert not name.endswith(('.har', '.pcap', '.pcapng', '.local.json', '.local.yaml', '.local.yml'))
             assert not any(p.startswith('.env') and p != '.env.example' for p in parts)
         for name in ['LICENSE', 'THIRD-PARTY-NOTICES.md', 'data/jp-client.json', '.env.example',
-                     'vendor/sirius-api-proxy/LICENSE', 'vendor/sirius-api-proxy/LICENSE-protobuf']:
+                     'crates/sirius-api-proxy/LICENSE', 'crates/sirius-api-proxy/LICENSE-protobuf']:
             assert name in files, name
         assert any(name.endswith('.proto') for name in files), 'missing protocol files'
-        license_text = (root / 'vendor/sirius-api-proxy/LICENSE').read_text()
+        license_text = (root / 'crates/sirius-api-proxy/LICENSE').read_text()
         assert 'Haruki Dev Team' in license_text and 'Sirius Project' in license_text
         executable = root / ('penlight-notes-api.exe' if manifest['target'].startswith('windows') else 'penlight-notes-api')
         with socket.socket() as listener:
