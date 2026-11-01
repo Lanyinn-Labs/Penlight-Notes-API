@@ -9,7 +9,7 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
-use super::{events, handlers, ApiState, SharedState};
+use super::{arena, events, handlers, ApiState, SharedState};
 use crate::{
     client::sirius::{SiriusClient, SiriusRankingSource},
     config::Config,
@@ -62,6 +62,62 @@ fn assemble(
     });
     let mut api = Router::new()
         .route("/{region}/application", get(handlers::application))
+        .route("/{region}/arena/current", get(arena::current_arena))
+        .route(
+            "/{region}/arena/ranking-rewards",
+            get(arena::ranking_rewards),
+        )
+        .route(
+            "/{region}/arena/seasons",
+            get(
+                move |State(state): State<SharedState>, Path(region): Path<String>| async move {
+                    handlers::jp_catalog_list(state, region, "arena-seasons").await
+                },
+            ),
+        )
+        .route(
+            "/{region}/arena/seasons/{id}",
+            get(
+                move |State(state): State<SharedState>,
+                      Path((region, id)): Path<(String, String)>| async move {
+                    handlers::jp_catalog_entry(state, region, "arena-seasons", id).await
+                },
+            ),
+        )
+        .route(
+            "/{region}/arena/leagues",
+            get(
+                move |State(state): State<SharedState>, Path(region): Path<String>| async move {
+                    handlers::jp_catalog_list(state, region, "arena-leagues").await
+                },
+            ),
+        )
+        .route(
+            "/{region}/arena/leagues/{id}",
+            get(
+                move |State(state): State<SharedState>,
+                      Path((region, id)): Path<(String, String)>| async move {
+                    handlers::jp_catalog_entry(state, region, "arena-leagues", id).await
+                },
+            ),
+        )
+        .route(
+            "/{region}/arena/ranks",
+            get(
+                move |State(state): State<SharedState>, Path(region): Path<String>| async move {
+                    handlers::jp_catalog_list(state, region, "arena-ranks").await
+                },
+            ),
+        )
+        .route(
+            "/{region}/arena/ranks/{id}",
+            get(
+                move |State(state): State<SharedState>,
+                      Path((region, id)): Path<(String, String)>| async move {
+                    handlers::jp_catalog_entry(state, region, "arena-ranks", id).await
+                },
+            ),
+        )
         .route("/{region}/events/current", get(events::current_event))
         .route(
             "/{region}/events/current/cutoffs",

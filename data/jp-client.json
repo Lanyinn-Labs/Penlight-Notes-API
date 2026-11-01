@@ -1,5 +1,5 @@
 {
-  "client_version": "1.0.6",
+  "client_version": "1.1.0",
   "endpoint": "https://api.bang-dream-on.jp",
   "protocol_directory": "vendor/sirius-api-proxy/protocol/sirius/1.0.4",
   "cdn_root": "https://static.bang-dream-on.jp",
@@ -8,5 +8,5 @@
     "iv_hex": "9b94c91e242a562e97fcd505b75a5129b2b80632a269034cf942ec7293d489a1"
   },
   "cdn_username": "sirius",
-  "cdn_password": "mbnEFJGchHnNhBI6jFb6oxtcoOKX2L0T"
+  "cdn_password": "dI0zpbOAXvmyAXBmfCt7Isvx0H23BGa2"
 }

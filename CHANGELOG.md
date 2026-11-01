@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 新增激奏 Arena 相关接口：`/{region}/arena/current`、`/{region}/arena/ranking-rewards`、`/{region}/arena/seasons`、`/{region}/arena/leagues` 及 `/{region}/arena/ranks`，支持根据当前时间判断正在进行的赛季、乐队 League 概况、段位梯次及榜单奖励档位。
+- 日服 Master 资源目录新增 `arena-seasons`、`arena-leagues` 与 `arena-ranks`，自动关联 `MasterText` 解析 `name_ja`；完善 `events` 目录的日文名称解析。
+- 日服客户端配置升级至 1.1.0（更新 `client_version` 及 CDN 凭据），拉取更新 Master 数据至包含激奏 Arena 与活动数据的最新快照（247 张表）。
 - 按文件哈希缓存已解析的在线 Master 表，单条资源查询先按 ID 过滤并按需加载 `MasterText`，减少重复 JSON 解析与全表遍历。
 - 在启动 Tokio 多线程运行时前完成环境变量默认项初始化，统一在线与离线目录查询逻辑，并补充 Master 读取告警日志。
 

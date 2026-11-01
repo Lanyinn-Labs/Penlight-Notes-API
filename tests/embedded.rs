@@ -500,3 +500,191 @@ async fn current_event_metadata_works_with_an_offline_snapshot() {
         503
     );
 }
+
+#[tokio::test]
+async fn arena_endpoints_and_catalogs_work_with_snapshot() {
+    let directory = Directory::new();
+    let now = chrono::Utc::now();
+    let start = (now - chrono::Duration::hours(1))
+        .with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
+        .format("%Y/%m/%d %H:%M:%S")
+        .to_string();
+    let end = (now + chrono::Duration::hours(24))
+        .with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
+        .format("%Y/%m/%d %H:%M:%S")
+        .to_string();
+
+    write_snapshot(
+        &directory.0,
+        "master-arena",
+        "v1",
+        &[
+            (
+                "MasterArenaSeason",
+                json!({
+                    "_allData": [
+                        {
+                            "_id": 1,
+                            "_nameTextId": "Arena_Season_Name_0001",
+                            "_startAt": start,
+                            "_endAt": end,
+                            "_rankingCountEndAt": end
+                        }
+                    ]
+                }),
+            ),
+            (
+                "MasterArenaLeague",
+                json!({
+                    "_allData": [
+                        {
+                            "_id": 1,
+                            "_nameTextId": "Arena_League_Name_001",
+                            "_bandId": 1,
+                            "_voiceCharacterGroup": [1, 2, 3, 4, 5],
+                            "_startAt": ""
+                        }
+                    ]
+                }),
+            ),
+            (
+                "MasterArenaRank",
+                json!({
+                    "_allData": [
+                        {
+                            "_id": 1,
+                            "_bandId": 1,
+                            "_nameTextId": "Arena_Rank_Name_001",
+                            "_rank": 1,
+                            "_division": 1,
+                            "_lp": 0,
+                            "_seasonResetLp": 0,
+                            "_startAt": "",
+                            "_pointBehaviorType": 1,
+                            "_isTopRank": false
+                        }
+                    ]
+                }),
+            ),
+            (
+                "MasterArenaRankingReward",
+                json!({
+                    "_allData": [
+                        {
+                            "_id": 1,
+                            "_leagueId": 0,
+                            "_rankStart": 1,
+                            "_rankEnd": 1,
+                            "_resourceType": 1,
+                            "_resourceId": 1,
+                            "_resourceCount": 10
+                        },
+                        {
+                            "_id": 2,
+                            "_leagueId": 1,
+                            "_rankStart": 2,
+                            "_rankEnd": 2,
+                            "_resourceType": 1,
+                            "_resourceId": 2,
+                            "_resourceCount": 20
+                        }
+                    ]
+                }),
+            ),
+            (
+                "MasterText",
+                json!({
+                    "_allData": [
+                        {
+                            "_id": "Arena_Season_Name_0001",
+                            "_japanese": "Season1"
+                        },
+                        {
+                            "_id": "Arena_League_Name_001",
+                            "_japanese": "MyGO!!!!!"
+                        },
+                        {
+                            "_id": "Arena_Rank_Name_001",
+                            "_japanese": "ビギナー1"
+                        }
+                    ]
+                }),
+            ),
+        ],
+    );
+
+    let mut config = Config::default();
+    let mut protocol = settings();
+    protocol.master_directory = Some(directory.0.clone());
+    config.regions[1].sirius = Some(protocol);
+    let router = api::build(Arc::new(config.clone()));
+
+    // 1. Current arena
+    let (status, body) = get(router.clone(), "/api/jp/arena/current").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["season"]["id"], 1);
+    assert_eq!(body["leagues"].as_array().unwrap().len(), 1);
+    assert_eq!(body["leagues"][0]["id"], 1);
+    assert_eq!(body["leagues"][0]["band_id"], 1);
+    assert_eq!(
+        body["leagues"][0]["voice_character_group"],
+        json!([1, 2, 3, 4, 5])
+    );
+
+    // 2. Ranking rewards (unfiltered and filtered)
+    let (status, rewards) = get(router.clone(), "/api/jp/arena/ranking-rewards").await;
+    assert_eq!(status, 200);
+    assert_eq!(rewards["rewards"].as_array().unwrap().len(), 2);
+
+    let (status, filtered) = get(router.clone(), "/api/jp/arena/ranking-rewards?league_id=1").await;
+    assert_eq!(status, 200);
+    assert_eq!(filtered["rewards"].as_array().unwrap().len(), 2);
+
+    let (status, filtered2) =
+        get(router.clone(), "/api/jp/arena/ranking-rewards?league_id=2").await;
+    assert_eq!(status, 200);
+    // league_id 0 matches all leagues, so 1 item returned
+    assert_eq!(filtered2["rewards"].as_array().unwrap().len(), 1);
+
+    // Invalid query
+    let (status, _) = get(router.clone(), "/api/jp/arena/ranking-rewards?unknown=1").await;
+    assert_eq!(status, 400);
+    let (status, _) = get(router.clone(), "/api/jp/arena/ranking-rewards?league_id=-1").await;
+    assert_eq!(status, 400);
+
+    // 3. Catalog endpoints with Japanese text resolution
+    let (status, seasons) = get(router.clone(), "/api/jp/arena/seasons").await;
+    assert_eq!(status, 200);
+    assert_eq!(seasons["entries"][0]["name_ja"], "Season1");
+
+    let (status, season_entry) = get(router.clone(), "/api/jp/arena/seasons/1").await;
+    assert_eq!(status, 200);
+    assert_eq!(season_entry["entry"]["name_ja"], "Season1");
+
+    let (status, leagues) = get(router.clone(), "/api/jp/arena/leagues").await;
+    assert_eq!(status, 200);
+    assert_eq!(leagues["entries"][0]["name_ja"], "MyGO!!!!!");
+
+    let (status, ranks) = get(router.clone(), "/api/jp/arena/ranks").await;
+    assert_eq!(status, 200);
+    assert_eq!(ranks["entries"][0]["name_ja"], "ビギナー1");
+
+    // Catalog entries by id
+    let (status, league_entry) = get(router.clone(), "/api/jp/arena/leagues/1").await;
+    assert_eq!(status, 200);
+    assert_eq!(league_entry["entry"]["name_ja"], "MyGO!!!!!");
+
+    // 4. Region status
+    assert_eq!(
+        get(router.clone(), "/api/global/arena/current").await.0,
+        501
+    );
+
+    config.regions[1].enabled = false;
+    assert_eq!(
+        get(api::build(Arc::new(config)), "/api/jp/arena/current")
+            .await
+            .0,
+        503
+    );
+}

@@ -1,3 +1,4 @@
+mod arena;
 mod events;
 mod handlers;
 mod limits;

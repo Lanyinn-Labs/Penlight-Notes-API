@@ -99,6 +99,45 @@ ID 必须为正整数。活动 rankings 必须指定 ranks；cutoffs 可省略 r
 缓存时间由 `PENLIGHT_RANKING_*_SECONDS` 配置。相同活动和规范化档位共享缓存，并发请求合并，失败后按配置退避。缓存最多 1024 个键，正在使用的键不会被淘汰；容量全部被占用时返回 429 api_busy。
 
 
+### 激奏 Arena（竞技场）
+
+| GET 路径 | 说明 |
+| --- | --- |
+| `/api/jp/arena/current` | 经校验的 Master 中正在进行的激奏 Arena 赛季及 5 大乐队 League 概况 |
+| `/api/jp/arena/ranking-rewards` | Arena 榜单奖励档位（可用 `?league_id=1` 过滤特定 League） |
+| `/api/jp/arena/seasons` | 全部赛季列表（含日文名 `name_ja`） |
+| `/api/jp/arena/seasons/{id}` | 指定赛季详情 |
+| `/api/jp/arena/leagues` | 全部 League 列表（含乐队 ID、角色组及 `name_ja`） |
+| `/api/jp/arena/leagues/{id}` | 指定 League 详情 |
+| `/api/jp/arena/ranks` | 全部段位梯次列表（含 Division、LP 分界线及 `name_ja`） |
+| `/api/jp/arena/ranks/{id}` | 指定段位详情 |
+
+当前赛季根据 `_startAt`、`_endAt` 判定进行中（含边界），按日本时间 UTC+9 解析，输出 UTC ISO 8601 时间；没有进行中的赛季返回 404，损坏或多个同时进行的赛季返回 503 master_data_unavailable。响应示例如下：
+
+```json
+{
+  "region": "jp",
+  "source": "master_snapshot",
+  "master_version": "1.1.0.100/dd5c1e3140e6f9140f63abed60049a98",
+  "snapshot": "master-046bc6353ac84bef987d38636f26cf1f",
+  "season": {
+    "id": 1,
+    "name_text_id": "Arena_Season_Name_0001",
+    "starts_at": "2026-10-27T15:00:00Z",
+    "ends_at": "2026-11-28T05:59:58Z",
+    "ranking_count_ends_at": "2026-11-28T05:59:59Z"
+  },
+  "leagues": [
+    {
+      "id": 1,
+      "name_text_id": "Arena_League_Name_001",
+      "band_id": 1,
+      "voice_character_group": [1, 2, 3, 4, 5]
+    }
+  ]
+}
+```
+
 ## 现有账号查询
 
 所有路径均以 `/api/jp/user` 为前缀，查询部署者配置的现有账号。
@@ -173,6 +212,9 @@ master-schema 始终是构建时提取的 APK 结构，不等于线上最新结�
 | stamps | MasterStamp |
 | shops | MasterShop |
 | login-bonuses | MasterLoginBonus |
+| arena-seasons | MasterArenaSeason |
+| arena-leagues | MasterArenaLeague |
+| arena-ranks | MasterArenaRank |
 
 资源详情 ID 无效返回 400，未找到返回 404。国际服这些整理后的资源接口尚未接入。
 

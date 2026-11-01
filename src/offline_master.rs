@@ -135,6 +135,9 @@ pub const JP_RESOURCES: &[&str] = &[
     "stamps",
     "shops",
     "login-bonuses",
+    "arena-seasons",
+    "arena-leagues",
+    "arena-ranks",
 ];
 
 pub(crate) struct CatalogSpec {
@@ -145,10 +148,9 @@ pub(crate) struct CatalogSpec {
 
 impl CatalogSpec {
     pub(crate) fn needs_text(&self, document: &Value) -> bool {
-        self.name_field.is_some()
-            && document["entries"]
-                .as_array()
-                .is_some_and(|entries| !entries.is_empty())
+        document["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| self.entry_needs_text(entry)))
     }
 
     pub(crate) fn entry_needs_text(&self, entry: &Value) -> bool {
@@ -167,7 +169,7 @@ pub(crate) fn catalog_spec(resource: &str) -> Option<CatalogSpec> {
             Some("_subtitleTextID"),
         ),
         "music" => ("MasterLiveMusic", Some("_titleTextID"), None),
-        "events" => ("MasterEvent", None, None),
+        "events" => ("MasterEvent", Some("_nameTextId"), None),
         "characters" => ("MasterCharacter", Some("_nameTextID"), None),
         "bands" => ("MasterBand", Some("_nameTextID"), None),
         "gacha" => ("MasterGacha", Some("_nameTextId"), None),
@@ -175,6 +177,9 @@ pub(crate) fn catalog_spec(resource: &str) -> Option<CatalogSpec> {
         "stamps" => ("MasterStamp", Some("_nameTextId"), None),
         "shops" => ("MasterShop", Some("_nameTextId"), None),
         "login-bonuses" => ("MasterLoginBonus", Some("_nameTextID"), None),
+        "arena-seasons" => ("MasterArenaSeason", Some("_nameTextId"), None),
+        "arena-leagues" => ("MasterArenaLeague", Some("_nameTextId"), None),
+        "arena-ranks" => ("MasterArenaRank", Some("_nameTextId"), None),
         _ => return None,
     };
     Some(CatalogSpec {
